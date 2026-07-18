@@ -94,3 +94,60 @@ class DiffLoader(QRunnable):
                         detail=f"{type(exc).__name__}: {exc}",
                     ),
                 )
+
+
+class WorkdirDiffLoader(QRunnable):
+    """커밋되지 않은 변경(스테이징/미스테이징) 하나의 diff를 계산한다.
+
+    DiffLoader와 같은 시그널 형태를 쓴다 — UI 입장에서 "지금 표시할 diff"
+    스트림은 하나이고, 세대 토큰이 커밋 diff와 워킹트리 diff의 순서 역전까지
+    함께 막는다. detail 자리는 항상 None이다.
+    """
+
+    def __init__(
+        self,
+        repo_path: str | Path,
+        path: str,
+        token: int,
+        *,
+        staged: bool,
+    ) -> None:
+        super().__init__()
+        self._repo_path = str(repo_path)
+        self._path = path
+        self._token = token
+        self._staged = staged
+        self._cancelled = False
+        self.signals = DiffLoaderSignals()
+        self.setAutoDelete(False)
+
+    @property
+    def token(self) -> int:
+        return self._token
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            from gitclient.infrastructure.local_engine import LocalGitEngine
+
+            engine = LocalGitEngine.open(self._repo_path)
+            lines = engine.workdir_diff_lines(self._path, staged=self._staged)
+
+            if self._cancelled:
+                return
+            self.signals.ready.emit(self._token, None, lines)
+
+        except GitClientError as exc:
+            if not self._cancelled:
+                self.signals.failed.emit(self._token, exc)
+        except Exception as exc:  # noqa: BLE001 - 워커에서 새는 예외는 앱을 죽인다
+            if not self._cancelled:
+                self.signals.failed.emit(
+                    self._token,
+                    GitClientError(
+                        "변경 사항 diff를 계산하는 중 오류가 발생했습니다.",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    ),
+                )

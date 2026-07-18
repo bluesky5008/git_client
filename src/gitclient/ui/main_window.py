@@ -35,12 +35,15 @@ from PySide6.QtWidgets import (
 )
 
 from gitclient.application.commit_loader import CommitLoader
-from gitclient.application.diff_loader import DiffLoader
+from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
 from gitclient.application.refs_loader import RefsLoader
+from gitclient.application.status_loader import StatusLoader
+from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import GitClientError
 from gitclient.domain.models import Ref, RefKind, RepositoryInfo
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from gitclient.ui.delegates import DiffDelegate, GraphDelegate, SummaryDelegate
+from gitclient.ui.working_tree_panel import WorkingTreePanel
 from gitclient.viewmodel.commit_graph_model import (
     Column,
     CommitGraphModel,
@@ -65,7 +68,12 @@ class MainWindow(QMainWindow):
         self._pool = QThreadPool.globalInstance()
         self._loader: CommitLoader | None = None
         self._refs_loader: RefsLoader | None = None
+        self._status_loader: StatusLoader | None = None
         self._loading = False
+
+        # 쓰기 경로 (Phase 2). 저장소별 직렬화는 WriteQueue가 보장한다.
+        self._write_queue: WriteQueue | None = None
+        self._graph_reload_pending = False
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
@@ -92,11 +100,20 @@ class MainWindow(QMainWindow):
         self._ref_list.setAlternatingRowColors(False)
         self._ref_list.setMinimumWidth(180)
         self._ref_list.itemActivated.connect(self._on_ref_activated)
+        self._ref_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._ref_list.customContextMenuRequested.connect(self._on_ref_context_menu)
 
         self._commit_view = self._build_commit_view()
         self._file_list = QListWidget()
         self._file_list.currentRowChanged.connect(self._on_file_selected)
         self._diff_view = self._build_diff_view()
+
+        self._work_panel = WorkingTreePanel()
+        self._work_panel.stage_requested.connect(self._on_stage_requested)
+        self._work_panel.unstage_requested.connect(self._on_unstage_requested)
+        self._work_panel.discard_requested.connect(self._on_discard_requested)
+        self._work_panel.commit_requested.connect(self._on_commit_requested)
+        self._work_panel.diff_requested.connect(self._on_workdir_diff_requested)
 
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
         detail_splitter.addWidget(self._wrap("변경 파일", self._file_list))
@@ -110,12 +127,18 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 2)
 
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_splitter.addWidget(self._wrap("작업 디렉터리", self._work_panel))
+        left_splitter.addWidget(self._wrap("참조", self._ref_list))
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 1)
+
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.addWidget(self._wrap("참조", self._ref_list))
+        main_splitter.addWidget(left_splitter)
         main_splitter.addWidget(right_splitter)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([220, 1060])
+        main_splitter.setSizes([260, 1020])
 
         self.setCentralWidget(main_splitter)
         self.statusBar().showMessage("저장소를 열어 주세요 (Ctrl+O)")
@@ -196,10 +219,27 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(quit_action)
 
+        self._branch_action = QAction("새 브랜치...", self)
+        self._branch_action.triggered.connect(self._prompt_new_branch)
+        self._stash_action = QAction("Stash 보관", self)
+        self._stash_action.triggered.connect(self._on_stash_save)
+        self._stash_pop_action = QAction("Stash 꺼내기", self)
+        self._stash_pop_action.triggered.connect(self._on_stash_pop)
+
+        repo_menu = self.menuBar().addMenu("저장소")
+        repo_menu.addAction(self._branch_action)
+        repo_menu.addSeparator()
+        repo_menu.addAction(self._stash_action)
+        repo_menu.addAction(self._stash_pop_action)
+
         toolbar = self.addToolBar("주요")
         toolbar.setMovable(False)
         toolbar.addAction(open_action)
         toolbar.addAction(reload_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._branch_action)
+        toolbar.addAction(self._stash_action)
+        toolbar.addAction(self._stash_pop_action)
 
     def _show_placeholder(self) -> None:
         self._file_list.clear()
@@ -239,6 +279,44 @@ class MainWindow(QMainWindow):
         self._diff_model.clear()
         self._show_placeholder()
         self._current_sha = None
+
+        # 쓰기 경로. bare 저장소는 워킹 트리가 없어 쓰기 UI를 껐다.
+        #
+        # 같은 저장소를 다시 여는 경우(F5, 커밋 후 그래프 재로딩)에는 기존 큐를
+        # **재사용**한다. 진행 중인 쓰기가 있는데 새 큐를 만들면 같은 저장소에
+        # 쓰기 스트림이 두 개 생겨 §3.3 규칙 3이 깨진다 (리뷰에서 확정된 결함).
+        has_workdir = info.workdir is not None
+        # 큐 키는 사용자가 입력한 경로가 아니라 pygit2가 정규화한 workdir다.
+        # 같은 저장소를 다른 표기(하위 디렉터리, 슬래시 방향)로 열어도
+        # 재사용 판정이 어긋나면 안 된다 — 어긋나면 직렬화가 깨진다.
+        queue_key = (
+            str(Path(info.workdir).resolve()) if has_workdir else None
+        )
+        same_repo_queue = (
+            self._write_queue is not None
+            and queue_key is not None
+            and self._write_queue.repo_path == queue_key
+        )
+        if has_workdir and not same_repo_queue:
+            self._dispose_write_queue()
+            queue = WriteQueue(queue_key, self._pool, parent=self)
+            # 정체 캡처: 교체된 구 큐의 늦은 시그널이 새 저장소 UI를 건드리지 못한다.
+            queue.job_failed.connect(
+                lambda _jid, _name, error, q=queue: self._on_write_failed(q, error)
+            )
+            queue.idle.connect(lambda q=queue: self._on_write_queue_idle(q))
+            self._write_queue = queue
+        elif not has_workdir:
+            self._dispose_write_queue()
+
+        # 재사용된 큐에 재로딩을 요청한 쓰기가 아직 남아 있을 수 있다 —
+        # 그 경우 플래그를 보존해야 큐가 빈 뒤 그래프가 갱신된다.
+        if self._write_queue is None or not self._write_queue.is_busy:
+            self._graph_reload_pending = False
+
+        self._work_panel.set_enabled_for_repo(has_workdir)
+        for action in (self._branch_action, self._stash_action, self._stash_pop_action):
+            action.setEnabled(has_workdir)
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -287,12 +365,50 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("커밋을 읽는 중...")
         self._pool.start(loader)
         self._pool.start(refs_loader)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        """작업 디렉터리 상태를 워커로 다시 읽는다. bare 저장소는 대상 아님."""
+        if self._repo_path is None or (
+            self._info is not None and self._info.workdir is None
+        ):
+            return
+        if self._status_loader is not None:
+            self._status_loader.cancel()
+
+        status_loader = StatusLoader(self._repo_path)
+        status_loader.signals.ready.connect(
+            lambda status, head, l=status_loader: self._on_status_ready(
+                l, status, head
+            )
+        )
+        status_loader.signals.failed.connect(
+            lambda error, l=status_loader: self._on_status_failed(l, error)
+        )
+        self._status_loader = status_loader
+        self._pool.start(status_loader)
+
+    def _on_status_ready(
+        self, loader: StatusLoader, status, head_message  # noqa: ANN001
+    ) -> None:
+        if loader is not self._status_loader:
+            return
+        self._work_panel.show_status(status, head_message)
+
+    def _on_status_failed(self, loader: StatusLoader, error: GitClientError) -> None:
+        if loader is not self._status_loader:
+            return
+        self.statusBar().showMessage(
+            f"작업 디렉터리 상태를 읽지 못했습니다: {error.message}"
+        )
 
     def _cancel_loading(self) -> None:
         if self._loader is not None:
             self._loader.cancel()
         if self._refs_loader is not None:
             self._refs_loader.cancel()
+        if self._status_loader is not None:
+            self._status_loader.cancel()
         for diff_loader in self._diff_loaders.values():
             diff_loader.cancel()
         self._loading = False
@@ -348,6 +464,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt 시그니처
         """창을 닫을 때 워커가 살아 있으면 정리한다."""
         self._cancel_loading()
+        # 큐를 분리해 두면 닫힌 뒤 도착하는 늦은 idle/실패 시그널을
+        # 정체 가드가 걸러낸다 — 파괴된 위젯을 건드리지 않는다.
+        self._dispose_write_queue()
         self._pool.waitForDone(2000)
         super().closeEvent(event)
 
@@ -382,6 +501,9 @@ class MainWindow(QMainWindow):
                 label = f"  {'● ' if ref.is_head else ''}{ref.shorthand}"
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, ref.target_sha)
+                item.setData(Qt.ItemDataRole.UserRole + 1, ref.kind.value)
+                item.setData(Qt.ItemDataRole.UserRole + 2, ref.shorthand)
+                item.setData(Qt.ItemDataRole.UserRole + 3, ref.is_head)
                 self._ref_list.addItem(item)
 
     def _resize_graph_column(self) -> None:
@@ -421,8 +543,12 @@ class MainWindow(QMainWindow):
         self, sha: str, *, path: str | None, include_detail: bool
     ) -> None:
         # 새 요청이 발급되는 순간 진행 중인 이전 요청들은 전부 무의미해진다.
+        # cancel된 로더는 시그널을 내지 않아 dict에서 안 빠지므로 여기서 비운다
+        # (리뷰에서 확정된 누수). 워커가 실행 중이어도 자기 프레임이 self를
+        # 붙잡고 있어 방출 중 파괴는 일어나지 않는다.
         for stale in self._diff_loaders.values():
             stale.cancel()
+        self._diff_loaders.clear()
 
         self._diff_generation += 1
         token = self._diff_generation
@@ -515,6 +641,222 @@ class MainWindow(QMainWindow):
         self._commit_view.scrollTo(
             self._commit_model.index(row, Column.SUMMARY),
             QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+
+    # ------------------------------------------------------------------
+    # 쓰기 연산 (Phase 2) — 전부 WriteQueue를 경유한다 (§3.3 규칙 3)
+    # ------------------------------------------------------------------
+
+    def _dispose_write_queue(self) -> None:
+        """큐를 교체/제거하기 전 구 큐를 정리한다.
+
+        시그널은 정체 캡처 가드가 걸러내므로 남은 작업이 끝나기를 기다렸다가
+        스스로 지워지게 한다. 진행 중인 쓰기를 강제로 죽이면 인덱스가 깨진다.
+        """
+        old = self._write_queue
+        if old is None:
+            return
+        self._write_queue = None
+        if old.is_busy:
+            old.idle.connect(old.deleteLater)
+        else:
+            old.deleteLater()
+
+    def _submit_write(
+        self,
+        name: str,
+        work,  # noqa: ANN001 - Callable[[LocalGitEngine], Any]
+        *,
+        reload_graph: bool = False,
+        on_success=None,  # noqa: ANN001
+    ) -> None:
+        queue = self._write_queue
+        if queue is None:
+            return
+
+        self.statusBar().showMessage(f"{name}...")
+        job_id = queue.submit(name, work)
+        # submit 직후 connect해도 안전하다 — 완료 시그널은 UI 스레드 이벤트 루프로
+        # 큐잉되므로 이 메서드가 반환하기 전에는 배달되지 않는다.
+
+        def _cleanup() -> None:
+            for signal, slot in ((queue.job_succeeded, _ok), (queue.job_failed, _fail)):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+
+        def _ok(jid: int, _done_name: str, result: object) -> None:
+            if jid != job_id:
+                return
+            _cleanup()
+            if reload_graph:
+                # 성공했을 때만 재로딩한다. 제출 시점에 플래그를 세우면
+                # 실패한 쓰기도 전체 재로딩을 유발한다 (리뷰에서 확정된 결함).
+                self._graph_reload_pending = True
+            if on_success is not None:
+                on_success(result)
+
+        def _fail(jid: int, _done_name: str, _error: object) -> None:
+            if jid != job_id:
+                return
+            _cleanup()
+
+        queue.job_succeeded.connect(_ok)
+        queue.job_failed.connect(_fail)
+
+    def _on_write_failed(self, queue: WriteQueue, error: GitClientError) -> None:
+        if queue is not self._write_queue:
+            return  # 교체된 저장소의 늦은 실패 — 현재 화면과 무관하다
+        self._report(error)
+
+    def _on_write_queue_idle(self, queue: WriteQueue) -> None:
+        """쓰기 묶음이 끝났다 — 상태를 새로 읽고, 필요하면 그래프도 다시 만든다."""
+        if queue is not self._write_queue:
+            return  # 교체된 저장소의 늦은 idle
+        if self._graph_reload_pending and self._repo_path is not None:
+            self._graph_reload_pending = False
+            self.open_repository(self._repo_path)
+            return
+        self._refresh_status()
+        self._update_status(self._info)
+
+    def _on_stage_requested(self, path: str) -> None:
+        self._submit_write(
+            f"스테이징: {path}", lambda engine: engine.stage_file(path)
+        )
+
+    def _on_unstage_requested(self, path: str) -> None:
+        self._submit_write(
+            f"스테이징 취소: {path}", lambda engine: engine.unstage_file(path)
+        )
+
+    def _on_discard_requested(self, path: str) -> None:
+        # §5.2 원칙 2: 파괴적 작업은 무엇이 사라지는지 명시하고 확인받는다.
+        answer = QMessageBox.warning(
+            self,
+            "변경 사항 버리기",
+            f"{path} 의 커밋되지 않은 변경을 버립니다.\n"
+            "이 작업은 되돌릴 수 없습니다. 계속할까요?",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer is not QMessageBox.StandardButton.Discard:
+            return
+        self._submit_write(
+            f"버리기: {path}", lambda engine: engine.discard_file(path)
+        )
+
+    def _on_commit_requested(self, message: str, amend: bool) -> None:
+        # 연타 가드: 앞선 커밋이 아직 큐에 있으면 무시한다. 엔진의 빈 커밋
+        # 거부와 이중 방어다 (리뷰에서 확정된 결함 — 연타 시 중복 커밋).
+        if self._write_queue is None or self._write_queue.is_busy:
+            return
+        name = "커밋 수정" if amend else "커밋"
+        self._submit_write(
+            name,
+            lambda engine: engine.create_commit(message, amend=amend),
+            reload_graph=True,
+            on_success=lambda _sha: self._work_panel.clear_message(),
+        )
+
+    def _on_workdir_diff_requested(self, path: str, staged: bool) -> None:
+        if self._repo_path is None:
+            return
+        # 이 요청이 보류 중인 커밋 diff 의도를 대체한다. 디바운스를 멈추지 않으면
+        # 나중에 만료돼 이전 커밋 diff가 최신 토큰을 받아 이 결과를 덮는다
+        # (리뷰에서 확정된 순서 역전).
+        self._diff_debounce.stop()
+        for stale in self._diff_loaders.values():
+            stale.cancel()
+        self._diff_loaders.clear()
+
+        self._diff_generation += 1
+        token = self._diff_generation
+        loader = WorkdirDiffLoader(self._repo_path, path, token, staged=staged)
+        loader.signals.ready.connect(self._on_diff_ready)
+        loader.signals.failed.connect(self._on_diff_failed)
+        self._diff_loaders[token] = loader
+        self._pool.start(loader)
+
+    # ------------------------------------------------------------------
+    # 브랜치 / Stash (Phase 2)
+    # ------------------------------------------------------------------
+
+    def _prompt_new_branch(self) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        name, ok = QInputDialog.getText(self, "새 브랜치", "브랜치 이름:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        self._submit_write(
+            f"브랜치 생성: {name}",
+            lambda engine: engine.create_branch(name, checkout=True),
+            reload_graph=True,
+        )
+
+    def _on_stash_save(self) -> None:
+        self._submit_write(
+            "Stash 보관",
+            lambda engine: engine.stash_save(),
+            reload_graph=True,
+        )
+
+    def _on_stash_pop(self) -> None:
+        self._submit_write(
+            "Stash 꺼내기",
+            lambda engine: engine.stash_pop(),
+            reload_graph=True,
+        )
+
+    def _on_ref_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
+        item = self._ref_list.itemAt(pos)
+        if item is None:
+            return
+        kind = item.data(Qt.ItemDataRole.UserRole + 1)
+        shorthand = item.data(Qt.ItemDataRole.UserRole + 2)
+        is_head = bool(item.data(Qt.ItemDataRole.UserRole + 3))
+        if kind != RefKind.LOCAL_BRANCH.value or shorthand is None:
+            return
+
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        if not is_head:
+            checkout = menu.addAction(f"'{shorthand}' 브랜치로 전환")
+            checkout.triggered.connect(
+                lambda: self._submit_write(
+                    f"브랜치 전환: {shorthand}",
+                    lambda engine: engine.checkout_branch(shorthand),
+                    reload_graph=True,
+                )
+            )
+            delete = menu.addAction(f"'{shorthand}' 삭제...")
+            delete.triggered.connect(lambda: self._confirm_delete_branch(shorthand))
+        else:
+            current = menu.addAction("현재 브랜치")
+            current.setEnabled(False)
+        menu.exec(self._ref_list.mapToGlobal(pos))
+
+    def _confirm_delete_branch(self, shorthand: str) -> None:
+        # §5.2 원칙 2: 무엇이 사라지는지 명시. 커밋 자체는 reflog에 남는다.
+        answer = QMessageBox.warning(
+            self,
+            "브랜치 삭제",
+            f"'{shorthand}' 브랜치를 삭제합니다.\n"
+            "브랜치가 가리키던 커밋은 사라지지 않지만, 다른 브랜치에 속하지\n"
+            "않은 커밋은 목록에서 보이지 않게 됩니다 (git reflog로 복구 가능).\n"
+            "계속할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+        self._submit_write(
+            f"브랜치 삭제: {shorthand}",
+            lambda engine: engine.delete_branch(shorthand),
+            reload_graph=True,
         )
 
     def _report(self, error: GitClientError) -> None:

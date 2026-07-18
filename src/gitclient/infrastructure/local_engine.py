@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pygit2
-from pygit2.enums import SortMode
+from pygit2.enums import CheckoutStrategy, DiffOption, FileStatus, SortMode
 
 from gitclient.domain.errors import (
     EngineError,
@@ -38,6 +38,9 @@ from gitclient.domain.models import (
     RefKind,
     RepositoryInfo,
     Signature,
+    WorkAreaStatus,
+    WorkingFileChange,
+    WorkingTreeStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -362,45 +365,48 @@ class LocalGitEngine:
 
         lines: list[DiffLine] = []
         for patch in diff:
-            delta = patch.delta
-            if path is not None and delta.new_file.path != path:
+            if path is not None and patch.delta.new_file.path != path:
                 continue
+            self._append_patch_lines(lines, patch)
+        return lines
 
+    def _append_patch_lines(
+        self, lines: list[DiffLine], patch: pygit2.Patch
+    ) -> None:
+        """패치 하나를 DiffLine 목록으로 풀어 붙인다."""
+        lines.append(
+            DiffLine(
+                kind=DiffLineKind.FILE_HEADER,
+                text=self._file_header(patch),
+            )
+        )
+
+        if patch.delta.is_binary:
+            # 바이너리는 내용 diff를 낼 수 없다. 사실을 알리고 넘어간다.
             lines.append(
                 DiffLine(
-                    kind=DiffLineKind.FILE_HEADER,
-                    text=self._file_header(patch),
+                    kind=DiffLineKind.CONTEXT,
+                    text="(바이너리 파일 — 내용 diff를 표시할 수 없습니다)",
                 )
             )
+            return
 
-            if delta.is_binary:
-                # 바이너리는 내용 diff를 낼 수 없다. 사실을 알리고 넘어간다.
+        for hunk in patch.hunks:
+            lines.append(
+                DiffLine(
+                    kind=DiffLineKind.HUNK_HEADER,
+                    text=hunk.header.rstrip("\n"),
+                )
+            )
+            for line in hunk.lines:
                 lines.append(
                     DiffLine(
-                        kind=DiffLineKind.CONTEXT,
-                        text="(바이너리 파일 — 내용 diff를 표시할 수 없습니다)",
+                        kind=_ORIGIN_MAP.get(line.origin, DiffLineKind.CONTEXT),
+                        text=line.content.rstrip("\n"),
+                        old_lineno=_lineno(line.old_lineno),
+                        new_lineno=_lineno(line.new_lineno),
                     )
                 )
-                continue
-
-            for hunk in patch.hunks:
-                lines.append(
-                    DiffLine(
-                        kind=DiffLineKind.HUNK_HEADER,
-                        text=hunk.header.rstrip("\n"),
-                    )
-                )
-                for line in hunk.lines:
-                    lines.append(
-                        DiffLine(
-                            kind=_ORIGIN_MAP.get(line.origin, DiffLineKind.CONTEXT),
-                            text=line.content.rstrip("\n"),
-                            old_lineno=_lineno(line.old_lineno),
-                            new_lineno=_lineno(line.new_lineno),
-                        )
-                    )
-
-        return lines
 
     def _file_header(self, patch: pygit2.Patch) -> str:
         delta = patch.delta
@@ -423,6 +429,332 @@ class LocalGitEngine:
 
         diff.find_similar()  # 이름 변경 탐지
         return diff
+
+    # ------------------------------------------------------------------
+    # 작업 디렉터리 상태 (Phase 2)
+    # ------------------------------------------------------------------
+
+    # (인덱스 플래그, 워킹트리 플래그) → 도메인 상태
+    _INDEX_FLAGS = (
+        (FileStatus.INDEX_NEW, WorkAreaStatus.NEW),
+        (FileStatus.INDEX_MODIFIED, WorkAreaStatus.MODIFIED),
+        (FileStatus.INDEX_DELETED, WorkAreaStatus.DELETED),
+        (FileStatus.INDEX_RENAMED, WorkAreaStatus.RENAMED),
+    )
+    _WT_FLAGS = (
+        (FileStatus.WT_NEW, WorkAreaStatus.NEW),
+        (FileStatus.WT_MODIFIED, WorkAreaStatus.MODIFIED),
+        (FileStatus.WT_DELETED, WorkAreaStatus.DELETED),
+        (FileStatus.WT_RENAMED, WorkAreaStatus.RENAMED),
+    )
+
+    def working_tree_status(self) -> WorkingTreeStatus:
+        """스테이징/미스테이징 변경 목록.
+
+        워킹 트리 전체를 스캔하므로 파일 수에 비례한다 — UI 스레드 금지.
+        """
+        with _translate("작업 디렉터리 상태 조회"):
+            status = self._repo.status(untracked_files="all", ignored=False)
+
+        staged: list[WorkingFileChange] = []
+        unstaged: list[WorkingFileChange] = []
+
+        for path, flags in sorted(status.items()):
+            if flags & FileStatus.CONFLICTED:
+                unstaged.append(
+                    WorkingFileChange(path, WorkAreaStatus.CONFLICTED, staged=False)
+                )
+                continue
+            for flag, mapped in self._INDEX_FLAGS:
+                if flags & flag:
+                    staged.append(WorkingFileChange(path, mapped, staged=True))
+                    break
+            for flag, mapped in self._WT_FLAGS:
+                if flags & flag:
+                    unstaged.append(WorkingFileChange(path, mapped, staged=False))
+                    break
+
+        return WorkingTreeStatus(staged=tuple(staged), unstaged=tuple(unstaged))
+
+    def head_message(self) -> str | None:
+        """HEAD 커밋의 메시지. amend 시 메시지 프리필에 쓴다. O(1)."""
+        with _translate("HEAD 메시지 조회"):
+            if self._repo.head_is_unborn:
+                return None
+            return self._repo[self._repo.head.target].message
+
+    def workdir_diff_lines(self, path: str, *, staged: bool) -> list[DiffLine]:
+        """커밋되지 않은 변경의 diff.
+
+        staged=True 면 HEAD↔인덱스, False 면 인덱스↔워킹트리를 비교한다.
+        """
+        with _translate("작업 디렉터리 diff 계산"):
+            if staged:
+                if self._repo.head_is_unborn:
+                    # 첫 커밋 전에는 HEAD가 없다 — 빈 트리와 비교해야
+                    # 스테이징된 파일이 '새 파일'로 보인다. (리뷰에서 확정된 결함:
+                    # "HEAD" 참조는 여기서 예외를 던졌다)
+                    empty_tree = self._repo[self._repo.TreeBuilder().write()]
+                    diff = self._repo.diff(empty_tree, cached=True)
+                else:
+                    diff = self._repo.diff("HEAD", cached=True)
+            else:
+                # 미추적 파일도 diff에 포함해야 클릭 시 내용이 보인다.
+                # 기본 diff는 untracked를 제외해 빈 화면이 됐다 (확정된 결함).
+                diff = self._repo.diff(
+                    flags=(
+                        DiffOption.INCLUDE_UNTRACKED
+                        | DiffOption.SHOW_UNTRACKED_CONTENT
+                        | DiffOption.RECURSE_UNTRACKED_DIRS
+                    )
+                )
+            diff.find_similar()
+
+            lines: list[DiffLine] = []
+            for patch in diff:
+                if patch.delta.new_file.path != path and (
+                    patch.delta.old_file.path != path
+                ):
+                    continue
+                self._append_patch_lines(lines, patch)
+            return lines
+
+    # ------------------------------------------------------------------
+    # 쓰기 연산 (Phase 2)
+    #
+    # 호출 규약: 반드시 WriteQueue를 통해 직렬로 실행할 것 (§3.3 규칙 3).
+    # 같은 저장소에 쓰기 두 개가 동시에 들어가면 인덱스가 깨진다.
+    # ------------------------------------------------------------------
+
+    def stage_file(self, path: str) -> None:
+        """파일 하나를 스테이징한다. 삭제된 파일이면 삭제를 스테이징한다."""
+        with _translate("스테이징"):
+            index = self._repo.index
+            workdir = Path(self._repo.workdir or "")
+            if (workdir / path).exists():
+                index.add(path)
+            else:
+                index.remove(path)
+            index.write()
+
+    def unstage_file(self, path: str) -> None:
+        """스테이징을 취소한다 — 인덱스 엔트리를 HEAD 상태로 되돌린다."""
+        with _translate("스테이징 취소"):
+            index = self._repo.index
+            head_tree = None
+            if not self._repo.head_is_unborn:
+                head_tree = self._repo.head.peel(pygit2.Tree)
+
+            if head_tree is not None and path in head_tree:
+                entry = head_tree / path
+                index.add(pygit2.IndexEntry(path, entry.id, entry.filemode))
+            else:
+                # HEAD에 없던 파일(INDEX_NEW)은 인덱스에서 빼는 것이 취소다.
+                index.remove(path)
+            index.write()
+
+    def discard_file(self, path: str) -> None:
+        """워킹 트리 변경을 버린다. 되돌릴 수 없다 — UI가 반드시 확인을 받을 것.
+
+        복원 기준은 HEAD가 아니라 **인덱스**다. 사용자가 버리겠다고 확인한 것은
+        미스테이징 변경뿐이며, 스테이징해 둔 내용은 그 범위 밖이다.
+        (초기 구현의 checkout_head는 인덱스까지 HEAD로 되돌려 스테이징된
+        변경을 함께 파괴했다 — 리뷰에서 확정된 결함. checkout_index는
+        unborn HEAD에서도 동작한다.)
+
+        추적되지 않은 새 파일은 인덱스에 없으므로 직접 지운다.
+        """
+        with _translate("변경 사항 버리기"):
+            flags = self._repo.status_file(path)
+            if flags & FileStatus.WT_NEW:
+                target = Path(self._repo.workdir or "") / path
+                target.unlink(missing_ok=True)
+                return
+            self._repo.checkout_index(
+                paths=[path], strategy=CheckoutStrategy.FORCE
+            )
+
+    def create_commit(self, message: str, *, amend: bool = False) -> str:
+        """스테이징된 내용으로 커밋한다. 새 커밋의 SHA를 반환한다.
+
+        작성자는 git 설정(user.name/user.email)에서 온다 — 설정이 없으면
+        어떤 서명으로 커밋할지 애플리케이션이 지어낼 수 없으므로 오류다.
+        """
+        if not message.strip():
+            raise EngineError(
+                "커밋 메시지가 비어 있습니다.",
+                action="변경 내용을 설명하는 메시지를 입력해 주세요.",
+            )
+
+        try:
+            signature = self._repo.default_signature
+        except (KeyError, pygit2.GitError) as exc:
+            raise EngineError(
+                "커밋 작성자 정보가 설정되어 있지 않습니다.",
+                detail=str(exc),
+                action=(
+                    "git config --global user.name \"이름\" 과 "
+                    "git config --global user.email \"메일\" 을 설정해 주세요."
+                ),
+            ) from exc
+
+        with _translate("커밋 생성"):
+            index = self._repo.index
+            tree = index.write_tree()
+            merge_head = self._merge_head()
+
+            if amend:
+                if self._repo.head_is_unborn:
+                    raise EngineError(
+                        "수정할 커밋이 없습니다.",
+                        action="첫 커밋은 amend 없이 만들어 주세요.",
+                    )
+                if merge_head is not None:
+                    raise EngineError(
+                        "머지 진행 중에는 커밋 수정(amend)을 할 수 없습니다.",
+                        action="머지 커밋을 먼저 완성해 주세요.",
+                    )
+                head_commit = self._repo[self._repo.head.target]
+                new_oid = self._repo.amend_commit(
+                    head_commit,
+                    "HEAD",
+                    message=message,
+                    tree=tree,
+                    committer=signature,
+                )
+                return str(new_oid)
+
+            # 스테이징된 것이 없는 커밋은 거부한다 — 커밋 버튼 연타로 같은
+            # 메시지의 빈 커밋이 쌓이는 것을 막는다 (리뷰에서 확정된 결함).
+            # 단, 머지 커밋은 트리가 HEAD와 같아도 유효하다(ours 전략 등).
+            if merge_head is None:
+                if self._repo.head_is_unborn:
+                    if len(index) == 0:
+                        raise EngineError(
+                            "스테이징된 변경이 없습니다.",
+                            action="커밋할 파일을 먼저 스테이징해 주세요.",
+                        )
+                elif tree == self._repo.head.peel(pygit2.Tree).id:
+                    raise EngineError(
+                        "스테이징된 변경이 없습니다.",
+                        action="커밋할 파일을 먼저 스테이징해 주세요.",
+                    )
+
+            parents = (
+                [] if self._repo.head_is_unborn else [self._repo.head.target]
+            )
+            if merge_head is not None:
+                # 머지 진행 중의 커밋은 머지 커밋이다 — MERGE_HEAD가 두 번째
+                # 부모가 되어야 한다. 빠뜨리면 머지가 일반 커밋으로 둔갑해
+                # 히스토리가 손상된다 (리뷰에서 확정된 결함).
+                parents.append(merge_head)
+
+            new_oid = self._repo.create_commit(
+                "HEAD", signature, signature, message, tree, parents
+            )
+            if merge_head is not None:
+                self._repo.state_cleanup()  # MERGE_HEAD/MERGE_MSG 정리
+            return str(new_oid)
+
+    def _merge_head(self) -> pygit2.Oid | None:
+        """머지 진행 중이면 MERGE_HEAD의 커밋 Oid."""
+        try:
+            return self._repo.lookup_reference("MERGE_HEAD").target
+        except (KeyError, pygit2.GitError):
+            return None
+
+    # ------------------------------------------------------------------
+    # 브랜치 연산 (Phase 2)
+    # ------------------------------------------------------------------
+
+    def create_branch(self, name: str, *, checkout: bool = False) -> None:
+        """HEAD 커밋에서 브랜치를 만든다."""
+        with _translate("브랜치 생성"):
+            if self._repo.head_is_unborn:
+                raise EngineError(
+                    "커밋이 없어 브랜치를 만들 수 없습니다.",
+                    action="첫 커밋을 만든 뒤 브랜치를 생성해 주세요.",
+                )
+            if name in self._repo.branches.local:
+                raise EngineError(
+                    f"브랜치가 이미 있습니다: {name}",
+                    action="다른 이름을 사용해 주세요.",
+                )
+            head_commit = self._repo[self._repo.head.target]
+            branch = self._repo.branches.local.create(name, head_commit)
+            if checkout:
+                self._repo.checkout(branch)
+
+    def checkout_branch(self, name: str) -> None:
+        """브랜치를 전환한다. 충돌하는 로컬 변경이 있으면 실패한다."""
+        try:
+            with _translate("브랜치 전환"):
+                self._repo.checkout(self._repo.branches.local[name])
+        except EngineError as exc:
+            if "conflict" in (exc.detail or "").lower():
+                raise EngineError(
+                    f"로컬 변경과 충돌해 '{name}' 브랜치로 전환할 수 없습니다.",
+                    detail=exc.detail,
+                    action="변경 사항을 커밋하거나 stash에 보관한 뒤 다시 시도해 주세요.",
+                ) from exc
+            raise
+
+    def delete_branch(self, name: str) -> None:
+        """로컬 브랜치를 삭제한다. 현재 브랜치는 삭제할 수 없다."""
+        with _translate("브랜치 삭제"):
+            branch = self._repo.branches.local.get(name)
+            if branch is None:
+                raise EngineError(f"브랜치를 찾을 수 없습니다: {name}")
+            if branch.is_head():
+                raise EngineError(
+                    "현재 작업 중인 브랜치는 삭제할 수 없습니다.",
+                    action="다른 브랜치로 전환한 뒤 삭제해 주세요.",
+                )
+            branch.delete()
+
+    # ------------------------------------------------------------------
+    # Stash (Phase 2)
+    # ------------------------------------------------------------------
+
+    def stash_save(self, message: str | None = None) -> str:
+        """현재 변경을 stash에 보관한다."""
+        try:
+            signature = self._repo.default_signature
+        except (KeyError, pygit2.GitError) as exc:
+            raise EngineError(
+                "stash 작성자 정보가 설정되어 있지 않습니다.",
+                detail=str(exc),
+                action="git config --global user.name/user.email 을 설정해 주세요.",
+            ) from exc
+
+        try:
+            with _translate("stash 보관"):
+                oid = self._repo.stash(
+                    signature,
+                    message=message or "gitclient stash",
+                    include_untracked=True,
+                )
+                return str(oid)
+        except EngineError as exc:
+            if "nothing to stash" in (exc.detail or "").lower():
+                raise EngineError(
+                    "보관할 변경 사항이 없습니다.",
+                ) from exc
+            raise
+
+    def stash_pop(self) -> None:
+        """가장 최근 stash를 꺼내 적용한다."""
+        with _translate("stash 적용"):
+            stashes = self._repo.listall_stashes()
+            if not stashes:
+                raise EngineError(
+                    "보관된 stash가 없습니다.",
+                )
+            self._repo.stash_pop(0)
+
+    def stash_count(self) -> int:
+        with _translate("stash 조회"):
+            return len(self._repo.listall_stashes())
 
     def _lookup_commit(self, sha: str) -> pygit2.Commit:
         try:

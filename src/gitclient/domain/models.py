@@ -142,6 +142,41 @@ class CommitDetail:
         return sum(c.deletions for c in self.changes)
 
 
+class WorkAreaStatus(Enum):
+    """워킹 트리/인덱스에서 파일 하나의 상태."""
+
+    NEW = "A"
+    MODIFIED = "M"
+    DELETED = "D"
+    RENAMED = "R"
+    CONFLICTED = "!"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingFileChange:
+    """커밋되지 않은 변경 하나.
+
+    같은 파일이 staged와 unstaged 양쪽에 동시에 나타날 수 있다
+    (일부만 스테이징한 뒤 또 수정한 경우). 이때는 항목이 두 개 생긴다.
+    """
+
+    path: str
+    status: WorkAreaStatus
+    staged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingTreeStatus:
+    """작업 디렉터리 전체 상태."""
+
+    staged: tuple[WorkingFileChange, ...] = ()
+    unstaged: tuple[WorkingFileChange, ...] = ()
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.staged and not self.unstaged
+
+
 @dataclass(slots=True)
 class RepositoryInfo:
     """열려 있는 저장소의 요약 정보."""
