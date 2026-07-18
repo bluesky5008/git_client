@@ -188,6 +188,8 @@ class RepositoryInfo:
     is_bare: bool = False
     is_shallow: bool = False
     refs: list[Ref] = field(default_factory=list)
+    remotes: list[str] = field(default_factory=list)
+    """설정된 원격 이름들. 비어 있으면 원격 작업이 불가능하다."""
 
     @property
     def display_name(self) -> str:

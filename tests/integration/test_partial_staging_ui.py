@@ -234,6 +234,7 @@ class TestCoordinatesRefreshAfterApply:
         show_unstaged_diff(window, qtbot)
 
         # 1차: 첫 변경 쌍만 올린다
+        generation_before = window._diff_generation
         selection = window._diff_view.selectionModel()
         for text in ("2", "TWO"):
             selection.select(
@@ -245,9 +246,16 @@ class TestCoordinatesRefreshAfterApply:
             lambda: staged_content(repo) == "1\nTWO\n3\n4\n5\n", timeout=TIMEOUT
         )
 
-        # 적용 후 diff가 자동으로 다시 읽혀 남은 변경만 남아야 한다
+        # 적용 후 diff가 자동으로 다시 읽혀 남은 변경만 남아야 한다.
+        #
+        # "patch is not None"으로 기다리면 안 된다 — **낡은 patch가 아직
+        # 남아 있어 조건이 즉시 참**이 되므로, 재로딩 전 모델을 읽고 통과해
+        # 버린다. 부하가 걸린 전체 실행에서만 간헐 실패했다.
+        # 세대 토큰이 올라가고(새 로딩 시작) 로더가 비었는지(로딩 완료)를
+        # 함께 본다.
         qtbot.waitUntil(
-            lambda: window._diff_model.patch is not None
+            lambda: window._diff_generation > generation_before
+            and not window._diff_loaders
             and window._diff_model.rowCount() > 0,
             timeout=TIMEOUT,
         )

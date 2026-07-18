@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from gitclient.application.commit_loader import CommitLoader
 from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
+from gitclient.application.fetch_worker import FetchWorker
 from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
@@ -55,6 +56,16 @@ from gitclient.viewmodel.diff_model import DiffModel, DiffRole
 
 ROW_HEIGHT = 24
 GRAPH_COLUMN_PADDING = 12
+
+
+def _format_bytes(count: int) -> str:
+    """전송량을 사람이 읽는 형태로. git과 같은 이진 접두사를 쓴다."""
+    size = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} GiB"
 
 
 class MainWindow(QMainWindow):
@@ -76,6 +87,9 @@ class MainWindow(QMainWindow):
         # 쓰기 경로 (Phase 2). 저장소별 직렬화는 WriteQueue가 보장한다.
         self._write_queue: WriteQueue | None = None
         self._graph_reload_pending = False
+
+        # 원격 작업 (Phase 3). 같은 저장소에 fetch가 중복으로 뜨지 않게 한다.
+        self._fetch_worker: FetchWorker | None = None
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
@@ -145,6 +159,15 @@ class MainWindow(QMainWindow):
         main_splitter.setSizes([260, 1020])
 
         self.setCentralWidget(main_splitter)
+
+        # 전송량은 임시 메시지로 띄우면 곧바로 다른 메시지에 덮인다 — 특히
+        # fetch 직후의 그래프 재로딩에. 목적함수가 누적 전송 바이트인 만큼
+        # 사용자가 비용을 계속 볼 수 있어야 하므로 고정 위젯에 둔다.
+        # (performance.md §8.4)
+        self._transfer_label = QLabel("")
+        self._transfer_label.setToolTip("마지막 원격 작업의 전송량")
+        self.statusBar().addPermanentWidget(self._transfer_label)
+
         self.statusBar().showMessage("저장소를 열어 주세요 (Ctrl+O)")
 
     def _wrap(self, title: str, widget: QWidget) -> QWidget:
@@ -258,6 +281,12 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(quit_action)
 
+        self._fetch_action = QAction("가져오기 (Fetch)", self)
+        self._fetch_action.setToolTip(
+            "원격의 변경을 가져옵니다 (워킹 트리는 건드리지 않습니다)"
+        )
+        self._fetch_action.triggered.connect(self._on_fetch)
+
         self._branch_action = QAction("새 브랜치...", self)
         self._branch_action.triggered.connect(self._prompt_new_branch)
         self._stash_action = QAction("Stash 보관", self)
@@ -266,6 +295,8 @@ class MainWindow(QMainWindow):
         self._stash_pop_action.triggered.connect(self._on_stash_pop)
 
         repo_menu = self.menuBar().addMenu("저장소")
+        repo_menu.addAction(self._fetch_action)
+        repo_menu.addSeparator()
         repo_menu.addAction(self._branch_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._stash_action)
@@ -275,6 +306,8 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         toolbar.addAction(open_action)
         toolbar.addAction(reload_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self._fetch_action)
         toolbar.addSeparator()
         toolbar.addAction(self._branch_action)
         toolbar.addAction(self._stash_action)
@@ -307,6 +340,15 @@ class MainWindow(QMainWindow):
             return
 
         self._cancel_loading()
+
+        # fetch 워커는 저장소에 묶여 있다. 저장소가 바뀌면 여기서 놓아줘야
+        # _on_fetch_finished의 정체 가드가 비로소 성립한다 — 그러지 않으면
+        # 이전 저장소의 전송량이 새 저장소 상태바에 찍히고, 새 저장소가
+        # 통째로 재로딩되어 선택과 스크롤이 초기화된다.
+        # _repo_path를 덮어쓰기 전에 비교해야 하므로 순서가 중요하다.
+        if self._fetch_worker is not None and str(path) != self._repo_path:
+            self._fetch_worker.cancel()
+            self._fetch_worker = None
 
         self._engine = engine
         self._info = info
@@ -356,6 +398,13 @@ class MainWindow(QMainWindow):
         self._work_panel.set_enabled_for_repo(has_workdir)
         for action in (self._branch_action, self._stash_action, self._stash_pop_action):
             action.setEnabled(has_workdir)
+
+        # fetch는 원격이 있어야 의미가 있다. bare 저장소에서도 가능하다.
+        # 진행 중인 fetch가 있으면 켜지 않는다 — 켜져 있는데 중복 가드에
+        # 걸려 아무 반응도 없는 버튼이 되면 안 된다.
+        self._fetch_action.setEnabled(
+            self._has_remotes() and self._fetch_worker is None
+        )
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -503,6 +552,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt 시그니처
         """창을 닫을 때 워커가 살아 있으면 정리한다."""
         self._cancel_loading()
+        # fetch는 네트워크에 매달려 있어 스스로 끝나기를 기다릴 수 없다.
+        # 취소가 git 프로세스 트리를 끊으므로 전역 스레드풀 슬롯이 곧 풀린다.
+        # 그러지 않으면 창이 사라진 뒤에도 프로세스가 최대 5분 남아, 사용자가
+        # 앱을 다시 띄우면 두 인스턴스가 같은 계측 DB에 쓰게 된다.
+        if self._fetch_worker is not None:
+            self._fetch_worker.cancel()
+            self._fetch_worker = None
         # 큐를 분리해 두면 닫힌 뒤 도착하는 늦은 idle/실패 시그널을
         # 정체 가드가 걸러낸다 — 파괴된 위젯을 건드리지 않는다.
         self._dispose_write_queue()
@@ -968,6 +1024,99 @@ class MainWindow(QMainWindow):
             lambda engine: engine.stash_pop(),
             reload_graph=True,
         )
+
+    # ------------------------------------------------------------------
+    # 원격 작업 (Phase 3)
+    # ------------------------------------------------------------------
+
+    def _fetch_remote(self) -> str | None:
+        """fetch 대상 원격. git과 같이 origin을 우선하고, 없으면 첫 번째를 쓴다.
+
+        버튼 활성 조건과 실행 대상이 같은 규칙에서 나와야 한다. "원격이 하나
+        라도 있으면 켠다"면서 항상 origin을 fetch하면, `upstream` 하나만 있는
+        저장소에서 버튼은 켜지고 누르면 "origin을 찾을 수 없다"가 뜬다 —
+        원격 주소도 권한도 멀쩡한데 엉뚱한 조치를 안내하게 된다.
+        """
+        if self._info is None or not self._info.remotes:
+            return None
+        remotes = self._info.remotes
+        return "origin" if "origin" in remotes else remotes[0]
+
+    def _has_remotes(self) -> bool:
+        """fetch할 원격이 있는가. 활성 판정과 실행 대상이 어긋나지 않게 한다."""
+        return self._fetch_remote() is not None
+
+    def _on_fetch(self) -> None:
+        """원격에서 변경을 가져온다. 계측 결과를 상태바에 보고한다."""
+        if self._repo_path is None or self._fetch_worker is not None:
+            return  # 이미 진행 중 — 중복 fetch를 막는다
+
+        remote = self._fetch_remote()
+        if remote is None:
+            return  # 원격이 없으면 액션이 꺼져 있어야 한다
+
+        worker = FetchWorker(self._repo_path, remote)
+        worker.signals.finished.connect(
+            lambda stats, w=worker: self._on_fetch_finished(w, stats)
+        )
+        worker.signals.failed.connect(
+            lambda error, w=worker: self._on_fetch_failed(w, error)
+        )
+        self._fetch_worker = worker
+        self._fetch_action.setEnabled(False)
+        self.statusBar().showMessage("원격에서 가져오는 중...")
+        self._pool.start(worker)
+
+    def _on_fetch_finished(self, worker: FetchWorker, stats) -> None:  # noqa: ANN001
+        if worker is not self._fetch_worker:
+            return  # 이전 저장소의 늦은 결과
+        self._fetch_worker = None
+        self._fetch_action.setEnabled(True)
+        self._transfer_label.setText(self._describe_fetch(stats))
+
+        # transferred_anything(팩을 받았는가)이 아니라 changed_anything으로
+        # 판단한다. 객체를 하나도 받지 않고 참조만 바뀌는 fetch가 있다 —
+        # 이미 가진 커밋을 가리키는 새 브랜치, prune 삭제. 전자를 쓰면 .git에
+        # 있는 브랜치가 화면에 끝내 안 나타나고, 이미 지워진 원격 브랜치가
+        # 계속 남는다.
+        if stats.changed_anything and self._repo_path is not None:
+            # 전송량 표시는 고정 위젯이라 이 재로딩에 덮이지 않는다.
+            self.open_repository(self._repo_path)
+        else:
+            # 재로딩이 없으면 "가져오는 중..." 임시 메시지를 아무도 지우지
+            # 않아, 끝난 작업이 계속 진행 중인 것처럼 보인다.
+            self._update_status(self._info)
+
+    def _on_fetch_failed(self, worker: FetchWorker, error: GitClientError) -> None:
+        if worker is not self._fetch_worker:
+            return
+        self._fetch_worker = None
+        self._fetch_action.setEnabled(True)
+        self._update_status(self._info)
+        self._report(error)
+
+    def _describe_fetch(self, stats) -> str:  # noqa: ANN001
+        """계측 결과를 사람이 읽을 문장으로.
+
+        전송량을 매번 보여주는 이유는 이 프로젝트의 목적함수가 누적 전송
+        바이트이기 때문이다 — 사용자가 비용을 볼 수 있어야 판단할 수 있다.
+        (performance.md §8.4)
+        """
+        if not stats.changed_anything:
+            return f"이미 최신입니다 ({stats.duration_ms}ms)"
+
+        parts = [f"{len(stats.ref_updates)}개 참조 갱신"]
+        if stats.received_bytes:
+            parts.append(f"{_format_bytes(stats.received_bytes)} 전송")
+        elif stats.received_bytes == 0:
+            # 참조만 바뀐 경우. 0바이트는 측정 실패가 아니라 측정된 사실이다.
+            parts.append("객체 전송 없음")
+        else:
+            parts.append("전송량 측정 실패")
+        if stats.received_objects:
+            parts.append(f"객체 {stats.received_objects}개")
+        parts.append(f"{stats.duration_ms}ms")
+        return "가져오기 완료 — " + ", ".join(parts)
 
     def _on_ref_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
         item = self._ref_list.itemAt(pos)
