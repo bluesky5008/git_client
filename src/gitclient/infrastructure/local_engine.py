@@ -19,13 +19,27 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pygit2
-from pygit2.enums import CheckoutStrategy, DiffOption, FileStatus, SortMode
+from pygit2.enums import (
+    ApplyLocation,
+    CheckoutStrategy,
+    DeltaStatus,
+    DiffOption,
+    FileStatus,
+    SortMode,
+)
 
 from gitclient.domain.errors import (
     EngineError,
     GitClientError,
     RepositoryNotFoundError,
     RepositoryOpenError,
+)
+from gitclient.domain.patch import (
+    FilePatch,
+    PatchError,
+    PatchHunk,
+    PatchLine,
+    synthesize_patch,
 )
 from gitclient.domain.models import (
     ChangeStatus,
@@ -487,28 +501,12 @@ class LocalGitEngine:
         """커밋되지 않은 변경의 diff.
 
         staged=True 면 HEAD↔인덱스, False 면 인덱스↔워킹트리를 비교한다.
+
+        비교 대상 선택은 `_workdir_diff`가 담당한다 — 부분 스테이징
+        (`file_patch`)과 같은 diff를 봐야 화면과 적용 대상이 어긋나지 않는다.
         """
         with _translate("작업 디렉터리 diff 계산"):
-            if staged:
-                if self._repo.head_is_unborn:
-                    # 첫 커밋 전에는 HEAD가 없다 — 빈 트리와 비교해야
-                    # 스테이징된 파일이 '새 파일'로 보인다. (리뷰에서 확정된 결함:
-                    # "HEAD" 참조는 여기서 예외를 던졌다)
-                    empty_tree = self._repo[self._repo.TreeBuilder().write()]
-                    diff = self._repo.diff(empty_tree, cached=True)
-                else:
-                    diff = self._repo.diff("HEAD", cached=True)
-            else:
-                # 미추적 파일도 diff에 포함해야 클릭 시 내용이 보인다.
-                # 기본 diff는 untracked를 제외해 빈 화면이 됐다 (확정된 결함).
-                diff = self._repo.diff(
-                    flags=(
-                        DiffOption.INCLUDE_UNTRACKED
-                        | DiffOption.SHOW_UNTRACKED_CONTENT
-                        | DiffOption.RECURSE_UNTRACKED_DIRS
-                    )
-                )
-            diff.find_similar()
+            diff = self._workdir_diff(staged=staged)
 
             lines: list[DiffLine] = []
             for patch in diff:
@@ -518,6 +516,161 @@ class LocalGitEngine:
                     continue
                 self._append_patch_lines(lines, patch)
             return lines
+
+    # ------------------------------------------------------------------
+    # 부분 스테이징 (Phase 2 증분 2)
+    # ------------------------------------------------------------------
+
+    def file_patch(self, path: str, *, staged: bool) -> FilePatch:
+        """파일 하나의 패치를 도메인 모델로 읽는다.
+
+        표시용 `DiffLine`과 달리 줄 원문을 가공 없이 보존한다 —
+        패치 합성에는 줄바꿈과 공백이 그대로 필요하기 때문이다.
+        """
+        with _translate("패치 읽기"):
+            diff = self._workdir_diff(staged=staged)
+            for patch in diff:
+                if path not in (patch.delta.new_file.path, patch.delta.old_file.path):
+                    continue
+                return self._to_file_patch(patch)
+        raise EngineError(
+            f"변경 내용을 찾을 수 없습니다: {path}",
+            action="파일이 외부에서 바뀌었을 수 있습니다. 새로 고침(F5) 후 다시 시도해 주세요.",
+        )
+
+    def _to_file_patch(self, patch: pygit2.Patch) -> FilePatch:
+        delta = patch.delta
+        hunks: list[PatchHunk] = []
+
+        if not delta.is_binary:
+            for hunk in patch.hunks:
+                lines = tuple(
+                    PatchLine(
+                        origin=line.origin,
+                        content=line.content,  # 원문 그대로 — strip 금지
+                        old_lineno=_lineno(line.old_lineno),
+                        new_lineno=_lineno(line.new_lineno),
+                    )
+                    for line in hunk.lines
+                )
+                hunks.append(
+                    PatchHunk(
+                        old_start=hunk.old_start,
+                        old_lines=hunk.old_lines,
+                        new_start=hunk.new_start,
+                        new_lines=hunk.new_lines,
+                        lines=lines,
+                    )
+                )
+
+        return FilePatch(
+            old_path=delta.old_file.path,
+            new_path=delta.new_file.path,
+            hunks=tuple(hunks),
+            is_new=delta.status == DeltaStatus.ADDED
+            or delta.status == DeltaStatus.UNTRACKED,
+            is_deleted=delta.status == DeltaStatus.DELETED,
+            is_binary=delta.is_binary,
+            old_mode=f"{delta.old_file.mode:06o}",
+            new_mode=f"{delta.new_file.mode:06o}",
+        )
+
+    def stage_partial(
+        self, path: str, selected: set[tuple[int, int]] | None = None
+    ) -> None:
+        """선택한 헝크/줄만 스테이징한다.
+
+        `selected`가 None이면 파일의 모든 변경을 스테이징한다(헝크 전체 선택).
+        워킹 트리는 건드리지 않는다 — 인덱스에만 적용된다.
+        """
+        patch = self.file_patch(path, staged=False)
+        self._apply_synthesized(patch, selected, reverse=False, action="스테이징")
+
+    def unstage_partial(
+        self, path: str, selected: set[tuple[int, int]] | None = None
+    ) -> None:
+        """선택한 헝크/줄만 스테이징 해제한다.
+
+        스테이징된 diff(HEAD↔인덱스)를 뒤집어 인덱스에 적용한다.
+        """
+        patch = self.file_patch(path, staged=True)
+        self._apply_synthesized(patch, selected, reverse=True, action="스테이징 취소")
+
+    def _apply_synthesized(
+        self,
+        patch: FilePatch,
+        selected: set[tuple[int, int]] | None,
+        *,
+        reverse: bool,
+        action: str,
+    ) -> None:
+        try:
+            patch_text = synthesize_patch(patch, selected, reverse=reverse)
+        except PatchError as exc:
+            raise EngineError(str(exc)) from exc
+
+        index_path = patch.new_path if reverse else patch.old_path
+        previous_mode = self._index_mode(index_path)
+
+        with _translate(f"부분 {action}"):
+            try:
+                parsed = pygit2.Diff.parse_diff(patch_text)
+                self._repo.apply(parsed, location=ApplyLocation.INDEX)
+                self._restore_mode(index_path, previous_mode)
+            except pygit2.GitError as exc:
+                # 합성이 틀리면 libgit2가 여기서 거부한다. 인덱스는 그대로다.
+                raise EngineError(
+                    f"부분 {action}에 실패했습니다.",
+                    detail=f"{exc}\n\n--- 생성된 패치 ---\n{patch_text}",
+                    action="파일이 그 사이 변경되었을 수 있습니다. "
+                    "새로 고침(F5) 후 다시 시도해 주세요.",
+                ) from exc
+
+    def _index_mode(self, path: str) -> int | None:
+        index = self._repo.index
+        try:
+            return index[path].mode
+        except KeyError:
+            return None
+
+    def _restore_mode(self, path: str, previous_mode: int | None) -> None:
+        """부분 적용 후 파일 모드를 되돌린다.
+
+        libgit2의 `apply(INDEX)`는 실행 비트를 보존하지 않아 100755 파일이
+        100644로 내려앉는다(실측 확인). 패치 헤더로는 고칠 수 없다 —
+        `old mode`/`new mode` 줄을 넣으면 `invalid patch header`로 거부된다.
+        부분 스테이징은 내용만 다루므로, 적용 전 모드를 그대로 복원한다.
+        """
+        if previous_mode is None:
+            return
+        index = self._repo.index
+        try:
+            entry = index[path]
+        except KeyError:
+            return  # 삭제가 적용된 경우 — 복원할 대상이 없다
+        if entry.mode == previous_mode:
+            return
+        index.add(pygit2.IndexEntry(path, entry.id, previous_mode))
+        index.write()
+
+    def _workdir_diff(self, *, staged: bool) -> pygit2.Diff:
+        """스테이징/미스테이징 diff. 부분 스테이징과 표시가 공유한다."""
+        if staged:
+            if self._repo.head_is_unborn:
+                empty_tree = self._repo[self._repo.TreeBuilder().write()]
+                diff = self._repo.diff(empty_tree, cached=True)
+            else:
+                diff = self._repo.diff("HEAD", cached=True)
+        else:
+            diff = self._repo.diff(
+                flags=(
+                    DiffOption.INCLUDE_UNTRACKED
+                    | DiffOption.SHOW_UNTRACKED_CONTENT
+                    | DiffOption.RECURSE_UNTRACKED_DIRS
+                )
+            )
+        diff.find_similar()
+        return diff
 
     # ------------------------------------------------------------------
     # 쓰기 연산 (Phase 2)

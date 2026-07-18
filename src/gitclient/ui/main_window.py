@@ -21,6 +21,7 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QListView,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QSplitter,
     QTableView,
     QVBoxLayout,
@@ -49,7 +51,7 @@ from gitclient.viewmodel.commit_graph_model import (
     CommitGraphModel,
     CommitRole,
 )
-from gitclient.viewmodel.diff_model import DiffModel
+from gitclient.viewmodel.diff_model import DiffModel, DiffRole
 
 ROW_HEIGHT = 24
 GRAPH_COLUMN_PADDING = 12
@@ -77,6 +79,8 @@ class MainWindow(QMainWindow):
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
+        self._diff_source: tuple[str, bool] | None = None
+        """지금 보고 있는 워킹트리 diff의 (경로, staged 여부). 커밋 diff면 None."""
         self._diff_generation = 0
         self._diff_loaders: dict[int, DiffLoader] = {}
         self._diff_debounce = QTimer(self)
@@ -117,7 +121,7 @@ class MainWindow(QMainWindow):
 
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
         detail_splitter.addWidget(self._wrap("변경 파일", self._file_list))
-        detail_splitter.addWidget(self._wrap("변경 내용", self._diff_view))
+        detail_splitter.addWidget(self._wrap("변경 내용", self._build_diff_panel()))
         detail_splitter.setStretchFactor(0, 1)
         detail_splitter.setStretchFactor(1, 3)
 
@@ -188,11 +192,46 @@ class MainWindow(QMainWindow):
         view = QListView()
         view.setModel(self._diff_model)
         view.setItemDelegate(DiffDelegate(view))
-        view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # 부분 스테이징을 위해 여러 줄을 고를 수 있어야 한다 (Phase 2 증분 2).
+        view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         view.setUniformItemSizes(True)
         view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         view.setFont(self._monospace_font())
+        view.selectionModel().selectionChanged.connect(
+            lambda *_: self._update_partial_actions()
+        )
         return view
+
+    def _build_diff_panel(self) -> QWidget:
+        """diff 뷰 + 부분 스테이징 도구 모음."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        bar = QHBoxLayout()
+        bar.setContentsMargins(4, 0, 4, 0)
+        self._stage_hunk_button = QPushButton("헝크 올리기")
+        self._stage_hunk_button.setToolTip(
+            "커서가 있는 헝크 전체를 스테이징합니다"
+        )
+        self._stage_hunk_button.clicked.connect(self._on_stage_hunk)
+        bar.addWidget(self._stage_hunk_button)
+
+        self._stage_lines_button = QPushButton("선택 줄 올리기")
+        self._stage_lines_button.setToolTip(
+            "선택한 줄만 스테이징합니다 (여러 줄 선택 가능)"
+        )
+        self._stage_lines_button.clicked.connect(self._on_stage_lines)
+        bar.addWidget(self._stage_lines_button)
+
+        bar.addStretch(1)
+        self._partial_hint = QLabel("")
+        bar.addWidget(self._partial_hint)
+        layout.addLayout(bar)
+
+        layout.addWidget(self._diff_view)
+        return container
 
     def _monospace_font(self) -> QFont:
         font = QFont("Consolas")
@@ -542,6 +581,8 @@ class MainWindow(QMainWindow):
     def _request_diff(
         self, sha: str, *, path: str | None, include_detail: bool
     ) -> None:
+        # 커밋 diff는 부분 스테이징 대상이 아니다.
+        self._diff_source = None
         # 새 요청이 발급되는 순간 진행 중인 이전 요청들은 전부 무의미해진다.
         # cancel된 로더는 시그널을 내지 않아 dict에서 안 빠지므로 여기서 비운다
         # (리뷰에서 확정된 누수). 워커가 실행 중이어도 자기 프레임이 self를
@@ -573,10 +614,26 @@ class MainWindow(QMainWindow):
         if detail is not None:
             self._populate_file_list(detail)
         self._diff_model.set_lines(lines)
+        self._update_partial_actions()
+
+    def _on_workdir_diff_ready(self, token: int, patch, lines, positions) -> None:  # noqa: ANN001
+        """커밋되지 않은 변경의 diff — 부분 스테이징 좌표를 함께 받는다."""
+        self._diff_loaders.pop(token, None)
+        if token != self._diff_generation:
+            return
+        self._diff_model.set_lines(lines, positions, patch)
+        self._update_partial_actions()
 
     def _on_diff_failed(self, token: int, error: GitClientError) -> None:
         self._diff_loaders.pop(token, None)
         if token != self._diff_generation:
+            return
+        if self._diff_source is not None:
+            # 부분 적용으로 그 파일의 변경이 모두 사라진 경우다 — 오류가 아니라
+            # "더 볼 것이 없음"이므로 모달을 띄우지 않고 조용히 비운다.
+            self._diff_model.clear()
+            self._diff_source = None
+            self._update_partial_actions()
             return
         self._report(error)
 
@@ -773,11 +830,113 @@ class MainWindow(QMainWindow):
 
         self._diff_generation += 1
         token = self._diff_generation
+        self._diff_source = (path, staged)
         loader = WorkdirDiffLoader(self._repo_path, path, token, staged=staged)
-        loader.signals.ready.connect(self._on_diff_ready)
+        loader.signals.ready.connect(self._on_workdir_diff_ready)
         loader.signals.failed.connect(self._on_diff_failed)
         self._diff_loaders[token] = loader
         self._pool.start(loader)
+
+    # ------------------------------------------------------------------
+    # 부분 스테이징 (Phase 2 증분 2)
+    # ------------------------------------------------------------------
+
+    def _selected_positions(self) -> set[tuple[int, int]]:
+        """diff 뷰에서 선택된 줄 중 변경 줄의 좌표."""
+        positions = set()
+        for index in self._diff_view.selectionModel().selectedIndexes():
+            position = index.data(DiffRole.PATCH_POSITION)
+            if position is not None:
+                positions.add(tuple(position))
+        return positions
+
+    def _current_hunk_positions(self) -> set[tuple[int, int]]:
+        """커서가 있는 헝크의 모든 변경 줄 좌표."""
+        current = self._diff_view.currentIndex()
+        if not current.isValid():
+            return set()
+
+        # 행이 어느 헝크에 속하는지는 모델에 직접 묻는다. 좌표를 위로 훑어
+        # 추측하면 헝크 머리글이나 선행 컨텍스트에서 앞 헝크로 새어 나가,
+        # 사용자가 보던 것과 다른 헝크가 올라간다 (확정된 결함).
+        hunk_index = self._diff_model.hunk_at(current.row())
+        if hunk_index is None:
+            return set()
+        return self._diff_model.positions_in_hunk(hunk_index)
+
+    def _update_partial_actions(self) -> None:
+        """부분 스테이징 버튼의 활성 상태와 안내 문구를 갱신한다."""
+        patch = self._diff_model.patch
+        source = self._diff_source
+        can_partial = (
+            self._write_queue is not None
+            and patch is not None
+            and patch.can_stage_partially
+            and source is not None
+        )
+
+        if not can_partial:
+            self._stage_hunk_button.setEnabled(False)
+            self._stage_lines_button.setEnabled(False)
+            hint = ""
+            if patch is not None and patch.is_binary:
+                hint = "바이너리 파일은 부분 스테이징할 수 없습니다"
+            self._partial_hint.setText(hint)
+            return
+
+        staged = source[1]
+        verb = "내리기" if staged else "올리기"
+        self._stage_hunk_button.setText(f"헝크 {verb}")
+        self._stage_lines_button.setText(f"선택 줄 {verb}")
+
+        selected = self._selected_positions()
+        self._stage_hunk_button.setEnabled(bool(self._current_hunk_positions()))
+        self._stage_lines_button.setEnabled(bool(selected))
+        self._partial_hint.setText(
+            f"{len(selected)}줄 선택됨" if selected else "줄을 선택하면 그 줄만 적용합니다"
+        )
+
+    def _on_stage_hunk(self) -> None:
+        self._apply_partial(self._current_hunk_positions(), scope="헝크")
+
+    def _on_stage_lines(self) -> None:
+        self._apply_partial(self._selected_positions(), scope="선택 줄")
+
+    def _apply_partial(self, positions: set[tuple[int, int]], *, scope: str) -> None:
+        if not positions or self._diff_source is None:
+            return
+
+        # 연타 가드: 앞선 부분 적용이 아직 큐에 있으면 화면 좌표는 이미 낡았다.
+        # 그대로 제출하면 엔진이 새로 읽은 패치의 엉뚱한 줄에 적용된다.
+        if self._write_queue is None or self._write_queue.is_busy:
+            return
+
+        path, staged = self._diff_source
+        verb = "내리기" if staged else "올리기"
+
+        if staged:
+            work = lambda engine: engine.unstage_partial(path, positions)  # noqa: E731
+        else:
+            work = lambda engine: engine.stage_partial(path, positions)  # noqa: E731
+
+        self._submit_write(
+            f"{scope} {verb}: {path}",
+            work,
+            on_success=lambda _r: self._reload_after_partial(path, staged),
+        )
+
+    def _reload_after_partial(self, path: str, staged: bool) -> None:
+        """부분 적용 뒤 diff를 다시 읽어 화면 좌표를 인덱스와 맞춘다.
+
+        갱신하지 않으면 화면의 (헝크, 줄) 좌표가 낡은 채 남는다. 엔진은 적용할
+        때 패치를 새로 읽으므로, 다음 적용이 **다른 줄에 꽂혀** 인덱스가 조용히
+        오염된다. 확정된 결함의 수정이다.
+        """
+        if self._diff_source != (path, staged):
+            return  # 그 사이 사용자가 다른 변경을 골랐다
+        self._diff_model.clear()  # 낡은 좌표와 선택을 즉시 버린다
+        self._update_partial_actions()
+        self._on_workdir_diff_requested(path, staged)
 
     # ------------------------------------------------------------------
     # 브랜치 / Stash (Phase 2)

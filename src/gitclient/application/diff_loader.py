@@ -96,12 +96,19 @@ class DiffLoader(QRunnable):
                 )
 
 
-class WorkdirDiffLoader(QRunnable):
-    """커밋되지 않은 변경(스테이징/미스테이징) 하나의 diff를 계산한다.
+class WorkdirDiffSignals(QObject):
+    ready = Signal(int, object, object, object)
+    """(token, FilePatch, list[DiffLine], list[position|None])."""
 
-    DiffLoader와 같은 시그널 형태를 쓴다 — UI 입장에서 "지금 표시할 diff"
-    스트림은 하나이고, 세대 토큰이 커밋 diff와 워킹트리 diff의 순서 역전까지
-    함께 막는다. detail 자리는 항상 None이다.
+    failed = Signal(int, object)
+
+
+class WorkdirDiffLoader(QRunnable):
+    """커밋되지 않은 변경(스테이징/미스테이징) 하나의 패치를 읽는다.
+
+    부분 스테이징이 가능하도록 표시용 줄과 **패치 좌표**를 함께 넘긴다.
+    화면의 줄과 패치의 줄이 같은 좌표를 공유해야 사용자가 고른 것이
+    그대로 적용된다.
     """
 
     def __init__(
@@ -118,7 +125,7 @@ class WorkdirDiffLoader(QRunnable):
         self._token = token
         self._staged = staged
         self._cancelled = False
-        self.signals = DiffLoaderSignals()
+        self.signals = WorkdirDiffSignals()
         self.setAutoDelete(False)
 
     @property
@@ -130,14 +137,36 @@ class WorkdirDiffLoader(QRunnable):
 
     def run(self) -> None:
         try:
+            from gitclient.domain.models import DiffLine, DiffLineKind
+            from gitclient.domain.patch import iter_display_rows
             from gitclient.infrastructure.local_engine import LocalGitEngine
 
             engine = LocalGitEngine.open(self._repo_path)
-            lines = engine.workdir_diff_lines(self._path, staged=self._staged)
+            patch = engine.file_patch(self._path, staged=self._staged)
+
+            kinds = {
+                "header": DiffLineKind.FILE_HEADER,
+                "hunk": DiffLineKind.HUNK_HEADER,
+                "add": DiffLineKind.ADDITION,
+                "del": DiffLineKind.DELETION,
+                "context": DiffLineKind.CONTEXT,
+            }
+            lines: list = []
+            positions: list = []
+            for kind, text, old_no, new_no, position in iter_display_rows(patch):
+                lines.append(
+                    DiffLine(
+                        kind=kinds[kind],
+                        text=text,
+                        old_lineno=old_no,
+                        new_lineno=new_no,
+                    )
+                )
+                positions.append(position)
 
             if self._cancelled:
                 return
-            self.signals.ready.emit(self._token, None, lines)
+            self.signals.ready.emit(self._token, patch, lines, positions)
 
         except GitClientError as exc:
             if not self._cancelled:

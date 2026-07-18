@@ -244,6 +244,8 @@ class DiffDelegate(QStyledItemDelegate):
 
     LINENO_WIDTH = 44
     GUTTER = 6
+    SELECTION_BAR = 3
+    """선택된 줄 왼쪽에 그리는 띠의 두께."""
 
     def paint(
         self,
@@ -262,6 +264,18 @@ class DiffDelegate(QStyledItemDelegate):
         background = self._background(line.kind)
         if background is not None:
             painter.fillRect(rect, background)
+
+        # 선택 표시는 부분 스테이징의 필수 요소다 — 무엇을 고르는지 보이지 않으면
+        # 어느 줄이 올라갈지 알 수 없다. 변경 종류 색을 덮지 않도록 반투명으로
+        # 겹쳐 칠하고, 왼쪽에 굵은 띠를 그려 확실히 구분한다.
+        if option.state & QStyle.StateFlag.State_Selected:
+            highlight = QColor(option.palette.highlight().color())
+            highlight.setAlpha(70)
+            painter.fillRect(rect, highlight)
+            painter.fillRect(
+                QRect(rect.left(), rect.top(), self.SELECTION_BAR, rect.height()),
+                option.palette.highlight().color(),
+            )
 
         if line.kind is DiffLineKind.FILE_HEADER:
             self._paint_header(painter, option, line.text, bold=True)
