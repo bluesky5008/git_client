@@ -75,6 +75,7 @@ class CommitGraphModel(QAbstractTableModel):
         self._commits: list[Commit] = []
         self._rows: list[GraphRow] = []
         self._refs_by_sha: dict[str, list[Ref]] = {}
+        self._row_by_sha: dict[str, int] = {}
         self._allocator = LaneAllocator()
         self._max_lane_count = 1
 
@@ -89,6 +90,7 @@ class CommitGraphModel(QAbstractTableModel):
         self._rows = []
         self._allocator = LaneAllocator()
         self._max_lane_count = 1
+        self._row_by_sha = {}
 
         self._refs_by_sha = {}
         for ref in refs:
@@ -105,10 +107,27 @@ class CommitGraphModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), start, start + len(commits) - 1)
         for commit in commits:
             row = self._allocator.push(commit.sha, commit.parents)
+            self._row_by_sha[commit.sha] = len(self._commits)
             self._commits.append(commit)
             self._rows.append(row)
             self._max_lane_count = max(self._max_lane_count, row.lane_count)
         self.endInsertRows()
+
+    def set_refs(self, refs: list[Ref]) -> None:
+        """참조 목록을 (재)설정하고 로드된 행의 배지를 갱신한다.
+
+        refs는 워커(RefsLoader)가 커밋 로딩과 병렬로 가져오므로,
+        커밋이 이미 화면에 있는 상태에서 나중에 도착할 수 있다.
+        """
+        self._refs_by_sha = {}
+        for ref in refs:
+            self._refs_by_sha.setdefault(ref.target_sha, []).append(ref)
+
+        if self._commits:
+            # 배지는 SUMMARY 열에 그려진다. 로드된 전 구간을 갱신 대상으로 알린다.
+            top_left = self.index(0, Column.SUMMARY)
+            bottom_right = self.index(len(self._commits) - 1, Column.SUMMARY)
+            self.dataChanged.emit(top_left, bottom_right, [CommitRole.REFS])
 
     @property
     def max_lane_count(self) -> int:
@@ -119,6 +138,10 @@ class CommitGraphModel(QAbstractTableModel):
         if 0 <= row < len(self._commits):
             return self._commits[row]
         return None
+
+    def row_for_sha(self, sha: str) -> int | None:
+        """SHA가 로드된 행에 있으면 그 행 번호. 참조 클릭 → 커밋 이동에 쓴다."""
+        return self._row_by_sha.get(sha)
 
     # ------------------------------------------------------------------
     # QAbstractTableModel 구현

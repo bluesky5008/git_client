@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -17,6 +18,12 @@ from gitclient.ui.main_window import MainWindow
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv if argv is None else argv
+
+    # 엔진이 남기는 진단(제외된 태그 등)이 보이도록 한다. (doc/design.md §7)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     app = QApplication(args)
     app.setApplicationName("Git Client")

@@ -6,12 +6,18 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
 
 import pygit2
 import pytest
 
-from gitclient.domain.errors import RepositoryNotFoundError
+from gitclient.domain.errors import (
+    EngineError,
+    GitClientError,
+    RepositoryNotFoundError,
+)
 from gitclient.domain.models import ChangeStatus, DiffLineKind, RefKind
 from gitclient.infrastructure.local_engine import LocalGitEngine
 
@@ -207,6 +213,172 @@ class TestDiffLines:
             if line.kind is DiffLineKind.FILE_HEADER
         ]
         assert headers == ["b.txt"]
+
+
+class TestDiffMapping:
+    """pygit2 delta → 도메인 모델 매핑의 분기별 검증.
+
+    파싱은 libgit2가 한다 — 여기서 검증하는 것은 상태 문자, 이름 변경,
+    바이너리 처리 같은 매핑 분기다. (doc/design.md §8)
+
+    COPIED는 find_similar에 copy 탐지 플래그를 주지 않아 도달 불가,
+    TYPECHANGE는 심링크가 필요해 Windows 이식성 문제로 제외한다.
+    """
+
+    def test_deleted_file_maps_to_deleted_status(
+        self, repo: pygit2.Repository
+    ) -> None:
+        (Path(repo.workdir) / "b.txt").unlink()
+        repo.index.remove("b.txt")
+        repo.index.write()
+        tree = repo.index.write_tree()
+        repo.create_commit(
+            "HEAD", SIGNATURE, SIGNATURE, "b.txt 삭제", tree, [repo.head.target]
+        )
+
+        engine = LocalGitEngine.open(repo.workdir)
+        head = next(iter(engine.iter_commits()))
+        detail = engine.commit_detail(head.sha)
+
+        assert [c.status for c in detail.changes] == [ChangeStatus.DELETED]
+        kinds = [line.kind for line in engine.diff_lines(head.sha)]
+        assert DiffLineKind.DELETION in kinds
+
+    def test_renamed_file_maps_to_renamed_with_old_path(
+        self, repo: pygit2.Repository
+    ) -> None:
+        # 내용을 그대로 두고 경로만 바꾼다 → 유사도 100%라 탐지가 안정적이다.
+        workdir = Path(repo.workdir)
+        (workdir / "renamed.txt").write_bytes((workdir / "b.txt").read_bytes())
+        (workdir / "b.txt").unlink()
+        repo.index.remove("b.txt")
+        repo.index.add("renamed.txt")
+        repo.index.write()
+        tree = repo.index.write_tree()
+        repo.create_commit(
+            "HEAD", SIGNATURE, SIGNATURE, "b.txt 이름 변경", tree, [repo.head.target]
+        )
+
+        engine = LocalGitEngine.open(repo.workdir)
+        head = next(iter(engine.iter_commits()))
+        detail = engine.commit_detail(head.sha)
+
+        change = detail.changes[0]
+        assert change.status is ChangeStatus.RENAMED
+        assert change.old_path == "b.txt"
+        assert change.path == "renamed.txt"
+        assert change.display_path == "b.txt -> renamed.txt"
+
+        headers = [
+            line.text
+            for line in engine.diff_lines(head.sha)
+            if line.kind is DiffLineKind.FILE_HEADER
+        ]
+        assert headers == ["b.txt -> renamed.txt"]
+
+    def test_binary_file_shows_notice_instead_of_hunks(
+        self, repo: pygit2.Repository
+    ) -> None:
+        (Path(repo.workdir) / "blob.bin").write_bytes(b"\x00\x01\x02\xff" * 64)
+        repo.index.add("blob.bin")
+        repo.index.write()
+        tree = repo.index.write_tree()
+        repo.create_commit(
+            "HEAD", SIGNATURE, SIGNATURE, "바이너리 추가", tree, [repo.head.target]
+        )
+
+        engine = LocalGitEngine.open(repo.workdir)
+        head = next(iter(engine.iter_commits()))
+        lines = engine.diff_lines(head.sha, path="blob.bin")
+
+        kinds = [line.kind for line in lines]
+        assert DiffLineKind.HUNK_HEADER not in kinds
+        assert any("바이너리" in line.text for line in lines)
+
+
+class TestClonedRepository:
+    """clone된 저장소 — 합성 fixture가 오래 놓쳤던 현실 형태.
+
+    clone에는 반드시 심볼릭 참조 `origin/HEAD`가 생긴다. 그 target은 Oid가
+    아니라 문자열이라, Oid로 취급하면 커밋 순회가 시작조차 못 하고 죽는다.
+    이 테스트 묶음은 그 회귀를 막는다.
+    """
+
+    @pytest.fixture
+    def clone(self, repo: pygit2.Repository, tmp_path: Path) -> Path:
+        dest = tmp_path / "clone"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(repo.workdir), str(dest)],
+            check=True,
+            capture_output=True,
+        )
+        return dest
+
+    def test_iter_commits_survives_origin_head(self, clone: Path) -> None:
+        engine = LocalGitEngine.open(clone)
+        summaries = [c.summary for c in engine.iter_commits()]
+        assert "a.txt 수정" in summaries
+
+    def test_refs_hide_symbolic_origin_head(self, clone: Path) -> None:
+        engine = LocalGitEngine.open(clone)
+        refs = engine.refs()
+        shorthands = [r.shorthand for r in refs]
+        assert "origin/HEAD" not in shorthands
+        assert "origin/main" in shorthands
+
+    def test_all_ref_targets_are_shas(self, clone: Path) -> None:
+        # 심볼릭 참조를 Oid로 오인하면 target_sha에 ref 경로 문자열이 들어간다.
+        engine = LocalGitEngine.open(clone)
+        for ref in engine.refs():
+            assert len(ref.target_sha) == 40, f"{ref.shorthand}: {ref.target_sha}"
+
+
+class TestExceptionBoundary:
+    """raw pygit2 예외가 엔진 밖으로 새지 않는지 검증한다. (doc/design.md §7)"""
+
+    def test_missing_object_raises_engine_error(
+        self, engine: LocalGitEngine
+    ) -> None:
+        with pytest.raises(EngineError) as excinfo:
+            engine.commit_detail("0" * 40)
+        assert excinfo.value.action is not None  # 권장 조치가 실려 있다
+
+    def test_shallow_boundary_diff_raises_domain_error(
+        self, repo: pygit2.Repository, tmp_path: Path
+    ) -> None:
+        """shallow 경계 커밋은 부모 오브젝트가 없다 — diff가 도메인 예외를 내야 한다."""
+        shallow = tmp_path / "shallow"
+        source = Path(repo.workdir).resolve().as_uri()  # file:// 라야 --depth가 동작
+        subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1", source, str(shallow)],
+            check=True,
+            capture_output=True,
+        )
+
+        engine = LocalGitEngine.open(shallow)
+        assert engine.info(include_refs=False).is_shallow is True
+
+        boundary = next(iter(engine.iter_commits()))
+        if not boundary.parents:
+            pytest.skip("git이 경계 커밋의 부모를 잘라냈다 — 이 형태에서는 재현 불가")
+
+        # raw KeyError/GitError가 아니라 GitClientError 계열이어야 UI가 잡는다.
+        with pytest.raises(GitClientError):
+            engine.diff_lines(boundary.sha)
+
+    def test_tag_to_non_commit_is_skipped_with_log(
+        self, repo: pygit2.Repository, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """커밋이 아닌 오브젝트를 가리키는 태그는 제외하되 로그를 남긴다. (§7 ADR-13)"""
+        blob_oid = repo.create_blob(b"raw data\n")
+        repo.references.create("refs/tags/blob-tag", blob_oid)
+
+        engine = LocalGitEngine.open(repo.workdir)
+        with caplog.at_level(logging.WARNING, logger="gitclient"):
+            refs = engine.refs()
+
+        assert "blob-tag" not in [r.shorthand for r in refs]
+        assert any("blob-tag" in record.message for record in caplog.records)
 
 
 class TestMergeCommit:

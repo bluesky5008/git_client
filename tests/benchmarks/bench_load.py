@@ -10,7 +10,7 @@
   - 그중 UI 스레드가 레인 배치에 쓴 시간
 
 pytest로 돌리지 않는 이유: 실제 QApplication과 창이 필요하고 수십 초가 걸린다.
-CI에서 회귀를 감시할 때는 이 스크립트를 별도 잡으로 실행한다. (doc/design.md §8.3)
+CI에서 회귀를 감시할 때는 이 스크립트를 별도 잡으로 실행한다. (doc/performance.md §8.3)
 """
 
 from __future__ import annotations

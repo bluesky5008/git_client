@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool
+from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,6 +35,8 @@ from PySide6.QtWidgets import (
 )
 
 from gitclient.application.commit_loader import CommitLoader
+from gitclient.application.diff_loader import DiffLoader
+from gitclient.application.refs_loader import RefsLoader
 from gitclient.domain.errors import GitClientError
 from gitclient.domain.models import Ref, RefKind, RepositoryInfo
 from gitclient.infrastructure.local_engine import LocalGitEngine
@@ -58,10 +60,21 @@ class MainWindow(QMainWindow):
 
         self._engine: LocalGitEngine | None = None
         self._info: RepositoryInfo | None = None
+        self._repo_path: str | None = None
         self._settings = QSettings("gitclient", "gitclient")
         self._pool = QThreadPool.globalInstance()
         self._loader: CommitLoader | None = None
+        self._refs_loader: RefsLoader | None = None
         self._loading = False
+
+        # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
+        self._current_sha: str | None = None
+        self._diff_generation = 0
+        self._diff_loaders: dict[int, DiffLoader] = {}
+        self._diff_debounce = QTimer(self)
+        self._diff_debounce.setSingleShot(True)
+        self._diff_debounce.setInterval(50)
+        self._diff_debounce.timeout.connect(self._dispatch_pending_diff)
 
         self._commit_model = CommitGraphModel(self)
         self._diff_model = DiffModel(self)
@@ -78,9 +91,11 @@ class MainWindow(QMainWindow):
         self._ref_list = QListWidget()
         self._ref_list.setAlternatingRowColors(False)
         self._ref_list.setMinimumWidth(180)
+        self._ref_list.itemActivated.connect(self._on_ref_activated)
 
         self._commit_view = self._build_commit_view()
         self._file_list = QListWidget()
+        self._file_list.currentRowChanged.connect(self._on_file_selected)
         self._diff_view = self._build_diff_view()
 
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -205,7 +220,9 @@ class MainWindow(QMainWindow):
     def open_repository(self, path: str | Path) -> None:
         try:
             engine = LocalGitEngine.open(path)
-            info = engine.info()
+            # include_refs=False: ref 열거는 ref 수에 비례해 느리다(실측 ref당
+            # ~1.3ms). UI 스레드에서는 lite 정보만 얻고 refs는 워커가 가져온다.
+            info = engine.info(include_refs=False)
         except GitClientError as exc:
             self._report(exc)
             return
@@ -214,12 +231,14 @@ class MainWindow(QMainWindow):
 
         self._engine = engine
         self._info = info
+        self._repo_path = str(path)
         self._settings.setValue("last_repository", str(path))
 
-        self._commit_model.reset(info.refs)
-        self._populate_refs(info.refs)
+        self._commit_model.reset([])
+        self._ref_list.clear()
         self._diff_model.clear()
         self._show_placeholder()
+        self._current_sha = None
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -234,27 +253,54 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _start_loading(self, path: str | Path) -> None:
-        """커밋 순회를 워커 스레드에 맡긴다.
+        """커밋 순회와 ref 열거를 워커 스레드에 맡긴다.
 
-        순회 비용은 커밋 수에 비례해 수 초까지 늘어난다. UI 스레드에서 돌리면
-        그동안 창이 얼어붙는다. (doc/design.md §3.3, G4)
+        두 작업 모두 입력 크기에 비례해 커진다 (doc/design.md §3.3).
+        반드시 병렬로 시작한다 — refs가 커밋 첫 행 표시(G2)를 지연시키면 안 된다.
+
+        각 슬롯은 람다로 loader 정체를 캡처해 자신이 최신인지 확인한다.
+        취소된 이전 로더가 이미 큐에 넣어둔 시그널이 새 저장소의 모델에
+        섞여 들어오는 경합을 막는다.
         """
         loader = CommitLoader(path)
-        loader.signals.batch_ready.connect(self._on_batch_ready)
-        loader.signals.finished.connect(self._on_loading_finished)
-        loader.signals.failed.connect(self._on_loading_failed)
-
+        loader.signals.batch_ready.connect(
+            lambda commits, l=loader: self._on_batch_ready(l, commits)
+        )
+        loader.signals.finished.connect(
+            lambda total, l=loader: self._on_loading_finished(l, total)
+        )
+        loader.signals.failed.connect(
+            lambda error, l=loader: self._on_loading_failed(l, error)
+        )
         self._loader = loader
         self._loading = True
+
+        refs_loader = RefsLoader(path)
+        refs_loader.signals.ready.connect(
+            lambda refs, l=refs_loader: self._on_refs_ready(l, refs)
+        )
+        refs_loader.signals.failed.connect(
+            lambda error, l=refs_loader: self._on_refs_failed(l, error)
+        )
+        self._refs_loader = refs_loader
+
         self.statusBar().showMessage("커밋을 읽는 중...")
         self._pool.start(loader)
+        self._pool.start(refs_loader)
 
     def _cancel_loading(self) -> None:
         if self._loader is not None:
             self._loader.cancel()
+        if self._refs_loader is not None:
+            self._refs_loader.cancel()
+        for diff_loader in self._diff_loaders.values():
+            diff_loader.cancel()
         self._loading = False
 
-    def _on_batch_ready(self, commits: list) -> None:
+    def _on_batch_ready(self, loader: CommitLoader, commits: list) -> None:
+        if loader is not self._loader:
+            return  # 이전 저장소의 늦은 묶음
+
         was_empty = self._commit_model.rowCount() == 0
         self._commit_model.append_commits(commits)
         self._resize_graph_column()
@@ -267,7 +313,9 @@ class MainWindow(QMainWindow):
             f"커밋을 읽는 중... {self._commit_model.rowCount()}개"
         )
 
-    def _on_loading_finished(self, _total: int) -> None:
+    def _on_loading_finished(self, loader: CommitLoader, _total: int) -> None:
+        if loader is not self._loader:
+            return
         # 주의: 여기서 self._loader를 버리면 안 된다. 이 슬롯은 워커의 시그널
         # 방출 중에 실행되며, 마지막 참조를 놓으면 방출 도중에 sender가 파괴되어
         # 뒤에 연결된 슬롯들이 실행되지 않는다. 참조는 다음 로딩이 시작될 때
@@ -278,9 +326,24 @@ class MainWindow(QMainWindow):
             self._diff_model.clear()
             self._show_placeholder()
 
-    def _on_loading_failed(self, error: GitClientError) -> None:
+    def _on_loading_failed(self, loader: CommitLoader, error: GitClientError) -> None:
+        if loader is not self._loader:
+            return
         self._loading = False
         self._report(error)
+
+    def _on_refs_ready(self, loader: RefsLoader, refs: list) -> None:
+        if loader is not self._refs_loader:
+            return  # 이전 저장소의 늦은 결과
+        self._populate_refs(refs)
+        self._commit_model.set_refs(refs)
+
+    def _on_refs_failed(self, loader: RefsLoader, error: GitClientError) -> None:
+        if loader is not self._refs_loader:
+            return
+        # refs 실패는 치명적이지 않다 — 그래프는 이미 뜨고 있다.
+        # 모달로 흐름을 끊는 대신 상태바로 알린다. (doc/design.md §7)
+        self.statusBar().showMessage(f"참조 목록을 읽지 못했습니다: {error.message}")
 
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt 시그니처
         """창을 닫을 때 워커가 살아 있으면 정리한다."""
@@ -292,7 +355,7 @@ class MainWindow(QMainWindow):
         parts = [f"HEAD: {info.head_shorthand or '(unborn)'}"]
         parts.append(f"커밋 {self._commit_model.rowCount()}개")
         if info.is_shallow:
-            # shallow 저장소는 기능 제약이 있으므로 명시한다. (doc/design.md §3.3)
+            # shallow 저장소는 기능 제약이 있으므로 명시한다. (doc/performance.md §3.3)
             parts.append("shallow 저장소 — 히스토리가 잘려 있습니다")
         self.statusBar().showMessage("   |   ".join(parts))
 
@@ -329,8 +392,13 @@ class MainWindow(QMainWindow):
         self._commit_view.setColumnWidth(Column.GRAPH, width)
 
     # ------------------------------------------------------------------
-    # 커밋 선택
+    # 커밋 선택 → diff (비동기)
     # ------------------------------------------------------------------
+    #
+    # diff 계산은 변경 크기에 비례해 커지므로 워커(DiffLoader)가 수행한다.
+    # (doc/design.md §3.3) 방향키로 커밋을 빠르게 훑는 경우를 위해:
+    #   - 디바운스(50ms): 연속 이동 중에는 요청을 만들지 않는다.
+    #   - 세대 토큰: 순서 역전으로 이전 커밋의 diff가 화면을 덮지 않게 한다.
 
     def _on_commit_selected(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if self._engine is None or not current.isValid():
@@ -340,33 +408,127 @@ class MainWindow(QMainWindow):
         if commit is None:
             return
 
+        self._current_sha = commit.sha
+        self._diff_debounce.start()  # 재시작 — 마지막 선택만 살아남는다
+
+    def _dispatch_pending_diff(self) -> None:
+        """디바운스가 끝난 시점의 현재 커밋에 대해 전체 diff를 요청한다."""
+        if self._current_sha is None or self._repo_path is None:
+            return
+        self._request_diff(self._current_sha, path=None, include_detail=True)
+
+    def _request_diff(
+        self, sha: str, *, path: str | None, include_detail: bool
+    ) -> None:
+        # 새 요청이 발급되는 순간 진행 중인 이전 요청들은 전부 무의미해진다.
+        for stale in self._diff_loaders.values():
+            stale.cancel()
+
+        self._diff_generation += 1
+        token = self._diff_generation
+
+        loader = DiffLoader(
+            self._repo_path,
+            sha,
+            token,
+            path=path,
+            include_detail=include_detail,
+        )
+        loader.signals.ready.connect(self._on_diff_ready)
+        loader.signals.failed.connect(self._on_diff_failed)
+        self._diff_loaders[token] = loader
+        self._pool.start(loader)
+
+    def _on_diff_ready(self, token: int, detail, lines) -> None:  # noqa: ANN001
+        self._diff_loaders.pop(token, None)
+        if token != self._diff_generation:
+            return  # 늦게 도착한 이전 세대의 결과
+
+        if detail is not None:
+            self._populate_file_list(detail)
+        self._diff_model.set_lines(lines)
+
+    def _on_diff_failed(self, token: int, error: GitClientError) -> None:
+        self._diff_loaders.pop(token, None)
+        if token != self._diff_generation:
+            return
+        self._report(error)
+
+    def _populate_file_list(self, detail) -> None:  # noqa: ANN001
+        """변경 파일 목록을 다시 만든다.
+
+        재구성 중 발생하는 선택 변경 시그널은 막는다 — 사용자가 파일을 고른 게
+        아니라 목록이 바뀐 것이므로, diff 재요청을 유발하면 안 된다.
+        """
+        self._file_list.blockSignals(True)
         try:
-            detail = self._engine.commit_detail(commit.sha)
-            lines = self._engine.diff_lines(commit.sha)
-        except GitClientError as exc:
-            self._report(exc)
+            self._file_list.clear()
+
+            if not detail.changes:
+                self._file_list.addItem("(변경된 파일 없음)")
+                return
+
+            whole = QListWidgetItem(
+                f"전체 변경   +{detail.total_insertions} -{detail.total_deletions}"
+            )
+            whole.setData(Qt.ItemDataRole.UserRole, None)
+            self._file_list.addItem(whole)
+
+            for change in detail.changes:
+                item = QListWidgetItem(
+                    f"{change.status.value}  {change.display_path}"
+                    f"   +{change.insertions} -{change.deletions}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, change.path)
+                self._file_list.addItem(item)
+
+            self._file_list.setCurrentRow(0)
+        finally:
+            self._file_list.blockSignals(False)
+
+    def _on_file_selected(self, row: int) -> None:
+        """변경 파일을 고르면 diff를 그 파일로 좁힌다. '전체 변경'은 전체 diff."""
+        if row < 0 or self._current_sha is None or self._repo_path is None:
+            return
+        item = self._file_list.item(row)
+        if item is None:
             return
 
-        self._file_list.clear()
-        if not detail.changes:
-            self._file_list.addItem("(변경된 파일 없음)")
-        for change in detail.changes:
-            item = QListWidgetItem(
-                f"{change.status.value}  {change.display_path}"
-                f"   +{change.insertions} -{change.deletions}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, change.path)
-            self._file_list.addItem(item)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        # include_detail=False: 파일 목록은 그대로 두고 diff만 갈아끼운다.
+        self._request_diff(self._current_sha, path=path, include_detail=False)
 
-        self._diff_model.set_lines(lines)
-        self._resize_graph_column()
+    def _on_ref_activated(self, item: QListWidgetItem) -> None:
+        """참조를 더블클릭/Enter 하면 해당 커밋으로 이동한다."""
+        target_sha = item.data(Qt.ItemDataRole.UserRole)
+        if not target_sha:
+            return  # 그룹 헤더
+
+        row = self._commit_model.row_for_sha(target_sha)
+        if row is None:
+            self.statusBar().showMessage(
+                "해당 커밋이 아직 로드되지 않았습니다.", 3000
+            )
+            return
+
+        self._commit_view.selectRow(row)
+        self._commit_view.scrollTo(
+            self._commit_model.index(row, Column.SUMMARY),
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
 
     def _report(self, error: GitClientError) -> None:
-        """오류를 원문과 함께 보여준다. (doc/design.md §5.2)"""
+        """오류를 표시한다. (doc/design.md §5.2 원칙 4, §7)
+
+        메시지 본문 아래에 권장 조치(action)를 바로 보이게 놓고,
+        엔진 원문(detail)은 접히는 상세 영역에 보존한다.
+        """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("오류")
         box.setText(error.message)
+        if error.action:
+            box.setInformativeText(error.action)
         if error.detail:
             box.setDetailedText(error.detail)
         box.exec()

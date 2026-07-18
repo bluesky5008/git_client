@@ -90,8 +90,10 @@ class TestCommitLoader:
     ) -> None:
         """앞선 슬롯이 로더 참조를 버려도 뒤 슬롯이 실행되어야 한다.
 
-        MainWindow가 실제로 이 형태로 연결한다. 첫 슬롯이 마지막 참조를 놓으면
-        방출 도중 sender가 파괴되어 이후 슬롯이 조용히 누락된다.
+        시그널 방출 도중 마지막 참조를 놓으면 sender가 파괴되어 이후 슬롯이
+        조용히 누락되는 결함의 회귀 테스트다. (현재 MainWindow는 참조를
+        유지하는 방식이지만, 이 클래스의 버그는 어느 호출자에서든 재발할 수
+        있으므로 로더 계약 수준에서 고정한다.)
         """
         holder = {"loader": CommitLoader(repo_path)}
         calls: list[str] = []

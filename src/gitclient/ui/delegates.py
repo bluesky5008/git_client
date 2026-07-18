@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from gitclient.domain.graph import EdgeKind, GraphRow
 from gitclient.domain.models import DiffLine, DiffLineKind, Ref, RefKind
-from gitclient.ui.theme import DiffColors, RefColors, lane_color
+from gitclient.ui.theme import DiffColors, RefColors, badge_text_color, lane_color
 from gitclient.viewmodel.commit_graph_model import CommitRole
 from gitclient.viewmodel.diff_model import DiffRole
 
@@ -192,14 +192,17 @@ class SummaryDelegate(QStyledItemDelegate):
                 height,
             )
 
+            background = self._badge_color(ref)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self._badge_color(ref))
+            painter.setBrush(background)
             painter.drawRoundedRect(
                 badge_rect, self.BADGE_RADIUS, self.BADGE_RADIUS
             )
 
             painter.setFont(badge_font)
-            painter.setPen(RefColors.TEXT)
+            # 글자색은 배경 휘도로 고른다 — 고정 흰색은 중간 명도 배지에서
+            # WCAG AA 미달이었다. (theme.badge_text_color)
+            painter.setPen(badge_text_color(background))
             painter.drawText(
                 badge_rect, Qt.AlignmentFlag.AlignCenter, label
             )

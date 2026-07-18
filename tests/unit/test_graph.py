@@ -223,9 +223,10 @@ class TestSharedParentDeduplication:
 
 
 class TestIncrementalLayout:
-    """뷰포트 단위 청크 계산이 일괄 계산과 같은 결과를 내야 한다.
+    """묶음(batch) 단위 증분 계산이 일괄 계산과 같은 결과를 내야 한다.
 
-    doc/design.md §4.1의 증분 계산 요구사항을 보장하는 테스트다.
+    워커가 커밋을 묶음으로 밀어넣을 때(doc/design.md §4.1.1.1) 묶음 경계에서
+    레인 배치가 끊기지 않음을 보장하는 테스트다.
     """
 
     COMMITS = [
