@@ -48,6 +48,19 @@ def window(qtbot, repo: pygit2.Repository):  # noqa: ANN001, ANN201
     return w
 
 
+def wait_settled(window, qtbot) -> None:  # noqa: ANN001
+    """쓰기 큐가 비고 로딩도 끝날 때까지 기다린다.
+
+    `not window._loading` 만으로는 부족하다 — 쓰기가 아직 큐에 있는데도
+    로딩 플래그는 내려가 있을 수 있어, 다음 조작이 이전 쓰기와 겹친다.
+    """
+    qtbot.waitUntil(
+        lambda: (window._write_queue is None or not window._write_queue.is_busy)
+        and not window._loading,
+        timeout=TIMEOUT,
+    )
+
+
 def unstaged_paths(window) -> list[str]:  # noqa: ANN001
     panel = window._work_panel
     return [
@@ -199,7 +212,7 @@ class TestBranchAndStash:
         qtbot.waitUntil(
             lambda: target.read_text(encoding="utf-8") == "one\n", timeout=TIMEOUT
         )
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
+        wait_settled(window, qtbot)
 
         window._on_stash_pop()
         qtbot.waitUntil(
