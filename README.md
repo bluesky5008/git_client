@@ -3,8 +3,17 @@
 GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 **네트워크 트래픽이 제한된 환경**에서의 통신 비용 최소화를 최우선 설계 목표로 삼는다.
 
-> **현재 상태: 설계 단계** — 구현 코드는 아직 없다.
-> 설계 문서를 먼저 확정하고 Phase 1부터 착수한다.
+## 현재 상태
+
+| Phase | 범위 | 상태 |
+|-------|------|------|
+| 1 | 읽기 전용 — 커밋 그래프, diff 뷰, 브랜치/태그 | ✅ 완료 |
+| 2 | 로컬 쓰기 — stage/commit/branch/stash | 🚧 증분 1 완료, 증분 2(헝크 스테이징) 진행 중 |
+| 3 | 원격 통신 — clone/fetch/push + 계측·최적화 | 대기 |
+| 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 대기 |
+| 5 | 다듬기 — 테마, 단축키, 다국어 | 대기 |
+
+테스트 **208개 통과**. 커밋 10만 개 저장소에서 첫 행 표시까지 **495ms** (목표 1,500ms).
 
 ---
 
@@ -32,60 +41,113 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 
 ---
 
-## 목표
+## 구현된 기능
 
-| # | 목표 | 성공 기준 |
-|---|------|-----------|
-| G1 | 일상 Git 워크플로의 GUI 완결 | clone/commit/branch/merge/rebase/stash/tag를 CLI 없이 수행 |
-| G2 | 대규모 저장소에서의 반응성 | 커밋 10만 개 저장소에서 그래프 초기 렌더 < 1.5s, 스크롤 60fps |
-| G3 | 원격 통신 비용 최소화 | 반복 작업의 누적 전송량을 표준 git 대비 유의미하게 절감 |
-| G4 | UI 무정지 | 어떤 Git 작업 중에도 UI 스레드 블로킹 0ms |
-| G5 | 크로스 플랫폼 | Windows / macOS / Linux 단일 코드베이스 |
+**읽기 (Phase 1)**
 
-**비목표**: 자체 Git 서버 구현, Git 프로토콜 재구현, 이슈 트래커·CI 통합(v1 범위 밖).
+- 커밋 그래프 — 분기, 머지, 옥토퍼스, 고아 브랜치, 교차 머지 처리 + 베지어 곡선 렌더링
+- 브랜치/태그 배지, 참조 패널 (더블클릭으로 해당 커밋 이동)
+- diff 뷰 — 줄 번호, 색상, 바이너리 파일 처리, 파일별 좁혀 보기
+- 모든 브랜치 끝점에서 순회하므로 HEAD에서 닿지 않는 커밋도 표시
+
+**로컬 쓰기 (Phase 2 증분 1)**
+
+- 작업 디렉터리 패널 — 스테이징/미스테이징 목록, 더블클릭으로 스테이징
+- stage / unstage / discard (파괴적 작업은 확인 다이얼로그)
+- commit / amend (amend 시 HEAD 메시지 자동 채움)
+- 브랜치 생성·전환·삭제 (컨텍스트 메뉴), stash 보관/꺼내기
+- 커밋되지 않은 변경의 diff 보기 (스테이징/미스테이징 각각)
+
+**아직 없는 것**
+
+- 헝크/라인 단위 스테이징 (Phase 2 증분 2)
+- 파일시스템 감시 — 외부 CLI 조작은 F5로 수동 갱신
+- 원격 작업 전부 (clone/fetch/push) — Phase 3
+- merge/rebase/충돌 해결 — Phase 4
 
 ---
 
-## 기술 스택
+## 실행
 
-| 영역 | 선택 |
-|------|------|
-| 언어 | Python 3.12+ |
-| UI | PySide6 (Qt 6) |
-| Git 로컬 엔진 | pygit2 (libgit2) |
-| Git 네트워크 엔진 | git CLI (subprocess) |
-| 캐시 | SQLite |
-| 테스트 | pytest, pytest-qt |
+```bash
+python -m venv .venv
+.venv\Scripts\activate               # Windows (Linux/macOS: source .venv/bin/activate)
+pip install PySide6 pygit2
 
-### 핵심 결정: 하이브리드 엔진
-
-```
-로컬 읽기/쓰기  ->  pygit2    (프로세스 생성 비용 0, 파싱된 객체 반환)
-네트워크 통신   ->  git CLI   (protocol v2, 객체 필터, 협상 튜닝, credential helper)
+python -m gitclient [저장소_경로]     # 경로 생략 시 빈 창으로 시작
 ```
 
-전송량을 줄이는 수단은 대부분 git CLI에만 있다. CLI의 단점인 프로세스 생성
-오버헤드는 CPU 비용이고, 이 환경에서 CPU는 제약이 아니다.
-자세한 근거는 [doc/design.md](doc/design.md) §2.3 참조.
+테스트:
+
+```bash
+pip install pytest pytest-qt
+python -m pytest
+```
+
+성능 벤치마크 (10만 커밋 fixture를 자동 생성):
+
+```bash
+python -m tests.benchmarks.bench_load 100000
+```
+
+---
+
+## 측정된 성능
+
+커밋 10만 개(팩된 저장소) 기준:
+
+| 항목 | 측정값 | 목표 |
+|------|--------|------|
+| `open_repository()` UI 스레드 점유 | 4.1ms | ≤ 50ms |
+| 첫 행이 화면에 나타나기까지 | **495ms** | 1,500ms |
+| 전체 10만 행 로딩 완료 | 1,969ms | — |
+
+읽기는 전부 워커 스레드에서 수행하고, 쓰기는 저장소별로 직렬화한다.
 
 ---
 
 ## 아키텍처
 
 ```
-Presentation   (PySide6 위젯 / 델리게이트)     블로킹 호출 금지
+Presentation   (PySide6 위젯 / 델리게이트)
      |
-ViewModel      (QAbstractItemModel + 상태)     뷰포트 가상화
+ViewModel      (QAbstractItemModel — 뷰포트 가상화)
      |
-Application    (유스케이스 / 작업 큐)          저장소별 쓰기 직렬화
+Application    (로더 워커 + WriteQueue 쓰기 직렬화)
      |
-Domain         (순수 파이썬 모델)              Qt/pygit2 의존 0
-     |
-Infrastructure (pygit2 / git CLI / SQLite)
+Domain         (순수 파이썬 모델 — Qt/pygit2 의존 0)
+     ^
+Infrastructure (pygit2 LocalGitEngine)
 ```
 
-의존 방향은 항상 아래로만 흐른다. Domain 층이 순수 파이썬이므로,
-성능 병목이 확인되면 해당 모듈만 Rust(pyo3)로 교체할 수 있다.
+의존은 항상 Domain을 향한다. Domain 층이 순수 파이썬이므로,
+성능 병목이 측정으로 확인되면 해당 모듈만 Rust(pyo3)로 교체할 수 있다.
+
+로컬은 pygit2, 네트워크는 git CLI를 쓰는 **하이브리드 엔진**이다 —
+전송량을 줄이는 수단(protocol v2, 객체 필터, 협상 튜닝)이 CLI에만 있기 때문이다.
+
+---
+
+## 개발 과정에서 정정한 것
+
+이 프로젝트는 측정 결과에 따라 결정을 뒤집은 이력을 문서에 남긴다.
+
+**G2(대규모 저장소 반응성) 판정이 한 번 틀렸다.** "커밋당 0.23ms는 파싱의 고유
+비용이며 목표 미달"이라 결론짓고 SQLite 레이아웃 캐시 구현에 착수하기 직전이었는데,
+10만 커밋 규모로 직접 측정하며 원인이 드러났다. 벤치마크 저장소를 pygit2 루프로
+만들어 커밋이 **느슨한 오브젝트 파일**로 남아 있었고, 이는 현실(clone 시 팩된 상태)을
+대표하지 못했다.
+
+| 저장소 (내용 동일) | 커밋당 순회 비용 |
+|--------------------|-----------------|
+| 20k · 느슨한 오브젝트 | 197.8µs |
+| 20k · 팩됨 | **4.9µs** |
+
+팩 압축만으로 40배 차이였다. G2는 이미 충족 상태였고 캐시는 철회했다.
+재발 방지를 위해 [tests/benchmarks/](tests/benchmarks/)에 팩된 fixture 생성기와
+**fixture 자체가 현실적인지 검증하는 테스트**를 두었다.
+
+자세한 경위는 [doc/design.md](doc/design.md) §4.1.1에 있다.
 
 ---
 
@@ -93,43 +155,18 @@ Infrastructure (pygit2 / git CLI / SQLite)
 
 | 문서 | 내용 |
 |------|------|
-| [doc/design.md](doc/design.md) | 전체 설계서 — 목표, 스택 선정 근거, 아키텍처, 커밋 그래프 렌더링, 동시성 모델, UI, 테스트, 배포, 로드맵, 결정 기록(ADR) |
-| [doc/performance.md](doc/performance.md) | 통신 최적화 설계 — 목적함수 정의, 구간별 최적화 기법, 안티패턴, 계측 체계, 구현 우선순위 |
-
-### 문서 규약
+| [doc/design.md](doc/design.md) | 전체 설계서 — 목표, 스택 선정 근거, 아키텍처, 커밋 그래프 렌더링, 동시성 모델, UI, 테스트, 로드맵, 결정 기록(ADR) |
+| [doc/performance.md](doc/performance.md) | 통신 최적화 설계 — 목적함수 정의, 구간별 기법, 안티패턴, 계측 체계 |
 
 🔶 표시는 **실측 데이터 없이 논리적 추론으로 내린 잠정 결정**이다.
-Phase 3의 계측 결과가 추론과 다르면 해당 결정을 뒤집고,
-변경 근거를 [doc/design.md](doc/design.md) §12 결정 기록에 남긴다.
-
-현재 잠정 결정 항목:
-
-- 전체 clone 기본값 (partial clone은 선택지로만 제공)
-- 백그라운드 prefetch 기본 비활성 (첫 실행 시 사용자에게 질문)
+측정 결과가 추론과 다르면 결정을 뒤집고 근거를 ADR에 남긴다.
 
 ---
 
-## 로드맵
-
-| Phase | 범위 | 완료 기준 |
-|-------|------|-----------|
-| 1 | 읽기 전용 — 저장소 열기, 커밋 그래프, diff 뷰 | 어떤 저장소든 열어서 히스토리를 탐색할 수 있다 |
-| 2 | 로컬 쓰기 — stage/commit/branch/stash | 이 클라이언트만으로 로컬 개발 사이클이 돌아간다 |
-| 3 | 원격 통신 — clone/fetch/push + **계측 체계 및 최적화** | 누적 전송량 절감 효과를 실측으로 제시한다 |
-| 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 UI | GitKraken의 핵심 기능 집합을 커버한다 |
-| 5 | 다듬기 — 테마, 단축키, 설정, 다국어 | — |
-
-**Phase 3은 기능 구현이 아니라 계측 체계 구축부터 시작한다.**
-측정 없는 최적화는 추측이기 때문이다.
-
----
-
-## 요구사항 (예정)
+## 요구사항
 
 - Python 3.12 이상
 - Git 2.40 이상 (시스템 설치본을 사용한다. 번들링하지 않는다)
-
----
 
 ## 라이선스
 
