@@ -8,12 +8,12 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | Phase | 범위 | 상태 |
 |-------|------|------|
 | 1 | 읽기 전용 — 커밋 그래프, diff 뷰, 브랜치/태그 | ✅ 완료 |
-| 2 | 로컬 쓰기 — stage/commit/branch/stash | 🚧 증분 1 완료, 증분 2(헝크 스테이징) 진행 중 |
-| 3 | 원격 통신 — clone/fetch/push + 계측·최적화 | 대기 |
+| 2 | 로컬 쓰기 — stage/commit/branch/stash, 라인 단위 스테이징 | ✅ 완료 |
+| 3 | 원격 통신 — clone/fetch/push + 계측·최적화 | 🚧 증분 1(계측 + fetch) 완료 |
 | 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 대기 |
 | 5 | 다듬기 — 테마, 단축키, 다국어 | 대기 |
 
-테스트 **208개 통과**. 커밋 10만 개 저장소에서 첫 행 표시까지 **495ms** (목표 1,500ms).
+테스트 **371개 통과**. 커밋 10만 개 저장소에서 첫 행 표시까지 **495ms** (목표 1,500ms).
 
 ---
 
@@ -50,19 +50,26 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 - diff 뷰 — 줄 번호, 색상, 바이너리 파일 처리, 파일별 좁혀 보기
 - 모든 브랜치 끝점에서 순회하므로 HEAD에서 닿지 않는 커밋도 표시
 
-**로컬 쓰기 (Phase 2 증분 1)**
+**로컬 쓰기 (Phase 2)**
 
 - 작업 디렉터리 패널 — 스테이징/미스테이징 목록, 더블클릭으로 스테이징
 - stage / unstage / discard (파괴적 작업은 확인 다이얼로그)
 - commit / amend (amend 시 HEAD 메시지 자동 채움)
 - 브랜치 생성·전환·삭제 (컨텍스트 메뉴), stash 보관/꺼내기
 - 커밋되지 않은 변경의 diff 보기 (스테이징/미스테이징 각각)
+- **라인 단위 스테이징** — diff에서 줄을 골라 스테이징/언스테이징
+
+**원격 통신 (Phase 3 증분 1)**
+
+- fetch — protocol v2, `--no-tags`, `--prune` 적용
+- **전송량 계측** — 작업마다 받은 바이트·객체 수·협상 왕복 횟수를 기록하고
+  상태바에 표시한다. 목적함수가 누적 전송 바이트이므로 비용을 숨기지 않는다.
+- 계측 이력을 SQLite에 축적 (저장소별 롤링 500건)
 
 **아직 없는 것**
 
-- 헝크/라인 단위 스테이징 (Phase 2 증분 2)
+- clone / pull / push, 인증 UI — Phase 3 증분 2
 - 파일시스템 감시 — 외부 CLI 조작은 F5로 수동 갱신
-- 원격 작업 전부 (clone/fetch/push) — Phase 3
 - merge/rebase/충돌 해결 — Phase 4
 
 ---
@@ -113,11 +120,11 @@ Presentation   (PySide6 위젯 / 델리게이트)
      |
 ViewModel      (QAbstractItemModel — 뷰포트 가상화)
      |
-Application    (로더 워커 + WriteQueue 쓰기 직렬화)
+Application    (로더/fetch 워커 + WriteQueue 쓰기 직렬화)
      |
 Domain         (순수 파이썬 모델 — Qt/pygit2 의존 0)
      ^
-Infrastructure (pygit2 LocalGitEngine)
+Infrastructure (pygit2 LocalGitEngine · git CLI RemoteEngine · StatsStore)
 ```
 
 의존은 항상 Domain을 향한다. Domain 층이 순수 파이썬이므로,
@@ -148,6 +155,13 @@ Infrastructure (pygit2 LocalGitEngine)
 **fixture 자체가 현실적인지 검증하는 테스트**를 두었다.
 
 자세한 경위는 [doc/design.md](doc/design.md) §4.1.1에 있다.
+
+**계측 자체가 조용히 비어 있을 뻔했다.** Phase 3에서 전송량 계측을 붙이고 보니
+작은 fetch에서 받은 바이트가 기록되지 않았다. git 기본 설정이 작은 팩을 풀어버려
+`Receiving objects` 줄 자체가 출력되지 않기 때문이었다 — 즉 가장 흔한 작업인
+증분 fetch의 비용이 측정되지 않는다. `transfer.unpackLimit=1`로 막았고,
+그럼에도 측정에 실패한 경우는 **0바이트가 아니라 "측정 안 됨"으로 구분**해
+기록한다. 둘을 섞으면 누적 집계가 조용히 과소 보고된다.
 
 ---
 

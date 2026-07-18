@@ -187,6 +187,8 @@ class LocalGitEngine:
                 is_bare=repo.is_bare,
                 is_shallow=repo.is_shallow,
                 refs=self.refs() if include_refs else [],
+                # 원격 목록은 설정 파일 한 번 읽기라 lite 정보에도 포함한다.
+                remotes=[remote.name for remote in repo.remotes],
             )
 
     def refs(self) -> list[Ref]:
