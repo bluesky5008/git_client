@@ -35,7 +35,7 @@ class TestCloneBasics:
     ) -> None:
         destination = tmp_path / "cloned"
 
-        RemoteEngine.clone(remote.origin_uri, destination, timeout_s=TIMEOUT)
+        RemoteEngine.clone(remote.origin_uri, destination, stall_timeout_s=TIMEOUT)
 
         assert (destination / ".git").exists()
         assert git("rev-parse", "HEAD", cwd=destination).stdout.strip() == (
@@ -52,7 +52,7 @@ class TestCloneBasics:
         놓친다** — 알 수 있는 것마저 버리는 셈이다.
         """
         stats = RemoteEngine.clone(
-            remote.origin_uri, tmp_path / "cloned", timeout_s=TIMEOUT
+            remote.origin_uri, tmp_path / "cloned", stall_timeout_s=TIMEOUT
         )
 
         assert stats.kind is OperationKind.CLONE
@@ -87,7 +87,7 @@ class TestCloneBasics:
         git("push", "--quiet", str(origin), "main", cwd=seed)
 
         stats = RemoteEngine.clone(
-            origin.resolve().as_uri(), tmp_path / "big-clone", timeout_s=TIMEOUT
+            origin.resolve().as_uri(), tmp_path / "big-clone", stall_timeout_s=TIMEOUT
         )
 
         assert stats.received_bytes is not None and stats.received_bytes > 0
@@ -98,7 +98,7 @@ class TestCloneBasics:
         destination = tmp_path / "prepared"
         destination.mkdir()
 
-        RemoteEngine.clone(remote.origin_uri, destination, timeout_s=TIMEOUT)
+        RemoteEngine.clone(remote.origin_uri, destination, stall_timeout_s=TIMEOUT)
 
         assert (destination / ".git").exists()
 
@@ -112,14 +112,14 @@ class TestCloneBasics:
         mine.write_text("내 파일\n", encoding="utf-8")
 
         with pytest.raises(EngineError):
-            RemoteEngine.clone(remote.origin_uri, destination, timeout_s=TIMEOUT)
+            RemoteEngine.clone(remote.origin_uri, destination, stall_timeout_s=TIMEOUT)
 
         assert mine.read_text(encoding="utf-8") == "내 파일\n"
 
     def test_missing_remote_is_actionable(self, tmp_path: Path) -> None:
         with pytest.raises(EngineError) as excinfo:
             RemoteEngine.clone(
-                str(tmp_path / "nowhere.git"), tmp_path / "dst", timeout_s=TIMEOUT
+                str(tmp_path / "nowhere.git"), tmp_path / "dst", stall_timeout_s=TIMEOUT
             )
         assert excinfo.value.detail
 
@@ -134,7 +134,7 @@ class TestCloneOptions:
 
         RemoteEngine.clone(
             remote.origin_uri, destination,
-            filter_spec="blob:none", timeout_s=TIMEOUT,
+            filter_spec="blob:none", stall_timeout_s=TIMEOUT,
         )
 
         promisor = git(
@@ -148,7 +148,7 @@ class TestCloneOptions:
         destination = tmp_path / "shallow"
 
         RemoteEngine.clone(
-            remote.origin_uri, destination, depth=1, timeout_s=TIMEOUT
+            remote.origin_uri, destination, depth=1, stall_timeout_s=TIMEOUT
         )
 
         shallow = git(
@@ -160,10 +160,10 @@ class TestCloneOptions:
         self, remote: RemoteFixture, tmp_path: Path
     ) -> None:
         full = RemoteEngine.clone(
-            remote.origin_uri, tmp_path / "full", timeout_s=TIMEOUT
+            remote.origin_uri, tmp_path / "full", stall_timeout_s=TIMEOUT
         )
         shallow = RemoteEngine.clone(
-            remote.origin_uri, tmp_path / "one", depth=1, timeout_s=TIMEOUT
+            remote.origin_uri, tmp_path / "one", depth=1, stall_timeout_s=TIMEOUT
         )
 
         assert shallow.received_objects < full.received_objects
@@ -227,6 +227,6 @@ class TestCloneArgumentInjection:
         hostile = "--upload-pack=" + str(script).replace("\\", "/")
 
         with pytest.raises(EngineError):
-            RemoteEngine.clone(hostile, tmp_path / "dst", timeout_s=TIMEOUT)
+            RemoteEngine.clone(hostile, tmp_path / "dst", stall_timeout_s=TIMEOUT)
 
         assert not marker.exists(), "URL이 옵션으로 해석돼 명령이 실행됐다"

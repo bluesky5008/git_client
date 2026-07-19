@@ -139,7 +139,7 @@ class TestShimHandlesHostileSecrets:
 
             stats = RemoteEngine(
                 work, credentials=Credentials(USERNAME, secret)
-            ).fetch(timeout_s=TIMEOUT)
+            ).fetch(stall_timeout_s=TIMEOUT)
 
             assert stats.succeeded
             tracked = git(
@@ -178,7 +178,7 @@ class TestRememberIsHonoured:
 
         RemoteEngine(
             work, credentials=Credentials(USERNAME, PASSWORD, remember=False)
-        ).fetch(timeout_s=TIMEOUT)
+        ).fetch(stall_timeout_s=TIMEOUT)
 
         stored = log.read_text(encoding="utf-8") if log.exists() else ""
         assert "store" not in stored, "저장하지 않기로 했는데 저장됐다"
@@ -191,7 +191,7 @@ class TestRememberIsHonoured:
 
         RemoteEngine(
             work, credentials=Credentials(USERNAME, PASSWORD, remember=True)
-        ).fetch(timeout_s=TIMEOUT)
+        ).fetch(stall_timeout_s=TIMEOUT)
 
         assert "store" in log.read_text(encoding="utf-8")
 
@@ -212,12 +212,12 @@ class TestCredentialKeyRoundTrip:
         remote.add_remote_commit()
 
         # 1) 자격증명을 주고 성공 → 저장 위임
-        RemoteEngine(work, credentials=good()).fetch(timeout_s=TIMEOUT)
+        RemoteEngine(work, credentials=good()).fetch(stall_timeout_s=TIMEOUT)
         assert store_file.exists(), "저장 자체가 안 됐다"
 
         # 2) 이제 자격증명 없이 — helper가 찾아내야 한다
         remote.add_remote_commit()
-        stats = RemoteEngine(work).fetch(timeout_s=TIMEOUT)
+        stats = RemoteEngine(work).fetch(stall_timeout_s=TIMEOUT)
 
         assert stats.succeeded, "저장한 자격증명을 git이 다시 찾지 못했다"
 
@@ -239,7 +239,7 @@ class TestDialogTargetIsTrusted:
         창에 다른 호스트가 뜨게 만들 수 있다.
         """
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work).fetch(stall_timeout_s=TIMEOUT)
 
         configured = git("remote", "get-url", "origin", cwd=work).stdout.strip()
         assert excinfo.value.url == configured

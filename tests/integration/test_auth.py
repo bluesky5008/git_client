@@ -48,7 +48,7 @@ class TestWithoutCredentials:
     def test_fetch_fails_fast_instead_of_hanging(self, work: Path) -> None:
         """매달리면 워커 슬롯이 잠긴다 — 실패로 끝나야 한다."""
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work).fetch(stall_timeout_s=TIMEOUT)
 
         assert excinfo.value.rejected is False, "아직 물어보지도 않았다"
         assert excinfo.value.action is not None
@@ -56,7 +56,7 @@ class TestWithoutCredentials:
     def test_error_carries_the_url_for_the_dialog(self, work: Path) -> None:
         """다이얼로그가 '무엇에 대한 로그인인가'를 보여줄 수 있어야 한다."""
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work).fetch(stall_timeout_s=TIMEOUT)
 
         assert excinfo.value.url is not None
         assert "127.0.0.1" in excinfo.value.url
@@ -67,14 +67,14 @@ class TestWithoutCredentials:
         git(*AUTHOR_ENV, "commit", "--quiet", "-m", "로컬", cwd=work)
 
         with pytest.raises(AuthenticationRequired):
-            RemoteEngine(work).push(refspecs=["main"], timeout_s=TIMEOUT)
+            RemoteEngine(work).push(refspecs=["main"], stall_timeout_s=TIMEOUT)
 
 
 class TestWithCredentials:
     def test_fetch_succeeds(self, remote: AuthenticatedRemote, work: Path) -> None:
         remote.add_remote_commit()
 
-        stats = RemoteEngine(work, credentials=good()).fetch(timeout_s=TIMEOUT)
+        stats = RemoteEngine(work, credentials=good()).fetch(stall_timeout_s=TIMEOUT)
 
         assert stats.succeeded
         tracked = git(
@@ -93,7 +93,7 @@ class TestWithCredentials:
         """
         remote.add_remote_commit()
 
-        stats = RemoteEngine(work, credentials=good()).fetch(timeout_s=TIMEOUT)
+        stats = RemoteEngine(work, credentials=good()).fetch(stall_timeout_s=TIMEOUT)
 
         assert stats.received_bytes is not None and stats.received_bytes > 0
         assert stats.received_objects
@@ -107,7 +107,7 @@ class TestWithCredentials:
         git(*AUTHOR_ENV, "commit", "--quiet", "-m", "로컬", cwd=work)
 
         stats = RemoteEngine(work, credentials=good()).push(
-            refspecs=["main"], timeout_s=TIMEOUT
+            refspecs=["main"], stall_timeout_s=TIMEOUT
         )
 
         assert stats.sent_bytes is not None and stats.sent_bytes > 0
@@ -125,7 +125,7 @@ class TestRejectedCredentials:
         wrong = Credentials(username=USERNAME, password="nope")
 
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work, credentials=wrong).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work, credentials=wrong).fetch(stall_timeout_s=TIMEOUT)
 
         assert excinfo.value.rejected is True
         assert excinfo.value.username == USERNAME, "다시 물어볼 때 채워 줄 값"
@@ -135,7 +135,7 @@ class TestRejectedCredentials:
         wrong = Credentials(username=USERNAME, password="nope")
 
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work, credentials=wrong).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work, credentials=wrong).fetch(stall_timeout_s=TIMEOUT)
 
         assert "토큰" in (excinfo.value.action or "")
 
@@ -167,7 +167,7 @@ class TestSecrets:
         wrong = Credentials(username=USERNAME, password="hunter2-secret")
 
         with pytest.raises(AuthenticationRequired) as excinfo:
-            RemoteEngine(work, credentials=wrong).fetch(timeout_s=TIMEOUT)
+            RemoteEngine(work, credentials=wrong).fetch(stall_timeout_s=TIMEOUT)
 
         assert "hunter2-secret" not in (excinfo.value.detail or "")
         assert "hunter2-secret" not in str(excinfo.value)
@@ -240,7 +240,7 @@ class TestStoredCredentialsAreReused:
         remote.add_remote_commit()
 
         # credentials 없이 — helper가 공급해야 한다
-        stats = RemoteEngine(work).fetch(timeout_s=TIMEOUT)
+        stats = RemoteEngine(work).fetch(stall_timeout_s=TIMEOUT)
 
         assert stats.succeeded
         assert git(

@@ -97,6 +97,12 @@ def _format_bytes(count: int) -> str:
     return f"{size:.2f} GiB"
 
 
+# 창을 닫을 때 스레드풀을 기다리는 상한.
+# 워커는 시그널이 끊겨 있어 이 위젯을 건드릴 수 없으므로 길게 잡을 이유가
+# 없다. G4(50ms) 안에 들어가도록 짧게 둔다.
+_CLOSE_DRAIN_MS = 20
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -628,8 +634,18 @@ class MainWindow(QMainWindow):
         # 그러지 않으면 창이 사라진 뒤에도 프로세스가 최대 5분 남아, 사용자가
         # 앱을 다시 띄우면 두 인스턴스가 같은 계측 DB에 쓰게 된다.
         if self._fetch_worker is not None:
-            self._fetch_worker.cancel()
+            worker = self._fetch_worker
             self._fetch_worker = None
+            # **먼저 끊고 나서 취소한다.** 프로세스 종료가 비동기가 된 뒤로는
+            # (§4.6.4) 워커가 곧바로 끝나지 않는다. 시그널이 붙어 있으면
+            # 파괴 중인 위젯으로 늦은 결과가 날아오므로, 기다리는 대신
+            # 연결을 끊어 그 위험 자체를 없앤다.
+            for signal in (worker.signals.finished, worker.signals.failed):
+                try:
+                    signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # 이미 끊겼거나 연결이 없었다
+            worker.cancel()
 
         # 쓰기는 취소하지 않는다 (§3.3 규칙 5). 하지만 창이 먼저 사라지면
         # 그 작업의 성패를 보고할 곳도 없어진다 — 병합 중단이 실패해도
@@ -644,7 +660,12 @@ class MainWindow(QMainWindow):
         # 큐를 분리해 두면 닫힌 뒤 도착하는 늦은 idle/실패 시그널을
         # 정체 가드가 걸러낸다 — 파괴된 위젯을 건드리지 않는다.
         self._dispose_write_queue()
-        self._pool.waitForDone(2000)
+        # 여기서 오래 기다리지 않는다. 남은 워커는 시그널이 끊겼거나 정체
+        # 가드에 걸려 이 위젯을 건드리지 못하고, git 프로세스는 별도 스레드가
+        # 이미 끊고 있다. 2초를 걸어두면 비동기 종료가 끝나기를 기다리느라
+        # 닫기가 실측 197ms 멈췄다 — 취소를 UI 스레드에서 뺀 이득이 닫기
+        # 경로에서 그대로 돌아온 셈이었다.
+        self._pool.waitForDone(_CLOSE_DRAIN_MS)
         super().closeEvent(event)
 
     def _update_status(self, info: RepositoryInfo | None) -> None:

@@ -240,21 +240,28 @@ class TestFailures:
         with pytest.raises(EngineError):
             broken.fetch()
 
-    def test_timeout_is_actionable(self, remote: RemoteFixture) -> None:
-        engine = RemoteEngine(remote.work)
-        with pytest.raises(EngineError) as excinfo:
-            engine.fetch(timeout_s=0)
-        assert "초 안에" in excinfo.value.message or excinfo.value.action
+    def test_finished_command_is_never_punished_for_being_slow(
+        self, remote: RemoteFixture
+    ) -> None:
+        """**끝난 명령은 침묵 예산이 0이어도 성공이다.**
+
+        기준이 벽시계에서 진행 없음으로 바뀐 핵심이 여기 있다. 예전에는
+        상한을 넘기면 이미 끝난 작업까지 실패로 뒤집었지만, 죽여야 할 것은
+        오래 걸린 전송이 아니라 멈춘 전송이다. (ADR-49)
+        """
+        stats = RemoteEngine(remote.work).fetch(stall_timeout_s=0)
+
+        assert stats is not None
 
     @pytest.mark.skipif(os.name != "nt", reason="느린 자식 스크립트가 Windows 전용")
     def test_timeout_bounds_a_slow_child(self, remote: RemoteFixture) -> None:
         """timeout이 **실제 상한**이어야 한다 — 느린 자손이 붙어 있어도.
 
-        위의 timeout_s=0 테스트로는 이걸 보장할 수 없다. 살아 있는 자손이
+        위의 stall_timeout_s=0 테스트로는 이걸 보장할 수 없다. 살아 있는 자손이
         없으므로 항상 즉시 통과하기 때문이다. 실제로는 자손(git-remote-https,
         ssh, credential helper)이 stderr 파이프를 상속하므로, git만 죽이면
         파이프가 닫히지 않아 Windows의 kill-후-communicate가 반환하지 않는다.
-        수정 전 실측: timeout_s=3인데 자손 수명 40초를 그대로 기다렸다.
+        수정 전 실측: stall_timeout_s=3인데 자손 수명 40초를 그대로 기다렸다.
         """
         slow = remote.root / "slow_upload_pack.bat"
         slow.write_text("@ping -n 30 127.0.0.1 > nul\n@git upload-pack %*\n")
@@ -268,7 +275,7 @@ class TestFailures:
         engine = RemoteEngine(remote.work)
         started = time.perf_counter()
         with pytest.raises(EngineError):
-            engine.fetch(timeout_s=3)
+            engine.fetch(stall_timeout_s=3)
         elapsed = time.perf_counter() - started
 
         # 상한 3초 + 트리 종료와 드레인 여유. 수정 전에는 30초까지 갔다.
