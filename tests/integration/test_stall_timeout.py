@@ -510,3 +510,37 @@ class TestPipesDoNotDeadlockTheWorker:
         )
         assert outcome["elapsed"] < DRAIN_TIMEOUT_S + 10
         assert engine._proc is None, "finally가 돌지 않아 _proc이 남았다"
+
+
+class TestPacksStayBounded:
+    """`unpackLimit=1` + 자동 정리 차단의 조합을 누군가는 치워야 한다.
+
+    §4.6.2는 매 fetch마다 팩을 하나씩 늘리고, §4.6.3은 git의 자동 정리를
+    껐다(진행률 없는 침묵이 stall로 오인됐다). 둘을 합쳐놓고 대체 정리를
+    두지 않으면 팩이 계속 쌓여 순회가 느려진다.
+
+    정리를 없애는 대신 **결과를 보고한 뒤로 자리를 옮겼다** — 대기 시간에
+    들어가지 않고 stall 감시 구간과도 분리된다.
+    """
+
+    def test_maintenance_runs_after_a_fetch(self, tmp_path: Path) -> None:
+        fixture = RemoteFixture(tmp_path / "src").build(commits=3, payload_kb=8)
+        fixture.add_and_publish(1)
+        engine = RemoteEngine(str(fixture.work))
+        engine.fetch()
+
+        # 임계값에 닿지 않아도 호출 자체는 성공해야 한다 (조용한 무동작)
+        engine.run_maintenance()
+
+        assert (fixture.work / ".git" / "objects" / "pack").exists()
+
+    def test_maintenance_failure_does_not_break_the_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        """정리는 부가 작업이다 — 실패해도 원격 작업의 성패를 뒤집지 않는다."""
+        fixture = RemoteFixture(tmp_path / "src").build(commits=2, payload_kb=8)
+        engine = RemoteEngine(str(tmp_path / "nowhere"))
+
+        engine.run_maintenance()  # 저장소가 없어도 예외가 새면 안 된다
+
+        assert True

@@ -636,7 +636,11 @@ class LocalGitEngine:
         )
 
     def stage_partial(
-        self, path: str, selected: set[tuple[int, int]] | None = None
+        self,
+        path: str,
+        selected: set[tuple[int, int]] | None = None,
+        *,
+        expected_patch: str | None = None,
     ) -> None:
         """선택한 헝크/줄만 스테이징한다.
 
@@ -644,17 +648,45 @@ class LocalGitEngine:
         워킹 트리는 건드리지 않는다 — 인덱스에만 적용된다.
         """
         patch = self.file_patch(path, staged=False)
+        self._require_same_patch(patch, expected_patch)
         self._apply_synthesized(patch, selected, reverse=False, action="스테이징")
 
     def unstage_partial(
-        self, path: str, selected: set[tuple[int, int]] | None = None
+        self,
+        path: str,
+        selected: set[tuple[int, int]] | None = None,
+        *,
+        expected_patch: str | None = None,
     ) -> None:
         """선택한 헝크/줄만 스테이징 해제한다.
 
         스테이징된 diff(HEAD↔인덱스)를 뒤집어 인덱스에 적용한다.
         """
         patch = self.file_patch(path, staged=True)
+        self._require_same_patch(patch, expected_patch)
         self._apply_synthesized(patch, selected, reverse=True, action="스테이징 취소")
+
+    @staticmethod
+    def _require_same_patch(patch, expected_patch: str | None) -> None:  # noqa: ANN001
+        """화면이 본 패치와 지금 적용할 패치가 같은지 확인한다.
+
+        선택 좌표는 **사용자가 화면에서 본** 패치 기준인데, 여기서는 적용
+        시점에 워킹 트리를 다시 읽는다. 그 사이 파일이 바뀌면 같은 좌표가
+        다른 줄을 가리켜 **고르지 않은 내용이 조용히 스테이징된다** —
+        오류도 경고도 없이 인덱스가 오염되는 유일한 경로다.
+
+        외부 편집기가 저장했거나 다른 도구가 건드린 경우가 여기 해당한다.
+        (`fast_forward`/`merge`의 `expected_branch`와 같은 취지)
+        """
+        if expected_patch is None:
+            return  # 호출자가 화면 상태를 모르는 경우 (테스트, 전체 적용)
+        if patch.fingerprint != expected_patch:
+            raise EngineError(
+                "파일이 바뀌어 선택한 줄을 그대로 적용할 수 없습니다.",
+                detail="화면에 표시된 내용과 지금 파일의 내용이 다릅니다.",
+                action="변경 내용을 다시 확인한 뒤 선택해 주세요. "
+                "(F5로 새로 고칠 수 있습니다)",
+            )
 
     def _apply_synthesized(
         self,

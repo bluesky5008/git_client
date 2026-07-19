@@ -451,6 +451,32 @@ class RemoteEngine:
                 name="gitclient-abort",
             ).start()
 
+    def run_maintenance(self) -> None:
+        """저장소 정리를 **임계 경로 밖에서** 돌린다.
+
+        `transfer.unpackLimit=1`(§4.6.2)은 매 fetch마다 팩을 하나씩 늘린다.
+        그리고 §4.6.3에서 `maintenance.auto=false`로 git의 자동 정리를 껐다 —
+        그 정리가 진행률 없는 침묵을 만들어 stall 감시기가 원격 무응답으로
+        오인했기 때문이다. **둘을 합치면 팩이 무한히 쌓인다**: 실측 fetch
+        30회에 팩 31개, 순회 6.5ms → 8.8ms.
+
+        그래서 정리를 없애는 대신 **자리를 옮긴다.** 사용자에게 결과를 이미
+        보고한 뒤에 돌리므로 대기 시간에 들어가지 않고, 별도 실행이라
+        stall 감시기가 보는 구간과도 분리된다. 정정된 목적 함수에서 임계
+        경로 밖의 CPU는 사실상 공짜다 (§1.4 원칙 4).
+
+        **실패해도 조용히 넘어간다.** 정리는 부가 작업이라 원격 작업의
+        성패를 뒤집으면 안 된다.
+        """
+        try:
+            self._run(
+                ["maintenance", "run", "--auto"],
+                measure=False,
+                stall_timeout_s=PUSH_STALL_TIMEOUT_S,
+            )
+        except GitClientError:
+            logger.debug("저장소 정리 실패 — 무시한다", exc_info=True)
+
     def list_remotes(self) -> list[str]:
         result = self._run(["remote"], measure=False)
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]

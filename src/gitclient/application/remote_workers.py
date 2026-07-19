@@ -179,6 +179,10 @@ class RemoteWorker(QRunnable):
                 return
             self.signals.finished.emit(stats)
 
+            # 결과를 **보고한 뒤에** 정리한다. 사용자는 이미 화면을 받았으므로
+            # 이 시간은 대기에 들어가지 않는다 (§4.6.2, §1.4 원칙 4).
+            self._maintain(engine)
+
         except GitClientError as exc:
             # 실패해도 바이트는 이미 나갔을 수 있다 — 여러 ref를 올리다 하나만
             # 거부되면 나머지는 실제로 전송된다. 취소 가드보다 **먼저** 기록한다:
@@ -196,6 +200,20 @@ class RemoteWorker(QRunnable):
                         detail=f"{type(exc).__name__}: {exc}",
                     )
                 )
+
+    def _maintain(self, engine: RemoteEngine) -> None:
+        """임계 경로 밖에서 저장소를 정리한다.
+
+        `unpackLimit=1` + 자동 정리 차단의 조합이 팩을 무한히 쌓기 때문에
+        누군가는 치워야 한다. 취소된 작업에서는 돌리지 않는다 — 사용자가
+        멈추라고 한 뒤에 CPU를 쓸 이유가 없다.
+        """
+        if self._cancelled:
+            return
+        try:
+            engine.run_maintenance()
+        except Exception:  # noqa: BLE001 - 정리는 부가 작업이다
+            pass
 
     def _credential_url(self, engine: RemoteEngine) -> str | None:
         """자격증명을 묶을 주소.
@@ -469,6 +487,20 @@ class CloneWorker(RemoteWorker):
                         pass
                     child.unlink(missing_ok=True)
         except OSError:
+            pass
+
+    def _maintain(self, engine: RemoteEngine) -> None:
+        """임계 경로 밖에서 저장소를 정리한다.
+
+        `unpackLimit=1` + 자동 정리 차단의 조합이 팩을 무한히 쌓기 때문에
+        누군가는 치워야 한다. 취소된 작업에서는 돌리지 않는다 — 사용자가
+        멈추라고 한 뒤에 CPU를 쓸 이유가 없다.
+        """
+        if self._cancelled:
+            return
+        try:
+            engine.run_maintenance()
+        except Exception:  # noqa: BLE001 - 정리는 부가 작업이다
             pass
 
     def _credential_url(self, engine: RemoteEngine) -> str | None:

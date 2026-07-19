@@ -15,6 +15,7 @@ import pytest
 
 from gitclient.domain.errors import EngineError
 from gitclient.infrastructure.local_engine import LocalGitEngine
+from tests.integration.remote_harness import AUTHOR_ENV, git
 
 SIGNATURE = pygit2.Signature("테스터", "tester@example.com", 1700000000, 540)
 
@@ -486,3 +487,55 @@ class TestHardCases:
         engine.stage_partial("crlf.txt")
 
         assert "Q" in staged_content(repo, "crlf.txt")
+
+
+class TestStalePatchIsRefused:
+    """화면이 본 패치와 적용할 패치가 다르면 거부한다.
+
+    선택 좌표는 **사용자가 화면에서 본** 패치 기준인데 엔진은 적용 시점에
+    파일을 다시 읽는다. 그 사이 외부 편집기가 저장했다면 같은 좌표가 다른
+    줄을 가리켜 **고르지 않은 내용이 조용히 스테이징된다** — 인덱스가 오류도
+    경고도 없이 오염되는 유일한 경로였다.
+    """
+
+    def test_external_edit_between_view_and_apply_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "work"
+        git("init", "--quiet", "-b", "main", str(repo))
+        (repo / "f.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        git("add", "-A", cwd=repo)
+        git(*AUTHOR_ENV, "commit", "--quiet", "-m", "base", cwd=repo)
+        engine = LocalGitEngine.open(str(repo))
+
+        # 사용자가 화면에서 본 패치
+        (repo / "f.txt").write_text("a\nCHANGED\nc\n", encoding="utf-8")
+        seen = engine.file_patch("f.txt", staged=False)
+
+        # 그 사이 외부 편집기가 전혀 다른 내용을 저장했다
+        (repo / "f.txt").write_text("a\nSOMETHING ELSE\nc\nd\n", encoding="utf-8")
+
+        with pytest.raises(EngineError) as excinfo:
+            engine.stage_partial(
+                "f.txt", None, expected_patch=seen.fingerprint
+            )
+
+        assert excinfo.value.action is not None
+        assert git("diff", "--cached", "--name-only", cwd=repo).stdout.strip() == "", (
+            "거부했는데 인덱스에 무언가 올라갔다"
+        )
+
+    def test_unchanged_file_still_applies(self, tmp_path: Path) -> None:
+        """가드가 정상 경로를 막으면 안 된다."""
+        repo = tmp_path / "work"
+        git("init", "--quiet", "-b", "main", str(repo))
+        (repo / "f.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        git("add", "-A", cwd=repo)
+        git(*AUTHOR_ENV, "commit", "--quiet", "-m", "base", cwd=repo)
+        engine = LocalGitEngine.open(str(repo))
+        (repo / "f.txt").write_text("a\nCHANGED\nc\n", encoding="utf-8")
+        seen = engine.file_patch("f.txt", staged=False)
+
+        engine.stage_partial("f.txt", None, expected_patch=seen.fingerprint)
+
+        assert "f.txt" in git("diff", "--cached", "--name-only", cwd=repo).stdout
