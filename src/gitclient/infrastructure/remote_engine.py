@@ -451,6 +451,45 @@ class RemoteEngine:
                 name="gitclient-abort",
             ).start()
 
+    def prefetch(self, remote: str = "origin") -> TransferStats:
+        """사용자가 기다리지 않는 시간에 미리 받아둔다.
+
+        **사용자가 보는 것을 바꾸지 않는다.** `--prefetch`는 `refs/remotes/*`가
+        아니라 `refs/prefetch/*`에 쓰므로, 배경 작업이 화면의 브랜치 목록이나
+        ahead/behind를 조용히 움직이는 일이 없다 (실측 확인). 참조가 객체를
+        붙잡아 두므로 나중 fetch가 그것을 재사용한다.
+
+        **효과는 전송을 통째로 없애는 것이다.** 실측: prefetch 뒤의 진짜
+        fetch는 받을 객체가 0이고 협상 왕복만 남는다. 느린 회선에서 대기의
+        대부분이 전송이므로, 그 전부가 임계 경로 밖으로 나간다.
+        (§1.4 원칙 4, ADR-7 정정)
+
+        요금이 없으므로 총 전송량이 늘어도 손해가 아니다 — 미리 받은 것을
+        쓰지 않게 되더라도 사용자는 기다리지 않았다.
+        """
+        # git 자신의 maintenance prefetch 태스크와 같은 인자를 쓴다
+        # (`GIT_TRACE=1 git maintenance run --task=prefetch`로 확인).
+        # 둘은 빠지면 배경 작업이 사용자의 상태를 건드린다:
+        #   --prune              : 원격에서 지운 브랜치가 refs/prefetch/*에
+        #                          영원히 쌓인다 (아무도 치우지 않는다)
+        #   --no-write-fetch-head: **FETCH_HEAD를 덮어쓴다.** 사용자가 방금
+        #                          `git fetch origin <브랜치>`로 만들어 둔
+        #                          값이 배경 작업에 조용히 지워진다 —
+        #                          사용자가 보는 것을 바꾸지 않는다는 이
+        #                          기능의 첫 번째 규율을 정면으로 어긴다
+        args = [
+            "fetch", "--prefetch", "--progress", "--prune",
+            "--no-write-fetch-head", "--no-recurse-submodules",
+            "--no-tags", "--", remote,
+        ]
+        self._active_remote = remote
+        return self._run_measured(
+            args,
+            kind=OperationKind.PREFETCH,
+            remote=remote,
+            stall_timeout_s=STALL_TIMEOUT_S,
+        )
+
     def run_maintenance(self) -> None:
         """저장소 정리를 **임계 경로 밖에서** 돌린다.
 

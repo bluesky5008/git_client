@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 from gitclient.application.commit_loader import CommitLoader
 from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
 from gitclient.application.remote_workers import (
+    PrefetchWorker,
     CloneWorker,
     FetchWorker,
     PullWorker,
@@ -107,6 +108,19 @@ logger = logging.getLogger(__name__)
 
 _CLOSE_DRAIN_MS = 20
 
+# 배경으로 미리 받아오는 주기. 요금이 없으므로(ADR-56) 자주 받아도 비용은
+# 회선 점유뿐이고, 그 대가로 사용자가 누를 때의 전송이 통째로 사라진다
+# (실측: prefetch 뒤의 fetch는 받을 객체가 0개다).
+#
+# 5분은 "눌렀을 때 대개 이미 받아져 있다"와 "느린 회선을 계속 물고 있지
+# 않는다" 사이의 값이다. git 자신의 maintenance prefetch는 1시간인데,
+# 그쪽은 사용자가 지켜보지 않는 서버 작업이라 기준이 다르다.
+_PREFETCH_INTERVAL_MS = 5 * 60 * 1000
+
+# 저장소를 연 직후의 첫 실행. 열자마자 회선을 물면 사용자가 지금 하려는
+# 일과 다투므로 조금 늦춘다.
+_PREFETCH_FIRST_DELAY_MS = 30 * 1000
+
 # 단계 이름은 사용자의 말로 옮긴다. "Resolving deltas"를 그대로 두면
 # 무엇을 기다리는지 알 수 없고, 회선 탓인지 아닌지도 구분되지 않는다.
 # **누가 일하고 있는지까지 말해야 한다.** 같은 단계라도 fetch와 push에서
@@ -154,6 +168,11 @@ class MainWindow(QMainWindow):
         self._remote_retry = None
         # 진행 중인 병합의 충돌 목록. 비어 있으면 병합 중이 아니다.
         self._gc_saved: tuple[int, int, int] | None = None
+        # 배경 prefetch. 사용자 작업 슬롯(_fetch_worker)과 **분리한다** —
+        # 같이 쓰면 배경 작업이 도는 동안 사용자의 버튼이 잠긴다.
+        self._prefetch_worker = None
+        self._prefetch_timer = QTimer(self)
+        self._prefetch_timer.timeout.connect(self._maybe_prefetch)
         self._merge_conflicts: tuple = ()
         self._merging = False
 
@@ -370,6 +389,16 @@ class MainWindow(QMainWindow):
         self._clone_action.setToolTip("원격 저장소를 복제해 옵니다")
         self._clone_action.triggered.connect(self._on_clone)
 
+        self._prefetch_action = QAction("배경에서 미리 가져오기", self)
+        self._prefetch_action.setCheckable(True)
+        self._prefetch_action.setToolTip(
+            "기다리지 않는 동안 미리 받아둡니다 — 누를 때 전송이 이미 끝나 있습니다"
+        )
+        self._prefetch_action.setChecked(
+            self._settings.value("prefetch_enabled", True, type=bool)
+        )
+        self._prefetch_action.toggled.connect(self._set_prefetch_enabled)
+
         self._abort_merge_action = QAction("병합 중단", self)
         self._abort_merge_action.setToolTip(
             "진행 중인 병합을 되돌립니다 (워킹 트리가 병합 이전으로 복구됩니다)"
@@ -398,6 +427,8 @@ class MainWindow(QMainWindow):
         repo_menu.addAction(self._fetch_action)
         repo_menu.addAction(self._pull_action)
         repo_menu.addAction(self._push_action)
+        repo_menu.addSeparator()
+        repo_menu.addAction(self._prefetch_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._abort_merge_action)
         repo_menu.addSeparator()
@@ -453,6 +484,13 @@ class MainWindow(QMainWindow):
         # 이전 저장소의 전송량이 새 저장소 상태바에 찍히고, 새 저장소가
         # 통째로 재로딩되어 선택과 스크롤이 초기화된다.
         # _repo_path를 덮어쓰기 전에 비교해야 하므로 순서가 중요하다.
+        previous_path = self._repo_path
+        if str(path) != self._repo_path:
+            # 배경 prefetch는 사용자 작업이 없어도 저장소에 묶여 있다.
+            # 놓아주지 않으면 이전 저장소를 향한 작업이 계속 돌며 풀 슬롯을
+            # 잡고, 늦은 결과가 바뀐 화면에 도착한다.
+            self._cancel_prefetch()
+
         if self._fetch_worker is not None and str(path) != self._repo_path:
             self._fetch_worker.cancel()
             self._fetch_worker = None
@@ -518,6 +556,21 @@ class MainWindow(QMainWindow):
 
         self._update_remote_actions()
         self._sync_merge_state()
+
+        # 배경 미리 가져오기를 건다. 열자마자가 아니라 조금 뒤에 시작해
+        # 사용자가 지금 하려는 일과 회선을 두고 다투지 않게 한다.
+        # **같은 저장소를 다시 열 때는 일정을 건드리지 않는다.** fetch 후
+        # 재로딩·F5가 open_repository를 반복 호출하는데, 매번 주기를 리셋하고
+        # 취소 불가능한 일회성 타이머를 쌓으면 예약이 누적된다.
+        if str(path) != previous_path or not self._prefetch_timer.isActive():
+            self._prefetch_timer.stop()
+            if self._has_remotes() and self._prefetch_enabled():
+                self._prefetch_timer.start(_PREFETCH_INTERVAL_MS)
+                # 일회성 타이머도 자식으로 만들어 창과 함께 죽게 한다.
+                first = QTimer(self)
+                first.setSingleShot(True)
+                first.timeout.connect(self._maybe_prefetch)
+                first.start(_PREFETCH_FIRST_DELAY_MS)
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -700,6 +753,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt 시그니처
         """창을 닫을 때 워커가 살아 있으면 정리한다."""
         self._cancel_loading()
+        self._prefetch_timer.stop()
+        self._cancel_prefetch()
         # fetch는 네트워크에 매달려 있어 스스로 끝나기를 기다릴 수 없다.
         # 취소가 git 프로세스 트리를 끊으므로 전역 스레드풀 슬롯이 곧 풀린다.
         # 그러지 않으면 창이 사라진 뒤에도 프로세스가 최대 5분 남아, 사용자가
@@ -1375,6 +1430,9 @@ class MainWindow(QMainWindow):
         "물어보면 해결되는" 유일한 실패라, 실패 시 되풀이할 방법을 여기서
         기억해 둔다. None이면 다시 시도하지 않는다.
         """
+        # 사용자의 작업이 먼저다 — 배경 prefetch가 회선을 물고 있으면 놓는다.
+        self._cancel_prefetch()
+
         self._remote_retry = retry
         worker.signals.finished.connect(
             lambda stats, w=worker: self._on_remote_finished(w, stats)
@@ -1445,6 +1503,98 @@ class MainWindow(QMainWindow):
         self._progress_bar.hide()
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
+
+    # -- 배경 미리 가져오기 (ADR-7) --------------------------------------
+
+    def _prefetch_enabled(self) -> bool:
+        """배경 미리 가져오기를 켤 것인가.
+
+        **기본은 켬이다** (ADR-7 정정) — 요금이 없으므로 미리 받는 것은
+        총량이 늘어도 이득이다. 다만 기본으로 켜는 기능에는 **끌 수단이
+        반드시 있어야 한다.** 회선을 아껴 써야 하는 순간(테더링, 화상회의
+        중)이 사용자에게는 있고, 우리는 그것을 알 수 없다.
+        """
+        return self._settings.value("prefetch_enabled", True, type=bool)
+
+    def _set_prefetch_enabled(self, enabled: bool) -> None:
+        self._settings.setValue("prefetch_enabled", enabled)
+        if enabled:
+            if self._repo_path is not None and self._has_remotes():
+                self._prefetch_timer.start(_PREFETCH_INTERVAL_MS)
+        else:
+            self._prefetch_timer.stop()
+            self._cancel_prefetch()
+
+    def _maybe_prefetch(self) -> None:
+        """조건이 맞으면 배경으로 미리 받아온다.
+
+        **사용자가 하는 일을 방해하지 않는 것이 첫 조건이다.** 원격 작업이
+        진행 중이거나 쓰기가 걸려 있으면 회선과 저장소를 두고 다투게 되므로
+        그냥 건너뛴다 — 다음 주기에 다시 온다.
+        """
+        if not self._prefetch_enabled():
+            return
+        if self._repo_path is None or not self._has_remotes():
+            return
+        if self._fetch_worker is not None or self._prefetch_worker is not None:
+            return  # 사용자 작업 중이거나 이전 prefetch가 아직 돈다
+        if self._write_queue is not None and self._write_queue.is_busy:
+            return
+        if self._merging:
+            return  # 병합 중에는 저장소를 조용히 두는 편이 낫다
+
+        remote = self._fetch_remote()
+        if remote is None:
+            return
+
+        # 저장된 자격증명은 git의 helper가 공급한다. 배경 작업은 **묻지
+        # 않으므로**(사용자를 방해하지 않는다) 저장된 값이 없으면 조용히
+        # 실패하고 다음 주기에 다시 시도한다.
+        worker = PrefetchWorker(self._repo_path, remote)
+        self._prefetch_worker = worker
+        # **결과를 화면에 알리지 않는다.** 사용자가 시작한 일이 아니므로
+        # 성공해도 조용하고, 실패해도 모달을 띄우지 않는다 — 배경 작업이
+        # 화면을 가로채면 그 자체가 방해다.
+        worker.signals.finished.connect(
+            lambda _stats, w=worker: self._on_prefetch_done(w)
+        )
+        worker.signals.failed.connect(
+            lambda error, w=worker: self._on_prefetch_done(w, error)
+        )
+        worker.signals.retired.connect(
+            lambda w=worker: self._on_prefetch_retired(w)
+        )
+        self._pool.start(worker)
+
+    def _on_prefetch_done(self, worker, error=None) -> None:  # noqa: ANN001
+        if worker is not self._prefetch_worker:
+            return  # 저장소가 바뀐 뒤 도착한 늦은 결과
+        # **여기서 슬롯을 놓지 않는다.** `finished`는 보고 시점이고 워커는
+        # 아직 저장소 정리를 돈다. 지금 None으로 만들면 `_cancel_prefetch()`가
+        # 부를 대상을 잃어 그 구간이 통째로 취소 불가가 된다 — 사용자의
+        # fetch가 repack 위에서 돌고, 창을 닫아도 git이 살아남는다.
+        if error is not None:
+            # 조용히 삼킨다. 사용자가 요청하지 않은 작업의 실패로 흐름을
+            # 끊지 않는다 — 다음 주기에 다시 시도한다.
+            logger.debug("배경 prefetch 실패: %s", error)
+
+    def _on_prefetch_retired(self, worker) -> None:  # noqa: ANN001
+        """워커가 정리까지 마쳤다 — 이제야 슬롯을 놓는다."""
+        if worker is self._prefetch_worker:
+            self._prefetch_worker = None
+
+    def _cancel_prefetch(self) -> None:
+        """배경 작업을 즉시 양보시킨다.
+
+        사용자가 원격 작업을 시작했거나 저장소를 바꿨을 때 부른다.
+        **배경 작업 때문에 사용자가 기다리는 일은 없어야 한다.**
+        투기적으로 받던 팩을 버리게 되지만, 애초에 없어도 되는 것이었다.
+        """
+        worker = self._prefetch_worker
+        if worker is None:
+            return
+        self._prefetch_worker = None
+        worker.cancel()
 
     def _update_remote_actions(self) -> None:
         """원격 액션의 활성 상태를 한 곳에서 정한다.

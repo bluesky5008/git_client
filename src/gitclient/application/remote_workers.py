@@ -39,6 +39,15 @@ class RemoteSignals(QObject):
     failed = Signal(object)
     """GitClientError."""
 
+    retired = Signal()
+    """run()이 **정말** 끝났다 — 유지보수까지 포함한다.
+
+    `finished`는 사용자에게 결과를 보고하는 시점일 뿐, 그 뒤로도 워커는
+    저장소 정리를 돈다. UI가 `finished`에서 워커 참조를 놓으면 그 구간이
+    통째로 취소 불가가 된다 — `cancel()`을 부를 대상이 사라지기 때문이다.
+    슬롯을 놓는 것은 이 신호로 한다.
+    """
+
     progressed = Signal(object)
     """ProgressSnapshot — 진행 중 여러 번 방출된다.
 
@@ -150,6 +159,15 @@ class RemoteWorker(QRunnable):
 
     def run(self) -> None:
         try:
+            self._run_guarded()
+        finally:
+            # 유지보수까지 끝났다 — 이제 UI가 슬롯을 놓아도 안전하다.
+            # 이 신호가 없으면 정리 구간이 취소 불가가 되어, 창을 닫은 뒤에도
+            # git이 살아남고 사용자의 다음 작업이 repack 위에서 돈다.
+            self.signals.retired.emit()
+
+    def _run_guarded(self) -> None:
+        try:
             from gitclient.infrastructure.remote_engine import RemoteEngine
 
             engine = RemoteEngine(
@@ -257,6 +275,24 @@ class FetchWorker(RemoteWorker):
 
     def _operate(self, engine: RemoteEngine) -> TransferStats:
         return engine.fetch(self._remote, tags=self._tags)
+
+
+class PrefetchWorker(RemoteWorker):
+    """사용자가 기다리지 않는 시간에 미리 받아둔다 (ADR-7 정정).
+
+    **조용해야 한다.** 사용자가 시작한 작업이 아니므로 실패해도 모달을
+    띄우지 않고, 진행률로 상태바를 차지하지도 않는다. 배경 작업이 화면을
+    가로채면 그 자체가 방해다.
+
+    **양보해야 한다.** 사용자가 원격 작업을 시작하면 즉시 취소된다 —
+    배경 작업 때문에 사용자가 기다리는 일은 없어야 한다. 취소해도 잃는
+    것은 투기적으로 받던 팩뿐이고, 그것은 애초에 없어도 되는 것이었다.
+    """
+
+    label = "미리 가져오기"
+
+    def _operate(self, engine: RemoteEngine) -> TransferStats:
+        return engine.prefetch(self._remote)
 
 
 class PushWorker(RemoteWorker):

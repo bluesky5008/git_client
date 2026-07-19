@@ -185,19 +185,32 @@ class StatsStore:
             logger.warning("계측을 저장하지 못했습니다: %s", exc)
 
     def _trim(self, connection: sqlite3.Connection, repo_key: str) -> None:
-        connection.execute(
-            """
-            DELETE FROM remote_stats
-             WHERE repo_key = ?
-               AND id NOT IN (
-                   SELECT id FROM remote_stats
-                    WHERE repo_key = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-               )
-            """,
-            (repo_key, repo_key, self._keep),
-        )
+        """저장소별로 최근 기록만 남긴다 — **종류별로 따로 센다.**
+
+        하나의 링에 섞어 담으면 배경 prefetch가 5분마다 행을 밀어 넣어
+        사용자 작업 기록을 밀어낸다. 사용자가 실제로 기다린 시간이 배경
+        작업에 덮이는 셈이라, 대기 시간이 목적 함수인 이 앱에서 가장 중요한
+        기록이 먼저 사라진다.
+        """
+        for (kind,) in connection.execute(
+            "SELECT DISTINCT kind FROM remote_stats WHERE repo_key = ?",
+            (repo_key,),
+        ).fetchall():
+            connection.execute(
+                """
+                DELETE FROM remote_stats
+                 WHERE repo_key = ?
+                   AND kind = ?
+                   AND id NOT IN (
+                       SELECT id FROM remote_stats
+                        WHERE repo_key = ?
+                          AND kind = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                   )
+                """,
+                (repo_key, kind, repo_key, kind, self._keep),
+            )
 
     def summarize(self, repo_key: str, *, since: datetime | None = None) -> TransferSummary:
         """기간 집계. `since`를 주면 그 시각 이후만 센다."""
