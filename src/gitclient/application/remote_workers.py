@@ -24,6 +24,8 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from gitclient.domain.errors import GitClientError
 
+from gitclient.infrastructure.askpass import Credentials
+
 if TYPE_CHECKING:
     from gitclient.domain.instrumentation import TransferStats
     from gitclient.infrastructure.remote_engine import RemoteEngine
@@ -60,10 +62,19 @@ class RemoteWorker(QRunnable):
     #: 실패 메시지에 쓸 작업 이름. 하위 클래스가 채운다.
     label = "원격 작업"
 
-    def __init__(self, repo_path: str | Path, remote: str = "origin") -> None:
+    def __init__(
+        self,
+        repo_path: str | Path,
+        remote: str = "origin",
+        *,
+        credentials: Credentials | None = None,
+    ) -> None:
         super().__init__()
         self._repo_path = str(repo_path)
         self._remote = remote
+        # 사용자가 방금 입력한 값. 워커가 사는 동안만 들고 있다가 엔진에
+        # 넘긴다 — 어디에도 저장하지 않는다. (ADR-3)
+        self._credentials = credentials
         self._cancelled = False
         self._engine: RemoteEngine | None = None
         self._lock = threading.Lock()
@@ -101,7 +112,9 @@ class RemoteWorker(QRunnable):
         try:
             from gitclient.infrastructure.remote_engine import RemoteEngine
 
-            engine = RemoteEngine(self._repo_path)
+            engine = RemoteEngine(
+                self._repo_path, credentials=self._credentials
+            )
             with self._lock:
                 cancelled = self._cancelled
                 self._engine = engine
@@ -111,6 +124,13 @@ class RemoteWorker(QRunnable):
 
             stats = self._operate(engine)
             self._record(stats)
+
+            # 통한 자격증명만 저장을 위임한다. 실패한 값을 저장하면 다음
+            # 시도가 그 값으로 조용히 거부된다. (ADR-3 — 우리가 쓰지 않는다)
+            if self._credentials is not None:
+                url = engine.remote_url(self._remote)
+                if url:
+                    engine.remember_credentials(url)
 
             if self._cancelled:
                 return
@@ -155,8 +175,9 @@ class FetchWorker(RemoteWorker):
         remote: str = "origin",
         *,
         tags: bool = False,
+        credentials: Credentials | None = None,
     ) -> None:
-        super().__init__(repo_path, remote)
+        super().__init__(repo_path, remote, credentials=credentials)
         self._tags = tags
 
     def _operate(self, engine: RemoteEngine) -> TransferStats:
@@ -173,8 +194,9 @@ class PushWorker(RemoteWorker):
         branch: str | None = None,
         *,
         set_upstream: bool = False,
+        credentials: Credentials | None = None,
     ) -> None:
-        super().__init__(repo_path, remote)
+        super().__init__(repo_path, remote, credentials=credentials)
         self._branch = branch
         self._set_upstream = set_upstream
 

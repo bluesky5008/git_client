@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,34 @@ AUTHOR_ENV = (
     "-c", "user.name=테스터",
     "-c", "user.email=tester@example.com",
 )
+
+
+def isolated_env() -> dict[str, str]:
+    """개발자의 실제 git 환경에서 테스트를 떼어낸다.
+
+    **격리하지 않으면 테스트가 실제 자격증명 저장소를 건드린다.** 이 머신의
+    시스템 설정에는 `credential.helper=manager`(GCM)가 켜져 있어서, 인증
+    하네스를 상대로 도는 테스트가 진짜 GCM을 태우고 실제 키체인에 쓰게 된다.
+    전역 설정(user.name, 별칭, safe.directory, 훅 경로)도 마찬가지로 새어든다.
+
+    `GIT_CONFIG_NOSYSTEM`은 시스템 설정을, `GIT_CONFIG_GLOBAL=/dev/null`은
+    사용자 설정을 끊는다.
+    """
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = ""
+    # 훅과 별칭이 상속되면 테스트가 개발자 환경에 따라 달라진다.
+    env.pop("GIT_CONFIG", None)
+    # 전역 설정을 끊으면 작성자 정보도 함께 사라진다. 격리를 넣자 이것에
+    # 기대던 테스트 네 개가 드러났다 — 개발자 계정 이름으로 커밋하고 있었다.
+    env.setdefault("GIT_AUTHOR_NAME", "테스터")
+    env.setdefault("GIT_AUTHOR_EMAIL", "tester@example.com")
+    env.setdefault("GIT_COMMITTER_NAME", "테스터")
+    env.setdefault("GIT_COMMITTER_EMAIL", "tester@example.com")
+    return env
 
 
 def git(*args: str, cwd: Path | str | None = None) -> subprocess.CompletedProcess[str]:
@@ -27,6 +56,7 @@ def git(*args: str, cwd: Path | str | None = None) -> subprocess.CompletedProces
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=isolated_env(),
     )
     if result.returncode != 0:
         raise AssertionError(
