@@ -43,6 +43,9 @@ from gitclient.domain.patch import (
 )
 from gitclient.domain.models import (
     ChangeStatus,
+    ConflictChoice,
+    ConflictDetail,
+    ConflictSideContent,
     Commit,
     CommitDetail,
     ConflictedFile,
@@ -846,7 +849,7 @@ class LocalGitEngine:
         # 원문("cannot create a tree from a not fully merged index")이 조치
         # 한 줄 없이 그대로 나간다 — 충돌을 해결하고 커밋하라고 안내해 놓고,
         # 그 안내를 따르다 스테이징을 빠뜨린 첫 실수에서 길을 잃게 된다.
-        unresolved = self.merge_conflicts()
+        unresolved = self.index_conflicts()
         if unresolved:
             paths = ", ".join(c.path for c in unresolved[:3])
             if len(unresolved) > 3:
@@ -1152,6 +1155,41 @@ class LocalGitEngine:
         with _translate("병합 상태 조회"):
             return self._repo.state() == pygit2.enums.RepositoryState.MERGE
 
+    def index_conflicts(self) -> tuple[ConflictedFile, ...]:
+        """저장소 상태와 **무관하게** 인덱스에 남은 충돌 전부.
+
+        충돌은 병합에서만 생기지 않는다 — stash pop, rebase, cherry-pick도
+        만든다. 실측: stash pop 충돌은 `state()`가 NONE인데 인덱스에는
+        충돌이 있다. 상태로 걸러내면 그 충돌들이 화면에서 통째로 사라지고,
+        사용자는 아무 안내 없이 마커가 든 파일을 마주한다 (§13-2).
+
+        `merge_conflicts()`와 나누는 이유: 그쪽은 "병합 중단"처럼 **병합에만**
+        의미가 있는 기능이 쓰고, 이쪽은 "충돌을 보여주고 해결한다"처럼
+        출처를 가리지 않는 기능이 쓴다.
+
+        **다만 rebase·cherry-pick·revert는 제외한다.** 두 가지 이유로
+        지금 보여주면 위험하다:
+
+        1. **스테이지 2/3의 의미가 뒤집힌다.** rebase는 upstream을 체크아웃한
+           뒤 사용자 커밋을 재생하므로 stage 2가 "올라탈 곳", stage 3이
+           "사용자 자신의 커밋"이다. 병합 기준 라벨("내 것"/"상대 것")을 그대로
+           두면 "내 것 사용"이 **사용자의 커밋을 버린다** — 실측으로 확인했고,
+           `rebase --continue`가 성공으로 끝나 커밋이 조용히 사라진다.
+        2. **끝낼 방법이 없다.** 이 앱에는 `rebase --continue`가 없다(증분 3).
+           해결해 놓고 마무리를 못 하는 상태로 사용자를 몰아넣게 된다.
+
+        제대로 다루는 것은 증분 3의 몫이다. 그때까지는 **보여주지 않는 편이
+        낫다** — 반쯤 도와주다 데이터를 잃게 하는 것보다.
+        """
+        with _translate("충돌 목록 조회"):
+            state = self._repo.state()
+            if state not in (
+                pygit2.enums.RepositoryState.NONE,
+                pygit2.enums.RepositoryState.MERGE,
+            ):
+                return ()
+            return self._collect_conflicts()
+
     def merge_conflicts(self) -> tuple[ConflictedFile, ...]:
         """지금 병합 중이라면 해결되지 않은 파일들.
 
@@ -1162,23 +1200,27 @@ class LocalGitEngine:
         with _translate("충돌 목록 조회"):
             if self._repo.state() != pygit2.enums.RepositoryState.MERGE:
                 return ()
-            conflicts = self._fresh_index().conflicts
-            if conflicts is None:
-                return ()
-            found: list[ConflictedFile] = []
-            for ancestor, ours, theirs in conflicts:
-                entry = ours or theirs or ancestor
-                if entry is None:  # pragma: no cover - 방어적
-                    continue
-                side = _conflict_side(ancestor, ours, theirs)
-                found.append(
-                    ConflictedFile(
-                        path=entry.path,
-                        side=side,
-                        has_markers=self._has_conflict_markers(side, ours, theirs),
-                    )
+            return self._collect_conflicts()
+
+    def _collect_conflicts(self) -> tuple[ConflictedFile, ...]:
+        """인덱스의 충돌을 도메인 객체로 옮긴다."""
+        conflicts = self._fresh_index().conflicts
+        if conflicts is None:
+            return ()
+        found: list[ConflictedFile] = []
+        for ancestor, ours, theirs in conflicts:
+            entry = ours or theirs or ancestor
+            if entry is None:  # pragma: no cover - 방어적
+                continue
+            side = _conflict_side(ancestor, ours, theirs)
+            found.append(
+                ConflictedFile(
+                    path=entry.path,
+                    side=side,
+                    has_markers=self._has_conflict_markers(side, ours, theirs),
                 )
-            return tuple(sorted(found, key=lambda c: c.path))
+            )
+        return tuple(sorted(found, key=lambda c: c.path))
 
     def _has_conflict_markers(self, side: ConflictSide, ours, theirs) -> bool:  # noqa: ANN001
         """워킹 트리 파일에 충돌 마커가 들어가는가.
@@ -1199,6 +1241,113 @@ class LocalGitEngine:
             if blob is None or getattr(blob, "is_binary", False):
                 return False
         return True
+
+    @staticmethod
+    def _conflict_entry(index, path: str):  # noqa: ANN001, ANN205
+        """인덱스에서 충돌 항목 하나를 꺼낸다. 없으면 조치를 실은 오류.
+
+        `ConflictCollection`에는 `.get()`이 없어 첨자 접근이 유일한 길이고,
+        없는 경로에는 KeyError를 던진다.
+        """
+        conflicts = index.conflicts
+        if conflicts is not None:
+            try:
+                return conflicts[path]
+            except KeyError:
+                pass
+        raise EngineError(
+            f"'{path}'은(는) 충돌 상태가 아닙니다.",
+            action="목록을 새로 고친 뒤 다시 시도해 주세요.",
+        )
+
+    def conflict_detail(self, path: str) -> ConflictDetail:
+        """충돌한 파일의 양쪽 내용을 꺼낸다.
+
+        인덱스의 스테이지에서 읽는다 — 워킹 트리가 아니다. 워킹 트리에는
+        마커가 섞인 결과물이 있거나(텍스트), 우리 것만 있거나(바이너리),
+        아무것도 없을(삭제) 수 있어서 원본 두 개를 복원할 수 없다.
+        """
+        with _translate("충돌 내용 조회"):
+            ancestor, ours, theirs = self._conflict_entry(
+                self._fresh_index(), path
+            )
+            return ConflictDetail(
+                path=path,
+                side=_conflict_side(ancestor, ours, theirs),
+                ours=self._side_content(ours),
+                theirs=self._side_content(theirs),
+            )
+
+    def _side_content(self, entry) -> ConflictSideContent:  # noqa: ANN001
+        """스테이지 항목 하나의 내용. 없으면 '존재하지 않음'으로 표시한다."""
+        if entry is None:
+            return ConflictSideContent(exists=False)
+        blob = self._repo[entry.id]
+        return ConflictSideContent(
+            exists=True,
+            data=bytes(blob.data),
+            is_binary=bool(blob.is_binary),
+        )
+
+    def resolve_conflict(self, path: str, choice: ConflictChoice) -> None:
+        """충돌 하나를 한쪽 선택으로 해결한다.
+
+        **마커 없는 충돌을 해결할 수 있는 유일한 길이다.** 바이너리 충돌과
+        삭제 계열 충돌은 워킹 트리에 마커가 없어서 "편집기로 정리하라"는
+        기존 안내가 통하지 않는다 — 이 앱에서 해결할 방법이 없던 상태다.
+
+        고른 쪽이 **없는** 경우(상대가 지웠는데 상대를 골랐다면)는 삭제를
+        선택한 것이다. 그때는 충돌 항목만 지우면 인덱스에서 경로가 사라져
+        git이 "삭제 스테이징"으로 읽는다 — `index.remove`를 부르면 오히려
+        "stage 0에 없다"며 실패한다 (실측).
+        """
+        with _translate("충돌 해결"):
+            index = self._fresh_index()
+            _ancestor, ours, theirs = self._conflict_entry(index, path)
+            chosen = ours if choice is ConflictChoice.OURS else theirs
+
+            if chosen is not None:
+                self._require_plain_file(path, chosen)
+
+            target = Path(self._repo.workdir or "") / path
+            del index.conflicts[path]
+            if chosen is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(bytes(self._repo[chosen.id].data))
+                index.add(path)
+                # **모드를 되살린다.** `index.add`는 워킹 트리를 다시 읽는데,
+                # Windows에는 실행 비트가 없어 100755가 100644로 떨어진다 —
+                # 스크립트가 조용히 실행 불가가 된다.
+                entry = index[path]
+                if entry.mode != chosen.mode:
+                    index.remove(path)
+                    index.add(pygit2.IndexEntry(path, entry.id, chosen.mode))
+            index.write()
+
+    @staticmethod
+    def _require_plain_file(path: str, entry) -> None:  # noqa: ANN001
+        """평범한 파일만 이 방식으로 해결할 수 있다.
+
+        심볼릭 링크(120000)는 blob 내용이 **링크 대상 경로**라 그대로 쓰면
+        링크가 아니라 경로가 적힌 파일이 된다. 서브모듈(160000)의 id는
+        blob이 아니라 **커밋**이라 `.data`를 읽는 것 자체가 틀렸다.
+        조용히 망가뜨리느니 거부하고 무엇을 해야 하는지 알린다.
+        """
+        mode = entry.mode
+        if mode == 0o120000:
+            raise EngineError(
+                f"'{path}'은(는) 심볼릭 링크라 여기서 해결할 수 없습니다.",
+                action="git CLI에서 `git checkout --ours/--theirs -- <경로>`로 "
+                "해결해 주세요.",
+            )
+        if mode == 0o160000:
+            raise EngineError(
+                f"'{path}'은(는) 서브모듈이라 여기서 해결할 수 없습니다.",
+                action="서브모듈 디렉터리에서 원하는 커밋을 체크아웃한 뒤 "
+                "상위 저장소에서 스테이징해 주세요.",
+            )
 
     def abort_merge(self) -> None:
         """진행 중인 병합을 되돌린다.

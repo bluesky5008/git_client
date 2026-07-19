@@ -564,6 +564,19 @@ def merge_job(source_ref: str, branch: str) -> Callable[[Any], Any]:
     return work
 
 
+def resolve_conflict_job(path: str, choice: Any) -> Callable[[Any], None]:
+    """충돌 하나를 한쪽 선택으로 해결한다.
+
+    워킹 트리와 인덱스를 모두 건드리므로 WriteQueue를 거쳐야 한다
+    (§3.3 규칙 3) — 특히 여러 파일을 연달아 해결할 때 직렬화가 필요하다.
+    """
+
+    def work(engine: Any) -> None:
+        engine.resolve_conflict(path, choice)
+
+    return work
+
+
 def abort_merge_job() -> Callable[[Any], None]:
     """진행 중인 병합을 되돌린다. 워킹 트리가 병합 이전으로 복구된다."""
 

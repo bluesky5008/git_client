@@ -59,6 +59,7 @@ from gitclient.application.remote_workers import (
     PushWorker,
     RemoteWorker,
     abort_merge_job,
+    resolve_conflict_job,
     fast_forward_job,
     merge_job,
 )
@@ -68,6 +69,7 @@ from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
+    ConflictChoice,
     ConflictSide,
     MergeKind,
     MergeOutcome,
@@ -77,6 +79,7 @@ from gitclient.domain.models import (
 )
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from gitclient.ui.clone_dialog import CloneDialog
+from gitclient.ui.conflict_panel import ConflictPanel
 from gitclient.ui.credential_dialog import CredentialDialog
 from gitclient.ui.delegates import DiffDelegate, GraphDelegate, SummaryDelegate
 from gitclient.ui.working_tree_panel import WorkingTreePanel
@@ -234,11 +237,21 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 2)
 
+        # 충돌 패널은 **충돌이 있을 때만** 나타난다. 평소에 자리를 차지하면
+        # 대부분의 시간 동안 쓸모없는 공간이 된다.
+        self._conflict_panel = ConflictPanel()
+        self._conflict_panel.resolve_requested.connect(self._on_resolve_conflict)
+        self._conflict_panel.detail_requested.connect(self._on_conflict_selected)
+        self._conflict_box = self._wrap("충돌 해결", self._conflict_panel)
+        self._conflict_box.hide()
+
         left_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_splitter.addWidget(self._conflict_box)
         left_splitter.addWidget(self._wrap("작업 디렉터리", self._work_panel))
         left_splitter.addWidget(self._wrap("참조", self._ref_list))
-        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(0, 2)
         left_splitter.setStretchFactor(1, 1)
+        left_splitter.setStretchFactor(2, 1)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.addWidget(left_splitter)
@@ -1730,6 +1743,80 @@ class MainWindow(QMainWindow):
         )
         self._graph_reload_pending = True
 
+    def _on_conflict_selected(self, path: str) -> None:
+        """고른 파일의 양쪽 내용을 채운다.
+
+        인덱스 스테이지를 읽는 짧은 작업이라 UI 스레드에서 한다 —
+        상한이 파일 하나 크기로 알려져 있다 (§3.3).
+        """
+        if self._engine is None:
+            return
+        try:
+            self._conflict_panel.show_detail(self._engine.conflict_detail(path))
+        except GitClientError:
+            # 그 사이 해결됐거나 저장소가 바뀌었다 — 다음 동기화가 정리한다.
+            pass
+
+    def _on_resolve_conflict(self, path: str, choice) -> None:  # noqa: ANN001
+        """한쪽을 골라 충돌을 해결한다.
+
+        워킹 트리와 인덱스를 모두 건드리므로 WriteQueue를 거친다
+        (§3.3 규칙 3).
+        """
+        if self._write_queue is None or self._engine is None:
+            return
+
+        # **손으로 고친 내용을 말없이 덮지 않는다.** 패널이 "직접 편집해
+        # 해결할 수도 있다"고 안내해 놓고 버튼이 그 결과를 조용히 지우면,
+        # 우리가 권한 방법을 우리가 파괴하는 셈이다.
+        if self._working_copy_edited(path):
+            answer = QMessageBox.warning(
+                self,
+                "편집한 내용 버리기",
+                f"{path} 을(를) 직접 고치신 것 같습니다.\n\n"
+                "한쪽을 고르면 그 편집 내용이 사라집니다. 계속할까요?",
+                QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer is not QMessageBox.StandardButton.Discard:
+                self._sync_merge_state()  # 잠가둔 버튼을 되살린다
+                return
+
+        label = "내 것" if choice is ConflictChoice.OURS else "상대 것"
+        self._write_queue.submit(
+            f"충돌 해결({label}): {path}",
+            resolve_conflict_job(path, choice),
+        )
+
+    def _working_copy_edited(self, path: str) -> bool:
+        """워킹 트리 파일이 충돌 직후 상태에서 벗어났는가.
+
+        **마커 유무만으로는 판단할 수 없다.** 바이너리 충돌에는 애초에
+        마커가 들어가지 않으므로, 그것만 보면 이 기능이 존재하는 이유인
+        경우마다 확인창이 뜬다.
+
+        그래서 두 가지를 함께 본다: 마커가 남아 있으면 손대지 않은 것이고,
+        마커가 없더라도 내용이 양쪽 원본 중 하나와 같으면 git이 써둔 그대로다.
+        둘 다 아닐 때만 사용자가 손을 댄 것으로 본다.
+        """
+        if self._repo_path is None or self._engine is None:
+            return False
+        try:
+            target = Path(self._repo_path) / path
+            if not target.exists():
+                return False
+            data = target.read_bytes()
+        except OSError:
+            return False
+        if b"<<<<<<<" in data and b">>>>>>>" in data:
+            return False  # 아직 마커가 그대로다
+        try:
+            detail = self._engine.conflict_detail(path)
+        except GitClientError:
+            return False
+        return data not in (detail.ours.data, detail.theirs.data)
+
     def _on_abort_merge(self) -> None:
         """진행 중인 병합을 되돌린다.
 
@@ -1767,7 +1854,11 @@ class MainWindow(QMainWindow):
             self._update_remote_actions()
             return
         try:
-            self._merge_conflicts = self._engine.merge_conflicts()
+            # **출처를 가리지 않는다.** 충돌은 병합에서만 생기지 않는다 —
+            # stash pop도 만든다(실측: state는 NONE인데 인덱스에는 충돌).
+            # 상태로 걸러내면 그 충돌이 화면에서 사라져, 사용자는 아무 안내
+            # 없이 마커가 든 파일을 마주한다 (§13-2).
+            self._merge_conflicts = self._engine.index_conflicts()
             self._merging = self._engine.is_merging()
         except GitClientError:
             self._merge_conflicts = ()
@@ -1776,6 +1867,11 @@ class MainWindow(QMainWindow):
         # 충돌을 해결해 스테이징하면 목록은 비지만 병합은 아직 진행 중이고,
         # 그때도 중단할 수 있어야 한다.
         self._abort_merge_action.setEnabled(self._merging)
+        # **패널은 저장소 상태에서 나온다.** 이전에는 병합이 충돌로 끝나는
+        # 순간의 모달이 전부였고, 앱을 다시 켜면 저장소는 병합 중인데 화면에
+        # 아무 흔적이 없었다 (§13-3).
+        self._conflict_panel.set_conflicts(self._merge_conflicts)
+        self._conflict_box.setVisible(bool(self._merge_conflicts))
         self._update_remote_actions()
 
     # -- clone ----------------------------------------------------------
