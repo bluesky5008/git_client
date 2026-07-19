@@ -75,7 +75,21 @@ class RemoteFixture:
         """seed의 커밋을 원격에 올린다 — 작업 저장소가 fetch할 거리를 만든다."""
         git("push", "--quiet", str(self.origin), "main", cwd=self.seed)
 
+    def sync_seed(self) -> None:
+        """seed를 원격의 현재 상태로 맞춘다.
+
+        push를 검증하면서 필요해졌다. 작업 저장소가 원격에 올리고 나면 seed는
+        원격보다 뒤처지므로, 그 상태에서 커밋을 쌓아 publish하면 비빨리감기로
+        거부된다 — 만들려던 상황과 무관한 실패다.
+
+        seed는 원격 쪽 커밋을 지어내기 위한 도구용 저장소이므로 여기서
+        되감아도 잃을 사용자 작업이 없다.
+        """
+        git("fetch", "--quiet", str(self.origin), "main", cwd=self.seed)
+        git("reset", "--hard", "--quiet", "FETCH_HEAD", cwd=self.seed)
+
     def add_and_publish(self, count: int = 1, *, payload_kb: int = 1) -> None:
+        self.sync_seed()
         self.add_commits(count, payload_kb=payload_kb)
         self.publish()
 
@@ -106,6 +120,47 @@ class RemoteFixture:
     def create_remote_tag(self, name: str) -> None:
         git(*AUTHOR_ENV, "tag", "-a", name, "-m", name, cwd=self.seed)
         git("push", "--quiet", str(self.origin), name, cwd=self.seed)
+
+    # ------------------------------------------------------------------
+    # push 쪽 거리 만들기
+    # ------------------------------------------------------------------
+
+    def commit_locally(self, count: int = 1, *, payload_kb: int = 1) -> None:
+        """**작업 저장소**에 커밋을 쌓는다 — push할 거리를 만든다.
+
+        `add_commits`는 seed(원격 쪽)에 쌓는다는 점에서 방향이 반대다.
+        """
+        payload = ("y" * 1024 + "\n") * payload_kb
+        existing = len(list(self.work.glob("local*.txt")))
+        for index in range(count):
+            number = existing + index
+            (self.work / f"local{number}.txt").write_text(
+                payload + str(number), encoding="utf-8"
+            )
+            git("add", "-A", cwd=self.work)
+            git(
+                *AUTHOR_ENV, "commit", "--quiet", "-m", f"로컬 커밋 {number}",
+                cwd=self.work,
+            )
+
+    def diverge(self) -> None:
+        """원격과 작업 저장소가 서로 다른 커밋을 갖게 만든다.
+
+        push는 거부되고 pull은 병합이 필요한 상태 — 협업에서 가장 흔한
+        마찰 지점이라 두 경로 모두 이 상황을 다뤄야 한다.
+        """
+        self.add_and_publish(1)
+        self.commit_locally(1)
+
+    def origin_branch_head(self, name: str = "main") -> str:
+        return git("rev-parse", name, cwd=self.origin).stdout.strip()
+
+    def origin_has_branch(self, name: str) -> bool:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"refs/heads/{name}"],
+            cwd=str(self.origin), capture_output=True, text=True,
+        )
+        return result.returncode == 0
 
     def work_head(self) -> str:
         return git("rev-parse", "HEAD", cwd=self.work).stdout.strip()

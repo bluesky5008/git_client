@@ -38,6 +38,17 @@ _RECEIVING = re.compile(
     r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?"
 )
 
+# push의 대응물. 형태는 같지만 방향이 반대다 — 우리가 **보낸** 바이트다.
+# "Writing objects: 100% (3/3), 429 bytes | 429.00 KiB/s, done."
+_WRITING = re.compile(
+    r"Writing objects:\s+100%\s+\((\d+)/(\d+)\),\s+"
+    r"([\d.]+)\s+" + _SIZE_UNIT +
+    r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?"
+)
+
+# "Everything up-to-date" — push가 할 일이 없을 때. ref 줄이 아예 없다.
+_NOTHING_TO_PUSH = re.compile(r"^Everything up-to-date")
+
 # "remote: Total 24 (delta 12), reused 0 (delta 0), pack-reused 0"
 _TOTAL = re.compile(
     r"Total\s+(\d+)\s+\(delta\s+(\d+)\),\s+reused\s+(\d+)\s+\(delta\s+(\d+)\)"
@@ -54,7 +65,12 @@ _REF_UPDATE = re.compile(
 )
 # "* [new branch]", "* [new tag]", "* [new ref]", "t [tag update]", "- [deleted]".
 # 대괄호 안을 열어두는 이유: git이 새 표식을 추가해도 갱신 수가 조용히 틀리지 않게.
-_REF_MARKER = re.compile(r"^([*t+-])\s+\[([^\]]+)\]\s+(\S+)\s+->\s+(\S+)")
+#
+# 화살표를 선택적으로 둔다 — push의 삭제 줄에는 화살표가 없다:
+#   fetch  " - [deleted]         (none)     -> origin/side"
+#   push   " - [deleted]         feature"
+# 필수로 두면 push 삭제가 통째로 안 잡혀 "0개 참조 갱신"으로 보고된다.
+_REF_MARKER = re.compile(r"^([*t+-])\s+\[([^\]]+)\]\s+(\S+)(?:\s+->\s+(\S+))?")
 
 _UNIT_BYTES = {
     "B": 1,
@@ -92,14 +108,30 @@ def parse_size(value: str, unit: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class RefUpdate:
-    """fetch가 갱신한 참조 하나."""
+    """원격 작업이 갱신한 참조 하나.
 
-    local_ref: str
-    remote_ref: str
+    **필드 이름이 방향 중립인 이유**: 화살표의 의미가 작업마다 뒤집힌다.
+
+        fetch  " * [new branch]  side -> origin/side"   원격 브랜치 → 로컬 추적 ref
+        push   " * [new branch]  main -> main"          로컬 브랜치 → 원격 브랜치
+
+    즉 fetch에서 왼쪽은 원격의 것이고 push에서 왼쪽은 우리 것이다.
+    `local_ref`/`remote_ref`로 이름 붙이면 한쪽에서 반드시 거짓말이 된다.
+    """
+
+    source: str
+    """화살표 왼쪽. fetch면 원격 브랜치, push면 로컬 브랜치."""
+
+    dest: str
+    """화살표 오른쪽. fetch면 로컬 추적 ref, push면 원격 브랜치.
+
+    화살표가 없는 줄(push의 삭제)에서는 source와 같다.
+    """
+
     old_sha: str | None = None
     new_sha: str | None = None
     deleted: bool = False
-    """prune이 지운 참조. sha가 없다고 '신규'로 오인하면 안 된다."""
+    """지워진 참조. sha가 없다고 '신규'로 오인하면 안 된다."""
 
     @property
     def is_new(self) -> bool:
@@ -119,6 +151,10 @@ class TransferStats:
     duration_ms: int
     received_bytes: int | None = None
     received_objects: int | None = None
+    sent_bytes: int | None = None
+    """push가 보낸 바이트. 목적함수는 방향을 가리지 않으므로 함께 센다."""
+
+    sent_objects: int | None = None
     total_objects: int | None = None
     reused_objects: int | None = None
     throughput_bytes_per_s: int | None = None
@@ -131,25 +167,42 @@ class TransferStats:
     succeeded: bool = True
 
     @property
-    def transferred_anything(self) -> bool:
-        """팩을 실제로 받았는가.
+    def billed_bytes(self) -> int | None:
+        """이 작업이 회선에 실은 총 바이트 — 목적함수의 단위.
 
-        **이 값을 "변경 없음"으로 읽으면 안 된다.** 객체를 하나도 받지 않고
-        참조만 바뀌는 fetch가 있다 — 이미 가진 커밋을 가리키는 새 브랜치,
-        prune 삭제. 그 판단은 `changed_anything`이다.
+        받은 것과 보낸 것을 합친다. 트래픽 예산은 방향을 가리지 않으므로,
+        누적 집계는 이 값으로 해야 한다. 한쪽이라도 측정하지 못했으면
+        합계도 "측정하지 못함"이다 — 0으로 때우면 과소 집계가 된다.
         """
-        return bool(self.received_objects)
+        if self.received_bytes is None and self.sent_bytes is None:
+            return None
+        if self.received_bytes is None or self.sent_bytes is None:
+            # 한 방향만 측정된 경우. fetch는 sent를, push는 received를
+            # 애초에 만들지 않으므로, 없는 쪽은 0으로 본다.
+            return self.received_bytes if self.sent_bytes is None else self.sent_bytes
+        return self.received_bytes + self.sent_bytes
+
+    @property
+    def transferred_anything(self) -> bool:
+        """팩을 실제로 주고받았는가.
+
+        **이 값을 "변경 없음"으로 읽으면 안 된다.** 객체를 하나도 옮기지 않고
+        참조만 바뀌는 작업이 있다 — 이미 가진 커밋을 가리키는 새 브랜치,
+        prune 삭제, 원격에 이미 있는 커밋을 가리키는 브랜치 push.
+        그 판단은 `changed_anything`이다.
+        """
+        return bool(self.received_objects) or bool(self.sent_objects)
 
     @property
     def changed_anything(self) -> bool:
-        """저장소 상태가 바뀌었는가 — 화면을 다시 그려야 하는가.
+        """저장소(또는 원격) 상태가 바뀌었는가 — 화면을 다시 그려야 하는가.
 
         `transferred_anything`으로 이걸 판단하면 .git과 화면이 어긋난다.
         실측: 원격에 새 브랜치가 생겼는데 그 커밋을 이미 갖고 있으면 팩이
         오지 않아 "이미 최신"으로 표시되고, 참조 목록에 브랜치가 끝내
         나타나지 않는다.
         """
-        return bool(self.received_objects) or bool(self.ref_updates)
+        return self.transferred_anything or bool(self.ref_updates)
 
     def region_ms(self, name: str) -> float | None:
         for label, seconds in self.regions:
@@ -164,11 +217,17 @@ class ProgressReport:
 
     received_bytes: int | None = None
     received_objects: int | None = None
+    sent_bytes: int | None = None
+    """push가 보낸 바이트. "Writing objects" 줄에서 온다."""
+
+    sent_objects: int | None = None
     total_objects: int | None = None
     reused_objects: int | None = None
     delta_objects: int | None = None
     throughput_bytes_per_s: int | None = None
     ref_updates: list[RefUpdate] = field(default_factory=list)
+    nothing_to_push: bool = False
+    """"Everything up-to-date" — push할 것이 없었다."""
 
 
 def parse_progress(stderr: str) -> ProgressReport:
@@ -195,6 +254,20 @@ def parse_progress(stderr: str) -> ProgressReport:
                 )
             continue
 
+        match = _WRITING.search(line)
+        if match:
+            report.sent_objects = int(match.group(1))
+            report.sent_bytes = parse_size(match.group(3), match.group(4))
+            if match.group(5) and match.group(6):
+                report.throughput_bytes_per_s = parse_size(
+                    match.group(5), match.group(6)
+                )
+            continue
+
+        if _NOTHING_TO_PUSH.search(line):
+            report.nothing_to_push = True
+            continue
+
         match = _TOTAL.search(line)
         if match:
             report.total_objects = int(match.group(1))
@@ -206,8 +279,8 @@ def parse_progress(stderr: str) -> ProgressReport:
         if match:
             report.ref_updates.append(
                 RefUpdate(
-                    local_ref=match.group(4),
-                    remote_ref=match.group(3),
+                    source=match.group(3),
+                    dest=match.group(4),
                     old_sha=match.group(1),
                     new_sha=match.group(2),
                 )
@@ -216,10 +289,12 @@ def parse_progress(stderr: str) -> ProgressReport:
 
         match = _REF_MARKER.search(line)
         if match:
+            source = match.group(3)
+            # 화살표가 없으면(push 삭제) 대상은 source 자신이다.
             report.ref_updates.append(
                 RefUpdate(
-                    local_ref=match.group(4),
-                    remote_ref=match.group(3),
+                    source=source,
+                    dest=match.group(4) or source,
                     deleted=match.group(1) == "-",
                 )
             )

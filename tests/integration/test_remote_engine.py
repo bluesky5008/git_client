@@ -53,8 +53,8 @@ class TestFetchBasics:
 
         assert stats.ref_updates
         update = stats.ref_updates[0]
-        assert update.local_ref == "origin/main"
-        assert update.remote_ref == "main"
+        assert update.dest == "origin/main"
+        assert update.source == "main"
 
     def test_no_op_fetch_transfers_nothing(self, engine: RemoteEngine) -> None:
         stats = engine.fetch()
@@ -100,7 +100,7 @@ class TestFetchBasics:
 
         assert stats.transferred_anything is False  # 받을 객체가 없다
         assert stats.changed_anything is True  # 그래도 origin/side가 생겼다
-        assert any(u.local_ref == "origin/side" for u in stats.ref_updates)
+        assert any(u.dest == "origin/side" for u in stats.ref_updates)
 
     def test_pruned_branch_is_reported(
         self, remote: RemoteFixture, engine: RemoteEngine
@@ -114,7 +114,7 @@ class TestFetchBasics:
 
         assert stats.changed_anything is True
         deleted = [u for u in stats.ref_updates if u.deleted]
-        assert [u.local_ref for u in deleted] == ["origin/doomed"]
+        assert [u.dest for u in deleted] == ["origin/doomed"]
 
     def test_forced_update_is_counted(
         self, remote: RemoteFixture, engine: RemoteEngine
@@ -124,7 +124,7 @@ class TestFetchBasics:
 
         stats = engine.fetch()
 
-        assert [u.local_ref for u in stats.ref_updates] == ["origin/main"]
+        assert [u.dest for u in stats.ref_updates] == ["origin/main"]
         assert stats.changed_anything is True
 
 
@@ -275,6 +275,121 @@ class TestFailures:
         assert elapsed < 15, f"timeout이 상한 노릇을 못 했다: {elapsed:.1f}초"
 
 
+class TestPush:
+    """push 계측 — 방향이 반대라 받는 쪽 로직을 그대로 쓸 수 없다."""
+
+    def test_push_sends_commits(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        remote.commit_locally(2, payload_kb=4)
+        before = remote.origin_branch_head()
+
+        engine.push(refspecs=["main"])
+
+        assert remote.origin_branch_head() != before
+        assert remote.origin_branch_head() == remote.work_head()
+
+    def test_sent_bytes_are_measured(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """보낸 바이트가 측정돼야 한다 — 목적함수는 방향을 가리지 않는다."""
+        remote.commit_locally(2, payload_kb=8)
+
+        stats = engine.push(refspecs=["main"])
+
+        assert stats.kind is OperationKind.PUSH
+        assert stats.sent_bytes is not None and stats.sent_bytes > 0
+        assert stats.sent_objects
+        assert stats.billed_bytes == stats.sent_bytes
+
+    def test_push_does_not_claim_received_bytes(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """해당 없는 방향은 None이어야 한다 — 0으로 채우면 '측정된 0'과 섞인다."""
+        remote.commit_locally(1)
+        stats = engine.push(refspecs=["main"])
+        assert stats.received_bytes is None
+
+    def test_nothing_to_push_is_zero_not_unmeasured(
+        self, engine: RemoteEngine
+    ) -> None:
+        """"Everything up-to-date"는 측정 실패가 아니다."""
+        stats = engine.push(refspecs=["main"])
+        assert stats.sent_bytes == 0
+        assert stats.changed_anything is False
+
+    def test_new_branch_without_objects_is_measured(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """원격이 이미 가진 커밋을 가리키는 브랜치 — 팩 없이 참조만 생긴다.
+
+        push는 이때 "Total 0 (delta 0)"을 내놓는다. fetch처럼 Total 줄이
+        아예 없는 게 아니라서, 0을 '측정 실패'로 오인하기 쉽다.
+        """
+        git("branch", "sidecar", cwd=remote.work)
+
+        stats = engine.push(refspecs=["sidecar"])
+
+        assert stats.sent_bytes == 0
+        assert stats.changed_anything is True
+        assert remote.origin_has_branch("sidecar")
+
+    def test_push_ref_update_direction(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """push의 화살표는 로컬 → 원격이다. fetch와 방향이 반대다."""
+        remote.commit_locally(1)
+
+        stats = engine.push(refspecs=["main"])
+
+        assert [(u.source, u.dest) for u in stats.ref_updates] == [("main", "main")]
+
+    def test_deleted_branch_push_has_no_arrow(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """push 삭제 줄에는 화살표가 없다 — 필수로 두면 통째로 놓친다."""
+        git("branch", "doomed", cwd=remote.work)
+        engine.push(refspecs=["doomed"])
+        assert remote.origin_has_branch("doomed")
+
+        stats = engine.push(refspecs=[":doomed"])
+
+        assert stats.changed_anything is True
+        assert [u.dest for u in stats.ref_updates if u.deleted] == ["doomed"]
+        assert not remote.origin_has_branch("doomed")
+
+    def test_rejected_push_points_at_pull(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """비빨리감기 거부는 가장 흔한 push 실패다 — 조치가 정확해야 한다."""
+        remote.diverge()
+
+        with pytest.raises(EngineError) as excinfo:
+            engine.push(refspecs=["main"])
+
+        assert excinfo.value.action is not None
+        assert "Pull" in excinfo.value.action or "합치" in excinfo.value.action
+        assert excinfo.value.detail  # git 원문 보존
+
+
+class TestAheadBehind:
+    def test_reports_divergence(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        remote.diverge()
+        engine.fetch()
+
+        assert engine.ahead_behind("main", "origin/main") == (1, 1)
+
+    def test_in_sync_is_zero_zero(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        assert engine.ahead_behind("main", "origin/main") == (0, 0)
+
+    def test_unknown_upstream_is_none(self, engine: RemoteEngine) -> None:
+        assert engine.ahead_behind("main", "origin/nonexistent") is None
+
+
 class TestArgumentInjection:
     """원격 이름과 refspec은 옵션이 아니다.
 
@@ -284,19 +399,107 @@ class TestArgumentInjection:
     그대로 나열한다. `--` 뒤에서는 git이 값을 URL/refspec으로만 읽는다.
     """
 
+    @staticmethod
+    def _payload(tmp_path: Path) -> tuple[str, Path]:
+        """실행되면 흔적을 남기는 스크립트. 실행 자체를 감지하기 위한 것이다.
+
+        "예외가 났는가"로는 방어를 검증할 수 없다 — `--`가 없어도 git은
+        엉뚱한 이유로 실패하므로 두 경우가 구분되지 않는다. 실제로 `--`를
+        지워도 전 테스트가 통과했다. **명령이 실행됐는지**를 봐야 한다.
+        """
+        marker = tmp_path / "PWNED.txt"
+        script = tmp_path / "payload.bat"
+        script.write_text(f'@echo pwned > "{marker}"\n@exit /b 1\n')
+        return str(script).replace("\\", "/"), marker
+
     def test_dash_leading_remote_name_is_not_an_option(
-        self, engine: RemoteEngine
+        self, engine: RemoteEngine, tmp_path: Path
     ) -> None:
-        with pytest.raises(EngineError) as excinfo:
-            engine.fetch("--upload-pack=echo")
-        # 옵션으로 먹히면 fetch가 성공해버린다. git이 거부해야 정상이다.
-        assert excinfo.value.detail
+        script, marker = self._payload(tmp_path)
+
+        with pytest.raises(EngineError):
+            engine.fetch(f"--upload-pack={script}")
+
+        assert not marker.exists(), "원격 이름이 옵션으로 해석돼 명령이 실행됐다"
 
     def test_dash_leading_refspec_is_not_an_option(
-        self, engine: RemoteEngine
+        self, engine: RemoteEngine, tmp_path: Path
     ) -> None:
+        script, marker = self._payload(tmp_path)
+
         with pytest.raises(EngineError):
-            engine.fetch(refspecs=["--upload-pack=echo"])
+            engine.fetch(refspecs=[f"--upload-pack={script}"])
+
+        assert not marker.exists()
+
+    def test_push_remote_name_is_not_an_option(
+        self, engine: RemoteEngine, tmp_path: Path
+    ) -> None:
+        """push에도 같은 방어가 필요하다.
+
+        push는 사용자가 누르는 경로이고 원격 이름은 악성 `.git/config`가
+        심을 수 있는 값이다. fetch만 검증하면 push의 `--`를 지워도 전 테스트가
+        통과한다 — 실제로 그랬다.
+        """
+        script, marker = self._payload(tmp_path)
+
+        with pytest.raises(EngineError):
+            engine.push(f"--receive-pack={script}")
+
+        assert not marker.exists(), "원격 이름이 옵션으로 해석돼 명령이 실행됐다"
+
+    def test_push_refspec_is_not_an_option(
+        self, engine: RemoteEngine, tmp_path: Path
+    ) -> None:
+        script, marker = self._payload(tmp_path)
+
+        with pytest.raises(EngineError):
+            engine.push(refspecs=[f"--receive-pack={script}"])
+
+        assert not marker.exists()
+
+
+class TestFailedTransfersAreStillMeasured:
+    """실패해도 바이트는 이미 나갔다 — 목적함수에서 빠지면 안 된다."""
+
+    def test_partially_rejected_push_still_reports_bytes(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """여러 ref를 올리다 하나만 거부되면 나머지는 실제로 전송된다.
+
+        push는 호출 단위가 아니라 ref 단위로 원자적이다. 예외만 던지고 끝내면
+        행 자체가 없어 "측정 실패"로도 잡히지 않는 완전 무기록이 된다.
+        """
+        # accepted: 새 브랜치(전송 발생) / rejected: 갈라진 main
+        remote.commit_locally(1, payload_kb=8)
+        git("branch", "accepted", cwd=remote.work)
+        remote.diverge()
+
+        with pytest.raises(EngineError) as excinfo:
+            engine.push(refspecs=["accepted", "main"])
+
+        stats = getattr(excinfo.value, "stats", None)
+        assert stats is not None, "실패한 push의 계측이 통째로 사라졌다"
+        assert stats.succeeded is False
+        assert stats.sent_bytes and stats.sent_bytes > 0
+        assert remote.origin_has_branch("accepted"), "일부는 실제로 올라갔다"
+
+    def test_failed_transfer_does_not_fake_zero(
+        self, remote: RemoteFixture, engine: RemoteEngine
+    ) -> None:
+        """실패 경로에서는 0 채우기를 하면 안 된다.
+
+        "팩이 필요 없었다"와 "보내기 전에 끊겼다"를 구분할 수 없으므로
+        None(측정 실패)이 맞다. 0으로 때우면 과소 집계가 된다.
+        """
+        remote.diverge()
+
+        with pytest.raises(EngineError) as excinfo:
+            engine.push(refspecs=["main"])
+
+        stats = getattr(excinfo.value, "stats", None)
+        assert stats is not None
+        assert stats.succeeded is False
 
 
 class TestEnvironmentIsolation:
