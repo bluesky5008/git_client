@@ -198,10 +198,33 @@ class LocalGitEngine:
                 is_empty=repo.is_empty,
                 is_bare=repo.is_bare,
                 is_shallow=repo.is_shallow,
+                is_partial=self._is_partial(repo),
                 refs=self.refs() if include_refs else [],
                 # 원격 목록은 설정 파일 한 번 읽기라 lite 정보에도 포함한다.
                 remotes=[remote.name for remote in repo.remotes],
             )
+
+    @staticmethod
+    def _is_partial(repo: pygit2.Repository) -> bool:
+        """부분 복제 저장소인가.
+
+        표식은 `remote.<이름>.promisor`다 — 그 원격이 지연된 객체를 나중에
+        공급해 준다는 뜻이다.
+
+        (`extensions.partialClone`을 먼저 봤는데 실측한 git 2.42는 그 키를
+        쓰지 않았다. 추측 대신 실제 설정을 확인하고 골랐다.)
+        """
+        # try를 **원격 하나마다** 건다. 루프 전체를 감싸면 promisor가 없는
+        # 첫 원격이 KeyError를 던지면서 순회가 끝나버려, 원격이 둘 이상일 때
+        # 부분 복제를 놓친다(pygit2는 없는 키에 KeyError를 던진다).
+        for remote in repo.remotes:
+            try:
+                value = repo.config[f"remote.{remote.name}.promisor"]
+            except (KeyError, ValueError, AttributeError, pygit2.GitError):
+                continue
+            if str(value).strip().lower() in ("true", "1", "yes"):
+                return True
+        return False
 
     def refs(self) -> list[Ref]:
         """로컬/원격 브랜치와 태그를 모은다.

@@ -32,10 +32,18 @@ from enum import Enum
 # 실제 fetch에서 확인된 형태이며, 이걸 놓치면 작은 fetch가 통째로
 # "측정 실패"로 기록되어 누적 전송량이 과소 집계된다.
 _SIZE_UNIT = r"(bytes|byte|[KMGT]iB|[KMGT]B|B)"
+
+# **크기 부분이 선택적인 이유**: git은 전송이 충분히 크거나 오래 걸릴 때만
+# 크기·처리량을 붙인다. 작은 clone은 `Receiving objects: 100% (3/3), done.`
+# 처럼 개수만 준다(실측: 200KB까지는 크기 없음, 2MB부터 나옴).
+#
+# 크기를 필수로 두면 그런 경우에 **객체 수까지 통째로 놓친다** — 알 수 있는
+# 것마저 "측정 못함"으로 버리는 셈이다. 개수는 받고, 크기는 없으면 None으로
+# 둔다(진짜 측정 실패). 둘은 별개의 사실이다.
 _RECEIVING = re.compile(
-    r"Receiving objects:\s+100%\s+\((\d+)/(\d+)\),\s+"
-    r"([\d.]+)\s+" + _SIZE_UNIT +
-    r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?"
+    r"Receiving objects:\s+100%\s+\((\d+)/(\d+)\)"
+    r"(?:,\s+([\d.]+)\s+" + _SIZE_UNIT +
+    r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?)?"
 )
 
 # push의 대응물. 형태는 같지만 방향이 반대다 — 우리가 **보낸** 바이트다.
@@ -247,7 +255,8 @@ def parse_progress(stderr: str) -> ProgressReport:
         match = _RECEIVING.search(line)
         if match:
             report.received_objects = int(match.group(1))
-            report.received_bytes = parse_size(match.group(3), match.group(4))
+            if match.group(3) and match.group(4):
+                report.received_bytes = parse_size(match.group(3), match.group(4))
             if match.group(5) and match.group(6):
                 report.throughput_bytes_per_s = parse_size(
                     match.group(5), match.group(6)

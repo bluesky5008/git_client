@@ -188,6 +188,9 @@ class RemoteEngine:
         # 지금 작업 중인 원격 이름. 오류를 만들 때 "무엇에 대한 로그인인가"를
         # 서버 출력이 아니라 우리 설정에서 답하기 위해 둔다.
         self._active_remote: str | None = None
+        # clone은 아직 저장소가 없어 `remote get-url`을 쓸 수 없다.
+        # 로그인 대상 주소를 여기서 직접 들고 간다.
+        self._clone_url: str | None = None
         # abort()는 UI 스레드에서, _run()은 워커 스레드에서 돈다.
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
@@ -281,6 +284,74 @@ class RemoteEngine:
         self._active_remote = remote
         return self._run_measured(
             args, kind=OperationKind.PUSH, remote=remote, timeout_s=timeout_s
+        )
+
+    @classmethod
+    def clone(
+        cls,
+        url: str,
+        destination: str | Path,
+        *,
+        filter_spec: str | None = None,
+        depth: int | None = None,
+        credentials: Credentials | None = None,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+    ) -> TransferStats:
+        """원격을 복제한다. 계측 결과를 반환한다.
+
+        다른 원격 작업과 달리 **시작할 때 저장소가 없다.** 그래서 인스턴스
+        메서드가 아니라 클래스 메서드이고, git은 대상의 상위 디렉터리에서
+        실행한다.
+
+        `filter_spec`(`blob:none` 등)과 `depth`는 초기 전송량을 줄이지만
+        누적 전송량에서는 이득이 불확실하다(ADR-6). 기본값은 둘 다 없음이며,
+        고른 경우의 제약은 UI가 알린다.
+        """
+        target = Path(destination)
+        parent = target.parent
+        parent.mkdir(parents=True, exist_ok=True)
+
+        engine = cls(parent, credentials=credentials)
+        return engine.clone_with(
+            url, target, filter_spec=filter_spec, depth=depth, timeout_s=timeout_s
+        )
+
+    def clone_with(
+        self,
+        url: str,
+        destination: str | Path,
+        *,
+        filter_spec: str | None = None,
+        depth: int | None = None,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+    ) -> TransferStats:
+        """이 엔진 인스턴스로 복제한다.
+
+        클래스 메서드와 갈라놓은 이유: 취소가 실제 프로세스를 끊으려면
+        **실행 중인 엔진을 호출자가 붙잡고 있어야** 한다. 클래스 메서드가
+        엔진을 안에서 만들어 버리면 워커가 그 인스턴스를 알 수 없다.
+        """
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._active_remote = None
+        self._clone_url = url
+        args = ["clone", "--progress"]
+        if filter_spec:
+            args.append(f"--filter={filter_spec}")
+        if depth is not None:
+            args.extend(["--depth", str(depth)])
+        # 원격 주소와 경로는 옵션이 아니다 (ADR: 인자 주입 방어).
+        args.append("--")
+        args.append(url)
+        args.append(str(target))
+
+        # 계측에 남는 원격 이름에서 자격증명을 걷어낸다. URL에 토큰을 박아둔
+        # 사용자가 있는데, 그 값이 계측 DB에 평문으로 영구 저장되면 안 된다.
+        return self._run_measured(
+            args,
+            kind=OperationKind.CLONE,
+            remote=_without_userinfo(url),
+            timeout_s=timeout_s,
         )
 
     def remote_url(self, remote: str) -> str | None:
@@ -675,7 +746,13 @@ class RemoteEngine:
         return _with_stderr(self._classify_failure(stderr, lowered, result), stderr)
 
     def _configured_url(self) -> str | None:
-        """지금 작업 중인 원격의 설정된 주소. 알 수 없으면 None."""
+        """지금 작업 중인 원격의 설정된 주소. 알 수 없으면 None.
+
+        clone은 저장소가 없어 설정을 읽을 수 없으므로 넘겨받은 주소를 쓴다.
+        어느 쪽이든 **서버가 보낸 문구가 아니라 우리가 아는 값**이다.
+        """
+        if self._clone_url:
+            return self._clone_url
         return self.remote_url(self._active_remote) if self._active_remote else None
 
     def _known_username(self, url: str | None) -> str | None:
