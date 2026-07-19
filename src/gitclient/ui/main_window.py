@@ -16,7 +16,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool, QTimer
+from PySide6.QtCore import (
+    QCoreApplication,
+    QElapsedTimer,
+    QEventLoop,
+    QModelIndex,
+    QSettings,
+    Qt,
+    QThreadPool,
+    QTimer,
+)
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,14 +54,23 @@ from gitclient.application.remote_workers import (
     PullWorker,
     PushWorker,
     RemoteWorker,
+    abort_merge_job,
     fast_forward_job,
+    merge_job,
 )
 from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.domain.instrumentation import OperationKind
-from gitclient.domain.models import MergeKind, Ref, RefKind, RepositoryInfo
+from gitclient.domain.models import (
+    ConflictSide,
+    MergeKind,
+    MergeOutcome,
+    Ref,
+    RefKind,
+    RepositoryInfo,
+)
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from gitclient.ui.clone_dialog import CloneDialog
 from gitclient.ui.credential_dialog import CredentialDialog
@@ -106,6 +124,10 @@ class MainWindow(QMainWindow):
         # 인증 실패 시 같은 작업을 자격증명과 함께 다시 만드는 함수.
         # 한 번 쓰면 비운다 — 무한히 되묻는 고리를 막는다.
         self._remote_retry = None
+        # 진행 중인 병합의 충돌 목록. 비어 있으면 병합 중이 아니다.
+        self._merge_conflicts: tuple = ()
+        self._merging = False
+
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
@@ -310,6 +332,13 @@ class MainWindow(QMainWindow):
         self._clone_action.setToolTip("원격 저장소를 복제해 옵니다")
         self._clone_action.triggered.connect(self._on_clone)
 
+        self._abort_merge_action = QAction("병합 중단", self)
+        self._abort_merge_action.setToolTip(
+            "진행 중인 병합을 되돌립니다 (워킹 트리가 병합 이전으로 복구됩니다)"
+        )
+        self._abort_merge_action.triggered.connect(self._on_abort_merge)
+        self._abort_merge_action.setEnabled(False)
+
         self._pull_action = QAction("가져와 합치기 (Pull)", self)
         self._pull_action.setToolTip("원격의 변경을 가져와 현재 브랜치에 합칩니다")
         self._pull_action.triggered.connect(self._on_pull)
@@ -331,6 +360,8 @@ class MainWindow(QMainWindow):
         repo_menu.addAction(self._fetch_action)
         repo_menu.addAction(self._pull_action)
         repo_menu.addAction(self._push_action)
+        repo_menu.addSeparator()
+        repo_menu.addAction(self._abort_merge_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._branch_action)
         repo_menu.addSeparator()
@@ -423,6 +454,12 @@ class MainWindow(QMainWindow):
             queue.job_failed.connect(
                 lambda _jid, _name, error, q=queue: self._on_write_failed(q, error)
             )
+            # 병합은 **충돌해도 성공으로 끝난다** — 결과 값을 봐야 안다.
+            queue.job_succeeded.connect(
+                lambda _jid, name, result, q=queue: self._on_write_succeeded(
+                    q, name, result
+                )
+            )
             queue.idle.connect(lambda q=queue: self._on_write_queue_idle(q))
             self._write_queue = queue
         elif not has_workdir:
@@ -438,6 +475,7 @@ class MainWindow(QMainWindow):
             action.setEnabled(has_workdir)
 
         self._update_remote_actions()
+        self._sync_merge_state()
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -592,6 +630,17 @@ class MainWindow(QMainWindow):
         if self._fetch_worker is not None:
             self._fetch_worker.cancel()
             self._fetch_worker = None
+
+        # 쓰기는 취소하지 않는다 (§3.3 규칙 5). 하지만 창이 먼저 사라지면
+        # 그 작업의 성패를 보고할 곳도 없어진다 — 병합 중단이 실패해도
+        # 아무도 모른 채 저장소가 중간 상태로 남는다. 그래서 짧게 기다려
+        # 결과가 보고될 기회를 준다.
+        #
+        # **닫기를 무기한 미루지는 않는다.** event.ignore()로 붙잡으면 창이
+        # 안 닫히는 것처럼 보이고, 그 사이 위젯이 밖에서 파괴되면 늦은
+        # 시그널이 삭제된 객체에 꽂힌다. 기다림에 마감을 두는 편이 낫다.
+        self._drain_writes(deadline_ms=3000)
+
         # 큐를 분리해 두면 닫힌 뒤 도착하는 늦은 idle/실패 시그널을
         # 정체 가드가 걸러낸다 — 파괴된 위젯을 건드리지 않는다.
         self._dispose_write_queue()
@@ -883,6 +932,77 @@ class MainWindow(QMainWindow):
         queue.job_succeeded.connect(_ok)
         queue.job_failed.connect(_fail)
 
+    def _on_write_succeeded(
+        self, queue: WriteQueue, name: str, result: object
+    ) -> None:
+        """쓰기 작업이 끝났다. 병합만 결과를 들여다본다.
+
+        **충돌은 실패 시그널로 오지 않는다** — git이 할 수 있는 만큼 합친
+        정상 결과이기 때문이다. 그래서 여기서 값을 보고 분기한다.
+        """
+        if queue is not self._write_queue:
+            return  # 교체된 저장소의 늦은 결과
+        if isinstance(result, MergeOutcome) and result.is_conflicted:
+            self._enter_conflict_mode(result)
+
+    def _enter_conflict_mode(self, outcome: MergeOutcome) -> None:
+        """충돌 상태를 화면에 드러낸다.
+
+        여기서 조용히 넘어가면 사용자는 워킹 트리에 충돌 마커가 든 줄도
+        모른 채 작업을 이어간다 — 그 상태로 커밋하면 마커가 그대로 들어간다.
+        """
+        self._merge_conflicts = outcome.conflicts
+        self._merging = True
+        self._abort_merge_action.setEnabled(True)
+        self._update_remote_actions()
+        summary = ", ".join(c.path for c in outcome.conflicts[:3])
+        if len(outcome.conflicts) > 3:
+            summary += f" 외 {len(outcome.conflicts) - 3}개"
+
+        # 마커가 없는 충돌(바이너리, 한쪽 삭제)에 "마커를 정리하라"고 하면
+        # 사용자는 있지도 않은 것을 찾는다. 그대로 커밋하면 워킹 트리에 남은
+        # 우리 것만 들어가 **상대 변경이 조용히 버려진다** — 그 파일들은
+        # 어느 쪽을 남길지 직접 골라야 한다.
+        markerless = [c.path for c in outcome.conflicts if not c.has_markers]
+        detail = f"충돌한 파일: {summary}"
+        if len(markerless) < len(outcome.conflicts):
+            detail += (
+                "\n\n워킹 트리의 해당 파일에 충돌 마커(<<<<<<< / >>>>>>>)가 "
+                "들어 있습니다."
+            )
+        if markerless:
+            names = ", ".join(markerless[:3])
+            detail += (
+                f"\n\n{names}에는 충돌 마커가 없습니다(바이너리이거나 한쪽이 "
+                "삭제한 파일). 지금 워킹 트리에는 우리 쪽 내용만 있으므로, "
+                "그대로 커밋하면 상대 변경이 버려집니다."
+            )
+        self._report(
+            GitClientError(
+                f"충돌 {len(outcome.conflicts)}개를 해결해야 합니다.",
+                detail=detail,
+                action="파일을 정리한 뒤 스테이징하고 커밋하면 병합이 "
+                "완료됩니다. 되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
+            )
+        )
+
+    def _drain_writes(self, *, deadline_ms: int) -> None:
+        """진행 중인 쓰기가 끝날 때까지 마감 시각까지만 기다린다.
+
+        결과 시그널은 이벤트 루프로 배달되므로 그냥 블로킹하면 영영 오지
+        않는다 — 이벤트를 돌리면서 기다려야 실패가 보고된다.
+        """
+        queue = self._write_queue
+        if queue is None or not queue.is_busy:
+            return
+        self.statusBar().showMessage("진행 중인 작업을 마치는 중입니다...")
+        timer = QElapsedTimer()
+        timer.start()
+        while queue.is_busy and timer.elapsed() < deadline_ms:
+            QCoreApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.AllEvents, 50
+            )
+
     def _on_write_failed(self, queue: WriteQueue, error: GitClientError) -> None:
         if queue is not self._write_queue:
             return  # 교체된 저장소의 늦은 실패 — 현재 화면과 무관하다
@@ -894,8 +1014,11 @@ class MainWindow(QMainWindow):
             return  # 교체된 저장소의 늦은 idle
         if self._graph_reload_pending and self._repo_path is not None:
             self._graph_reload_pending = False
-            self.open_repository(self._repo_path)
+            self.open_repository(self._repo_path)  # 여기서 병합 상태도 다시 읽는다
             return
+        # 쓰기 하나로 병합이 끝났을 수 있다(마지막 충돌을 해결한 커밋). 저장소에
+        # 다시 물어야 중단 메뉴와 원격 액션이 실제 상태와 어긋나지 않는다.
+        self._sync_merge_state()
         self._refresh_status()
         self._update_status(self._info)
 
@@ -1163,7 +1286,10 @@ class MainWindow(QMainWindow):
         # 복제는 저장소가 열려 있지 않아도 된다 — 오히려 그때 가장 필요하다.
         # 다만 원격 작업 슬롯은 공유하므로 진행 중이면 잠근다.
         self._clone_action.setEnabled(idle)
-        available = self._has_remotes() and idle
+        # 병합이 끝나지 않았으면 가져오기·올리기를 열어두지 않는다. 눌러봐야
+        # 합칠 수 없는데 **바이트는 이미 쓴 뒤다** — 전송량이 이 앱의 목적
+        # 함수이므로(§1.1) 헛된 fetch는 그 자체로 결함이다.
+        available = self._has_remotes() and idle and not self._merging
         self._fetch_action.setEnabled(available)
         self._pull_action.setEnabled(available)
         # push는 워킹 트리가 있어야 의미가 있다(bare 저장소는 올릴 것이 없다).
@@ -1260,6 +1386,54 @@ class MainWindow(QMainWindow):
             "원격에서 가져오는 중...",
             retry=lambda creds: FetchWorker(path, remote, credentials=creds),
         )
+
+    def _on_abort_merge(self) -> None:
+        """진행 중인 병합을 되돌린다.
+
+        **되돌릴 수 없는 작업이다** — 충돌 마커를 편집한 내용도, 충돌 없이
+        이미 반영된 변경도 전부 사라진다. 그래서 확인을 받는다.
+        """
+        if self._write_queue is None:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "병합 중단",
+            "진행 중인 병합을 되돌립니다.\n\n"
+            "워킹 트리가 병합 이전 상태로 복구되며, 충돌을 해결하던 내용은 "
+            "사라집니다. 이 작업은 되돌릴 수 없습니다.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Discard:
+            return
+        self._merge_conflicts = ()
+        self._abort_merge_action.setEnabled(False)
+        self._write_queue.submit("병합 중단", abort_merge_job())
+        self._graph_reload_pending = True
+
+    def _sync_merge_state(self) -> None:
+        """저장소가 병합 중인지 확인해 UI에 반영한다.
+
+        앱을 껐다 켜거나 다른 저장소를 열어도 병합은 **저장소에 남아 있다** —
+        메모리 상태만 믿으면 중단 메뉴가 꺼진 채로 갇힌다.
+        """
+        if self._engine is None:
+            self._merge_conflicts = ()
+            self._merging = False
+            self._abort_merge_action.setEnabled(False)
+            self._update_remote_actions()
+            return
+        try:
+            self._merge_conflicts = self._engine.merge_conflicts()
+            self._merging = self._engine.is_merging()
+        except GitClientError:
+            self._merge_conflicts = ()
+            self._merging = False
+        # 충돌 목록이 아니라 **저장소 상태**로 판단한다. 사용자가 마지막
+        # 충돌을 해결해 스테이징하면 목록은 비지만 병합은 아직 진행 중이고,
+        # 그때도 중단할 수 있어야 한다.
+        self._abort_merge_action.setEnabled(self._merging)
+        self._update_remote_actions()
 
     # -- clone ----------------------------------------------------------
 
@@ -1394,18 +1568,13 @@ class MainWindow(QMainWindow):
             return
 
         if preview.kind is MergeKind.MERGE_REQUIRED:
-            # 병합 커밋과 충돌 해결 UI는 Phase 4다. 여기서 병합을 시작하면
-            # 사용자가 앱 안에서 끝낼 수 없는 상태에 갇힌다 — 받은 것은
-            # 이미 저장했으니 그래프에는 반영하고, 할 수 없는 일은 말한다.
-            reload_and(
-                GitClientError(
-                    "양쪽에 서로 다른 커밋이 있어 자동으로 합칠 수 없습니다.",
-                    detail="원격 변경은 이미 가져왔습니다. "
-                    "합치기(merge)는 아직 지원하지 않습니다.",
-                    action="지금은 git CLI에서 merge 또는 rebase로 "
-                    "해결해 주세요. 앱 안에서의 병합은 Phase 4에서 추가됩니다.",
-                )
-            )
+            # Phase 4: 이제 앱 안에서 합친다. 충돌하면 그 상태를 보여주고
+            # 사용자가 해결하거나 중단할 수 있게 한다 — CLI로 내보내지 않는다.
+            if self._write_queue is None:
+                reload_and()
+                return
+            self._write_queue.submit("가져와 합치기", merge_job(upstream, branch))
+            self._graph_reload_pending = True
             return
 
         if self._write_queue is None:
