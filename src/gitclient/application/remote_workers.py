@@ -432,6 +432,31 @@ class CloneWorker(RemoteWorker):
         return self._destination
 
 
+def merge_job(source_ref: str, branch: str) -> Callable[[Any], Any]:
+    """WriteQueue에 제출할 병합 작업.
+
+    빨리 감기와 달리 **충돌이 정상 결과**다. 예외로 던지지 않고 결과를
+    돌려주므로, 호출부(UI)가 `job_succeeded`에서 충돌 여부를 보고 분기한다.
+
+    `branch`를 함께 실어 보내는 이유는 `fast_forward_job`과 같다 — 큐에서
+    실행될 때 사용자가 브랜치를 바꿨을 수 있다.
+    """
+
+    def work(engine: Any) -> Any:
+        return engine.merge(source_ref, branch)
+
+    return work
+
+
+def abort_merge_job() -> Callable[[Any], None]:
+    """진행 중인 병합을 되돌린다. 워킹 트리가 병합 이전으로 복구된다."""
+
+    def work(engine: Any) -> None:
+        engine.abort_merge()
+
+    return work
+
+
 def fast_forward_job(upstream_ref: str, branch: str) -> Callable[[Any], str]:
     """WriteQueue에 제출할 빨리 감기 작업.
 

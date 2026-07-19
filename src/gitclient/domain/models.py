@@ -224,3 +224,84 @@ class MergePreview:
 
     kind: MergeKind
     target_sha: str
+
+
+class ConflictSide(Enum):
+    """충돌한 파일이 양쪽에서 어떤 상태인가.
+
+    내용끼리 부딪히는 것만 충돌이 아니다. 한쪽이 지우고 한쪽이 고친 경우도
+    충돌이며, 이때는 보여줄 "상대 내용"이 아예 없다 — UI가 3-way를 그리려면
+    이 구분이 필요하다.
+    """
+
+    BOTH_MODIFIED = "both_modified"
+    """양쪽이 내용을 고쳤다.
+
+    텍스트라면 워킹 트리에 충돌 마커가 들어가지만 **바이너리면 들어가지
+    않는다** — libgit2가 3-way 텍스트 병합을 포기하고 우리 것을 그대로
+    남긴다. 마커 유무는 side가 아니라 `has_markers`로 판단할 것.
+    """
+
+    DELETED_BY_THEM = "deleted_by_them"
+    """상대가 지웠고 우리가 고쳤다."""
+
+    DELETED_BY_US = "deleted_by_us"
+    """우리가 지웠고 상대가 고쳤다."""
+
+    BOTH_ADDED = "both_added"
+    """양쪽이 같은 경로에 서로 다른 파일을 새로 만들었다 (공통 조상 없음)."""
+
+    BOTH_DELETED = "both_deleted"
+    """양쪽 모두 이 경로를 지웠다 — 보통 이름 변경 대 삭제에서 원래 경로가
+    이렇게 남는다. 어느 쪽에도 보여줄 내용이 없다 (git의 DD)."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictedFile:
+    """병합이 자동으로 해결하지 못한 파일 하나."""
+
+    path: str
+    side: ConflictSide
+    has_markers: bool = True
+    """워킹 트리 파일에 충돌 마커가 들어 있는가.
+
+    바이너리 충돌과 삭제 계열 충돌에는 마커가 없다. 이때 워킹 트리에는
+    우리 것만 남아 있어서, "마커를 정리하고 커밋하라"는 안내를 그대로
+    따르면 **상대 변경이 조용히 버려진** 머지 커밋이 만들어진다.
+    """
+
+    @property
+    def has_our_content(self) -> bool:
+        return self.side not in (
+            ConflictSide.DELETED_BY_US,
+            ConflictSide.BOTH_DELETED,
+        )
+
+    @property
+    def has_their_content(self) -> bool:
+        return self.side not in (
+            ConflictSide.DELETED_BY_THEM,
+            ConflictSide.BOTH_DELETED,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MergeOutcome:
+    """병합 시도의 결과.
+
+    **충돌은 실패가 아니다.** git이 할 수 있는 만큼 합쳐두고 나머지를 사람에게
+    넘긴 상태이며, 저장소는 병합 진행 중(MERGE_HEAD 존재)으로 남는다.
+    그래서 예외가 아니라 결과 값으로 돌려준다 — 호출자가 "무엇을 해야 하는가"를
+    분기해야 하기 때문이다.
+    """
+
+    kind: MergeKind
+    """UP_TO_DATE / FAST_FORWARD / MERGE_REQUIRED 중 실제로 수행된 것."""
+
+    conflicts: tuple[ConflictedFile, ...] = ()
+    merged_sha: str | None = None
+    """만들어진 머지 커밋. 충돌이 있으면 None (아직 커밋 전이다)."""
+
+    @property
+    def is_conflicted(self) -> bool:
+        return bool(self.conflicts)

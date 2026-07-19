@@ -45,10 +45,13 @@ from gitclient.domain.models import (
     ChangeStatus,
     Commit,
     CommitDetail,
+    ConflictedFile,
+    ConflictSide,
     DiffLine,
     DiffLineKind,
     FileChange,
     MergeKind,
+    MergeOutcome,
     MergePreview,
     Ref,
     RefKind,
@@ -128,6 +131,26 @@ def _branch_oid(branch: pygit2.Branch) -> pygit2.Oid | None:
     if isinstance(target, pygit2.Oid):
         return target
     return None
+
+
+def _conflict_side(ancestor, ours, theirs) -> ConflictSide:  # noqa: ANN001
+    """충돌의 종류를 가른다.
+
+    내용끼리 부딪히는 것만 충돌이 아니다 — 한쪽이 지운 경우도 충돌이고,
+    그때는 보여줄 "상대 내용"이 아예 없다. 3-way UI가 이 구분 없이는
+    존재하지 않는 쪽을 그리려 든다.
+    """
+    if ours is None and theirs is None:
+        # 이름 변경 대 삭제에서 원래 경로가 이렇게 남는다. 먼저 걸러야
+        # 한다 — "우리가 지웠다"로 분류하면 없는 상대 내용을 그리려 든다.
+        return ConflictSide.BOTH_DELETED
+    if ours is None:
+        return ConflictSide.DELETED_BY_US
+    if theirs is None:
+        return ConflictSide.DELETED_BY_THEM
+    if ancestor is None:
+        return ConflictSide.BOTH_ADDED
+    return ConflictSide.BOTH_MODIFIED
 
 
 def _peel_to_commit_id(reference: pygit2.Reference) -> pygit2.Oid:
@@ -756,6 +779,17 @@ class LocalGitEngine:
         """
         with _translate("변경 사항 버리기"):
             flags = self._repo.status_file(path)
+            if flags & FileStatus.CONFLICTED:
+                # 충돌 중인 파일에 "버리기"는 성립하지 않는다. 인덱스에
+                # 스테이지가 셋이라 checkout_index는 병합 이전 내용이 아니라
+                # 충돌 마커를 다시 써넣을 뿐이고, 충돌은 그대로 남는다 —
+                # 확인 다이얼로그가 약속한 것과 다른 일이 벌어진다.
+                # git도 같은 이유로 거부한다(path '...' is unmerged).
+                raise EngineError(
+                    f"'{path}'은(는) 충돌 해결 중이라 변경을 버릴 수 없습니다.",
+                    action="충돌 마커를 정리한 뒤 스테이징해 해결하거나, "
+                    "'저장소 > 병합 중단'으로 병합 전체를 되돌려 주세요.",
+                )
             if flags & FileStatus.WT_NEW:
                 target = Path(self._repo.workdir or "") / path
                 target.unlink(missing_ok=True)
@@ -774,6 +808,22 @@ class LocalGitEngine:
             raise EngineError(
                 "커밋 메시지가 비어 있습니다.",
                 action="변경 내용을 설명하는 메시지를 입력해 주세요.",
+            )
+
+        # 충돌이 남은 인덱스로는 트리를 만들 수 없다. 막지 않으면 libgit2
+        # 원문("cannot create a tree from a not fully merged index")이 조치
+        # 한 줄 없이 그대로 나간다 — 충돌을 해결하고 커밋하라고 안내해 놓고,
+        # 그 안내를 따르다 스테이징을 빠뜨린 첫 실수에서 길을 잃게 된다.
+        unresolved = self.merge_conflicts()
+        if unresolved:
+            paths = ", ".join(c.path for c in unresolved[:3])
+            if len(unresolved) > 3:
+                paths += f" 외 {len(unresolved) - 3}개"
+            raise EngineError(
+                f"해결되지 않은 충돌 {len(unresolved)}개가 남아 커밋할 수 없습니다.",
+                detail=f"충돌한 파일: {paths}",
+                action="충돌한 파일을 정리한 뒤 스테이징하면 커밋할 수 "
+                "있습니다. 되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
             )
 
         try:
@@ -973,6 +1023,250 @@ class LocalGitEngine:
         if analysis & flags.FASTFORWARD:
             return MergePreview(MergeKind.FAST_FORWARD, str(target))
         return MergePreview(MergeKind.MERGE_REQUIRED, str(target))
+
+    def merge(self, source_ref: str, expected_branch: str | None = None) -> MergeOutcome:
+        """`source_ref`를 현재 브랜치에 합친다.
+
+        빨리 감을 수 있으면 빨리 감고, 아니면 병합을 시작한다.
+        **충돌은 예외가 아니라 결과다** — git이 할 수 있는 만큼 합쳐두고
+        나머지를 사람에게 넘긴 상태이므로, 호출자가 분기할 수 있게 값으로
+        돌려준다.
+
+        `expected_branch`는 `fast_forward`와 같은 이유로 받는다: 이 작업이
+        큐에서 실행될 때 사용자가 브랜치를 바꿨을 수 있다.
+        """
+        self._require_quiet_repository()
+        head_branch = self._head_branch()
+        self._require_expected_branch(head_branch, expected_branch)
+
+        preview = self.merge_preview(source_ref)
+        if preview.kind is MergeKind.UP_TO_DATE:
+            return MergeOutcome(MergeKind.UP_TO_DATE)
+        if preview.kind is MergeKind.FAST_FORWARD:
+            sha = self.fast_forward(source_ref, expected_branch)
+            return MergeOutcome(MergeKind.FAST_FORWARD, merged_sha=sha)
+
+        target = pygit2.Oid(hex=preview.target_sha)
+        with _translate("병합"):
+            # 커밋하지 않은 **추적 중인** 변경만 막는다. 병합이 반쯤 진행된
+            # 뒤에 막히면 사용자가 손으로 풀어야 하므로 우리가 먼저 본다.
+            #
+            # 추적되지 않은 파일은 세지 않는다 — git도 막지 않고, 막으면 메모
+            # 파일 하나 때문에 pull의 병합 갈래가 통째로 멈춘다. 게다가
+            # 우리가 안내하는 stash는 기본값에서 추적되지 않은 파일을 담지
+            # 않아, 사용자가 그대로 따라도 상태가 바뀌지 않는다. 병합이 실제로
+            # 덮어쓸 파일이 있으면 libgit2가 원자적으로 거부한다.
+            status = self.working_tree_status()
+            blocking = (
+                *status.staged,
+                *(c for c in status.unstaged if c.status is not WorkAreaStatus.NEW),
+            )
+            if blocking:
+                raise EngineError(
+                    "커밋하지 않은 변경이 있어 병합을 시작할 수 없습니다.",
+                    detail=", ".join(c.path for c in blocking[:5]),
+                    action="변경 사항을 커밋하거나 stash에 보관한 뒤 "
+                    "다시 시도해 주세요.",
+                )
+            self._repo.merge(target)
+
+        conflicts = self.merge_conflicts()
+        if conflicts:
+            # 저장소는 병합 진행 중으로 남는다. 워킹 트리에는 충돌 마커가
+            # 들어 있고, 충돌하지 않은 변경은 이미 반영돼 있다.
+            return MergeOutcome(MergeKind.MERGE_REQUIRED, conflicts=conflicts)
+
+        # 충돌이 없으면 바로 머지 커밋을 만든다. 여기서 멈추면 사용자가
+        # "병합했는데 커밋이 없는" 상태를 이해해야 하고, 그건 우리가 떠넘긴
+        # 복잡도다.
+        message = self._merge_message(source_ref)
+        try:
+            sha = self.create_commit(message)
+        except GitClientError as exc:
+            # 여기서 그냥 던지면 저장소는 병합 중인데 충돌은 0개로 남는다 —
+            # 사용자에게는 원인 모를 오류만 뜨고, 중단 메뉴를 켤 근거도 없다.
+            # 시작 전에 추적 중인 변경이 없음을 확인했으므로 되돌려도 잃을
+            # 사용자 작업이 없다.
+            self.abort_merge()
+            raise EngineError(
+                "병합을 시작했지만 머지 커밋을 만들지 못해 되돌렸습니다.",
+                detail=str(exc),
+                action=getattr(exc, "action", None)
+                or "원인을 해결한 뒤 다시 시도해 주세요.",
+            ) from exc
+        return MergeOutcome(MergeKind.MERGE_REQUIRED, merged_sha=sha)
+
+    def _fresh_index(self) -> pygit2.Index:
+        """디스크에서 다시 읽은 인덱스.
+
+        pygit2는 인덱스를 메모리에 캐시한다. 그런데 화면을 그리는 엔진과
+        쓰기를 수행하는 엔진은 **서로 다른 인스턴스다**(쓰기는 WriteQueue의
+        워커 스레드에서 돈다). 캐시를 그대로 믿으면 사용자가 충돌을 해결해
+        스테이징해도 UI는 영원히 "충돌 남음"으로 보고, 중단 메뉴가 꺼지지
+        않으며 원격 액션도 잠긴 채로 갇힌다.
+        """
+        index = self._repo.index
+        index.read(False)  # 디스크가 바뀌었을 때만 다시 읽는다
+        return index
+
+    def is_merging(self) -> bool:
+        """저장소가 병합 진행 중인가. **충돌 유무와 무관하다.**
+
+        충돌을 전부 해결해 스테이징하면 `index.conflicts`는 비지만, 커밋하기
+        전까지 MERGE_HEAD는 그대로 남아 병합은 계속 진행 중이다. 충돌 개수로
+        판단하면 마지막 파일을 스테이징하는 순간 중단 메뉴가 꺼져 사용자가
+        빠져나갈 길 없는 화면에 갇힌다.
+        """
+        with _translate("병합 상태 조회"):
+            return self._repo.state() == pygit2.enums.RepositoryState.MERGE
+
+    def merge_conflicts(self) -> tuple[ConflictedFile, ...]:
+        """지금 병합 중이라면 해결되지 않은 파일들.
+
+        인덱스의 충돌은 rebase·cherry-pick 중에도 생긴다. 상태를 함께
+        확인하지 않으면 남의 작업 중 충돌을 "병합 중"으로 오인하고,
+        그 오인이 `abort_merge`까지 이어지면 rebase가 파괴된다.
+        """
+        with _translate("충돌 목록 조회"):
+            if self._repo.state() != pygit2.enums.RepositoryState.MERGE:
+                return ()
+            conflicts = self._fresh_index().conflicts
+            if conflicts is None:
+                return ()
+            found: list[ConflictedFile] = []
+            for ancestor, ours, theirs in conflicts:
+                entry = ours or theirs or ancestor
+                if entry is None:  # pragma: no cover - 방어적
+                    continue
+                side = _conflict_side(ancestor, ours, theirs)
+                found.append(
+                    ConflictedFile(
+                        path=entry.path,
+                        side=side,
+                        has_markers=self._has_conflict_markers(side, ours, theirs),
+                    )
+                )
+            return tuple(sorted(found, key=lambda c: c.path))
+
+    def _has_conflict_markers(self, side: ConflictSide, ours, theirs) -> bool:  # noqa: ANN001
+        """워킹 트리 파일에 충돌 마커가 들어가는가.
+
+        **blob에게 묻는다 — 워킹 트리 파일을 읽지 않는다.** 마커가 없는 경우는
+        정확히 "libgit2가 3-way 텍스트 병합을 포기했을 때"이고, 그 판단 기준이
+        곧 blob의 바이너리 여부다. 파일 내용을 훑어 `<<<<<<<`를 찾는 방법도
+        되지만, 이 함수는 저장소를 열 때마다 UI 스레드에서 도는 경로에 있다
+        (§3.3 G4: 단일 블로킹 구간 50ms). 충돌 파일이 수백 개인 대형 병합에서
+        파일마다 수십~수백 KB를 읽으면 그 예산을 통째로 넘긴다.
+        """
+        if side is not ConflictSide.BOTH_MODIFIED and side is not ConflictSide.BOTH_ADDED:
+            return False  # 삭제 계열은 합칠 상대가 없어 마커도 없다
+        for entry in (ours, theirs):
+            if entry is None:
+                return False
+            blob = self._repo.get(entry.id)
+            if blob is None or getattr(blob, "is_binary", False):
+                return False
+        return True
+
+    def abort_merge(self) -> None:
+        """진행 중인 병합을 되돌린다.
+
+        **병합이 건드린 경로만** 병합 이전으로 복구한다. 충돌 마커가 든
+        파일도, 충돌 없이 이미 반영된 변경도 사라진다 — 그것이 "중단"의
+        뜻이다. 하지만 병합과 무관한 파일의 커밋 안 된 작업은 **건드리지
+        않는다**: git은 그런 변경을 둔 채로 병합을 시작하도록 허용하고
+        `git merge --abort`도 그것을 보존한다(`reset --merge` 의미론).
+        전면 `reset --hard`는 중단이 약속한 범위를 넘어 사용자 작업을
+        파괴한다 — 리뷰에서 확정된 결함이다.
+
+        **병합일 때만 되돌린다.** rebase·cherry-pick도 충돌로 멈추고
+        인덱스에 충돌을 남기지만 그것은 우리가 시작한 병합이 아니다.
+        `state_cleanup`으로 `.git/rebase-merge`를 지우면 `git rebase --abort`도
+        `--continue`도 불가능해지고 HEAD는 브랜치 밖에 남는다.
+        """
+        with _translate("병합 중단"):
+            state = self._repo.state()
+            if state == pygit2.enums.RepositoryState.NONE:
+                return  # 진행 중인 병합이 없다
+            if state != pygit2.enums.RepositoryState.MERGE:
+                # 조용히 넘어가지 않는다 — 파괴적 확인을 받은 직후의 무음
+                # no-op은 그 자체로 또 다른 실패다.
+                raise EngineError(
+                    "진행 중인 작업이 병합이 아니어서 중단할 수 없습니다.",
+                    detail=f"저장소 상태: {state!r}",
+                    action="rebase나 cherry-pick은 git CLI에서 "
+                    "`git rebase --abort` 등으로 정리해 주세요.",
+                )
+            head = self._repo.head.target
+            commit = self._repo[head].peel(pygit2.Commit)
+            paths = self._merge_touched_paths(commit)
+            if paths:
+                # 빈 pathspec을 넘기면 libgit2가 "전부"로 해석해 워킹 트리
+                # 전체를 덮어쓴다 — 고치려던 그 파괴가 그대로 돌아온다.
+                self._repo.checkout_tree(
+                    commit,
+                    paths=paths,
+                    strategy=pygit2.enums.CheckoutStrategy.FORCE,
+                )
+            self._repo.state_cleanup()
+            self._repo.reset(head, pygit2.enums.ResetMode.MIXED)
+
+    def _merge_touched_paths(self, head_commit: pygit2.Commit) -> list[str]:
+        """병합이 손댄 경로 = 충돌한 경로 + 인덱스가 HEAD와 달라진 경로.
+
+        git은 인덱스가 HEAD와 다르면 병합을 시작하지 않는다. 따라서 인덱스의
+        모든 편차는 병합이 만든 것이고, 이 목록 밖은 전부 사용자 것이다.
+        """
+        paths: set[str] = set()
+        index = self._fresh_index()
+        conflicts = index.conflicts
+        if conflicts is not None:
+            for ancestor, ours, theirs in conflicts:
+                entry = ours or theirs or ancestor
+                if entry is not None:
+                    paths.add(entry.path)
+        for patch in head_commit.tree.diff_to_index(index):
+            paths.add(patch.delta.new_file.path)
+            paths.add(patch.delta.old_file.path)
+        return sorted(paths)
+
+    def _merge_message(self, source_ref: str) -> str:
+        """git이 쓰는 것과 같은 형태의 머지 커밋 메시지."""
+        name = source_ref
+        for prefix in ("refs/remotes/", "refs/heads/"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        head = self._head_branch()
+        into = f" into {head}" if head and head != "main" else ""
+        return f"Merge {name}{into}"
+
+    def _head_branch(self) -> str | None:
+        """현재 브랜치 이름. 분리된 HEAD면 None."""
+        if self._repo.head_is_unborn or self._repo.head_is_detached:
+            return None
+        return self._repo.head.shorthand
+
+    def _require_quiet_repository(self) -> None:
+        """다른 작업이 진행 중이면 시작하지 않는다."""
+        state = self._repo.state()
+        if state != pygit2.enums.RepositoryState.NONE:
+            raise EngineError(
+                "이미 진행 중인 작업이 있습니다.",
+                detail=f"저장소 상태: {state!r}",
+                action="진행 중인 병합이나 rebase를 마무리하거나 취소한 뒤 "
+                "다시 시도해 주세요.",
+            )
+
+    def _require_expected_branch(
+        self, head_branch: str | None, expected: str | None
+    ) -> None:
+        if expected is not None and head_branch != expected:
+            raise EngineError(
+                f"'{expected}'에 합치려 했지만 현재 브랜치가 바뀌었습니다.",
+                detail=f"현재 브랜치: {head_branch}",
+                action="브랜치를 확인한 뒤 다시 시도해 주세요.",
+            )
 
     def fast_forward(self, upstream_ref: str, expected_branch: str | None = None) -> str:
         """현재 브랜치를 upstream으로 빨리 감는다. 새 커밋을 만들지 않는다.

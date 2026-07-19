@@ -333,24 +333,33 @@ class TestPullUI:
         assert window.reported_errors == []
         assert "이미 최신" in window._transfer_label.text()
 
-    def test_diverged_pull_keeps_the_fetched_objects_and_explains(
+    def test_diverged_pull_merges_instead_of_giving_up(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
     ) -> None:
-        """병합이 필요하면 시작하지 않는다 — 앱 안에서 끝낼 수 없기 때문이다.
+        """갈라진 pull은 이제 **앱 안에서 합친다** (Phase 4, ADR-24 해제).
 
-        다만 받아온 것은 버리지 않는다. 트래픽을 이미 썼으므로 다시 받게
-        만들면 안 된다.
+        Phase 3까지는 "git CLI로 해결하라"며 멈췄다. 그것이 이 앱의 가장 큰
+        기능 공백이었다 — 협업의 가장 흔한 지점에서 사용자를 밖으로 내보냈다.
+
+        받아온 것을 버리지 않는다는 성질은 그대로다.
         """
         remote.diverge()
         before_local = remote.work_head()
 
         window._on_pull()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
-        qtbot.waitUntil(lambda: bool(window.reported_errors), timeout=TIMEOUT)
+        qtbot.waitUntil(
+            lambda: window._write_queue is not None
+            and not window._write_queue.is_busy,
+            timeout=TIMEOUT,
+        )
 
-        error = window.reported_errors[-1]
-        assert error.action is not None
-        assert remote.work_head() == before_local, "합치지 않았는데 HEAD가 움직였다"
+        # 충돌 없는 갈라짐이므로 머지 커밋이 생겨야 한다
+        assert remote.work_head() != before_local, "합치지 않았다"
+        parents = git(
+            "rev-list", "--parents", "-n", "1", "HEAD", cwd=remote.work
+        ).stdout.split()
+        assert len(parents) == 3, "머지 커밋의 부모가 둘이어야 한다"
         # 받아온 커밋은 원격 추적 참조에 남아 있어야 한다
         tracked = git(
             "rev-parse", "refs/remotes/origin/main", cwd=remote.work
@@ -403,12 +412,17 @@ class TestPullRefreshesTheView:
     def test_diverged_pull_still_shows_new_remote_branches(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
     ) -> None:
-        """병합이 필요해 멈추더라도 받아온 것은 보여줘야 한다."""
+        """병합까지 이어지더라도 받아온 참조는 화면에 나타나야 한다."""
         remote.diverge()
         remote.create_remote_branch("newcomer")
 
         window._on_pull()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
+        qtbot.waitUntil(
+            lambda: window._write_queue is not None
+            and not window._write_queue.is_busy,
+            timeout=TIMEOUT,
+        )
         qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
         labels = [
