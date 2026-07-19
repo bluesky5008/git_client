@@ -222,10 +222,13 @@ class TestNoDeadEnds:
         assert window._merge_conflicts == (), "전제가 깨졌다"
         assert window._abort_merge_action.isEnabled(), "빠져나갈 길이 사라졌다"
 
-    def test_remote_actions_are_locked_during_a_merge(
+    def test_pull_and_push_are_locked_during_a_merge(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
     ) -> None:
-        """합칠 수 없는데 fetch를 열어두면 바이트만 쓴다 — 목적 함수 위반."""
+        """병합 중에는 저장소 상태가 pull·push를 거부한다.
+
+        켜 두면 눌러도 실패하는 버튼이 된다.
+        """
         assert window._pull_action.isEnabled()
         make_conflicting_divergence(remote)
 
@@ -234,8 +237,27 @@ class TestNoDeadEnds:
         qtbot.waitUntil(lambda: window._merging, timeout=TIMEOUT)
 
         assert not window._pull_action.isEnabled()
-        assert not window._fetch_action.isEnabled()
         assert not window._push_action.isEnabled()
+
+    def test_fetch_stays_open_during_a_merge(
+        self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
+    ) -> None:
+        """**fetch는 병합 중에도 열어둔다** (v1.6 정정, ADR-43).
+
+        초안은 "합칠 수 없는데 바이트만 쓴다"를 근거로 함께 잠갔다. 요금이
+        없으므로(ADR-56) 그건 비용이 아니고, 오히려 사용자가 충돌을 푸는
+        그 시간에 받아두면 나중 대기가 줄어든다 — 임계 경로 밖 전송은
+        이득이라는 원칙과 같은 논리다.
+        """
+        make_conflicting_divergence(remote)
+
+        window._on_pull()
+        settle(window, qtbot)
+        qtbot.waitUntil(lambda: window._merging, timeout=TIMEOUT)
+
+        assert window._fetch_action.isEnabled(), (
+            "병합 중 fetch를 막으면 나중에 받을 것을 지금 받을 기회를 버린다"
+        )
 
     def test_remote_actions_return_after_abort(
         self, window, qtbot, remote: RemoteFixture, monkeypatch  # noqa: ANN001
