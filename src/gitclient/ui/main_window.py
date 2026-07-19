@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QProgressBar,
     QLabel,
     QListView,
     QListWidget,
@@ -62,7 +63,7 @@ from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
-from gitclient.domain.instrumentation import OperationKind
+from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
     ConflictSide,
     MergeKind,
@@ -101,6 +102,23 @@ def _format_bytes(count: int) -> str:
 # 워커는 시그널이 끊겨 있어 이 위젯을 건드릴 수 없으므로 길게 잡을 이유가
 # 없다. G4(50ms) 안에 들어가도록 짧게 둔다.
 _CLOSE_DRAIN_MS = 20
+
+# 단계 이름은 사용자의 말로 옮긴다. "Resolving deltas"를 그대로 두면
+# 무엇을 기다리는지 알 수 없고, 회선 탓인지 아닌지도 구분되지 않는다.
+# **누가 일하고 있는지까지 말해야 한다.** 같은 단계라도 fetch와 push에서
+# 주체가 반대다 — push의 Counting은 우리 CPU이고, `remote: Resolving deltas`는
+# 서버다. 주체를 틀리면 "왜 느린가"에 대한 답이 정반대가 된다.
+_PHASE_LABELS = {
+    (TransferPhase.PREPARING, True): "원격이 준비하는 중",
+    (TransferPhase.PREPARING, False): "보낼 것을 준비하는 중",
+    (TransferPhase.RECEIVING, False): "받는 중",
+    (TransferPhase.RECEIVING, True): "받는 중",
+    (TransferPhase.SENDING, False): "보내는 중",
+    (TransferPhase.SENDING, True): "보내는 중",
+    (TransferPhase.APPLYING, True): "원격이 반영하는 중",
+    (TransferPhase.APPLYING, False): "적용하는 중",
+}
+
 
 
 class MainWindow(QMainWindow):
@@ -207,10 +225,19 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_splitter)
 
-        # 전송량은 임시 메시지로 띄우면 곧바로 다른 메시지에 덮인다 — 특히
-        # fetch 직후의 그래프 재로딩에. 목적함수가 누적 전송 바이트인 만큼
-        # 사용자가 비용을 계속 볼 수 있어야 하므로 고정 위젯에 둔다.
+        # 진행 표시. **느린 회선에서 이게 없으면 앱이 멎은 것처럼 보인다** —
+        # 목적 함수가 "사용자가 기다리는 시간"이므로 얼마나 더 기다려야
+        # 하는지를 보여주는 것이 곧 그 함수를 직접 겨냥한 기능이다.
         # (performance.md §8.4)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setMaximumWidth(160)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.hide()
+        self.statusBar().addPermanentWidget(self._progress_bar)
+
+        # 전송량은 임시 메시지로 띄우면 곧바로 다른 메시지에 덮인다 — 특히
+        # fetch 직후의 그래프 재로딩에. 사용자가 방금 치른 대기의 규모를
+        # 계속 볼 수 있어야 하므로 고정 위젯에 둔다. (performance.md §8.4)
         self._transfer_label = QLabel("")
         self._transfer_label.setToolTip("마지막 원격 작업의 전송량")
         self.statusBar().addPermanentWidget(self._transfer_label)
@@ -424,6 +451,10 @@ class MainWindow(QMainWindow):
         if self._fetch_worker is not None and str(path) != self._repo_path:
             self._fetch_worker.cancel()
             self._fetch_worker = None
+            # 워커를 놓아주면 정체 가드가 이후의 늦은 신호를 전부 걸러낸다 —
+            # 막대를 치울 주체가 사라지므로 여기서 직접 치운다. 그러지 않으면
+            # 이전 저장소의 진행 막대가 다음 원격 작업 때까지 남는다.
+            self._reset_progress()
 
         self._engine = engine
         self._info = info
@@ -640,12 +671,20 @@ class MainWindow(QMainWindow):
             # (§4.6.4) 워커가 곧바로 끝나지 않는다. 시그널이 붙어 있으면
             # 파괴 중인 위젯으로 늦은 결과가 날아오므로, 기다리는 대신
             # 연결을 끊어 그 위험 자체를 없앤다.
-            for signal in (worker.signals.finished, worker.signals.failed):
-                try:
-                    signal.disconnect()
-                except (RuntimeError, TypeError):
-                    pass  # 이미 끊겼거나 연결이 없었다
-            worker.cancel()
+            # closeEvent는 **어떤 경우에도 예외를 내면 안 된다** — 여기서
+            # 던지면 창이 닫히지 않고 사용자가 앱을 종료할 수 없다.
+            try:
+                signals = worker.signals
+                for signal in (
+                    signals.finished, signals.failed, signals.progressed
+                ):
+                    try:
+                        signal.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass  # 이미 끊겼거나 연결이 없었다
+                worker.cancel()
+            except Exception:  # noqa: BLE001
+                logger.debug("원격 워커 정리 실패", exc_info=True)
 
         # 쓰기는 취소하지 않는다 (§3.3 규칙 5). 하지만 창이 먼저 사라지면
         # 그 작업의 성패를 보고할 곳도 없어진다 — 병합 중단이 실패해도
@@ -1294,10 +1333,69 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(
             lambda error, w=worker: self._on_remote_failed(w, error)
         )
+        worker.signals.progressed.connect(
+            lambda snapshot, w=worker: self._on_remote_progress(w, snapshot)
+        )
         self._fetch_worker = worker
+        self._reset_progress()
         self._update_remote_actions()
         self.statusBar().showMessage(message)
         self._pool.start(worker)
+
+    def _on_remote_progress(self, worker, snapshot) -> None:  # noqa: ANN001
+        """진행 상황을 상태바에 그린다.
+
+        **정체 가드가 필수다.** 진행률은 작업당 여러 번 오므로, 이전 작업의
+        늦은 신호가 새 작업이 시작된 화면에 끼어들 수 있다 — finished와 달리
+        한 번 걸러내는 것으로 끝나지 않는다.
+        """
+        if worker is not self._fetch_worker:
+            return
+        self._progress_bar.setVisible(True)
+        if snapshot.percent is None or self._waiting_on_server(snapshot):
+            # 총계를 모르거나(Enumerating) 서버 응답을 기다리는 구간 —
+            # 확정 막대를 세워두면 멈춘 것처럼 보이므로 불확정으로 둔다.
+            self._progress_bar.setRange(0, 0)
+        else:
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(snapshot.percent)
+        self.statusBar().showMessage(self._describe_progress(snapshot))
+
+    @staticmethod
+    def _waiting_on_server(snapshot) -> bool:  # noqa: ANN001
+        """팩을 다 올리고 서버 응답을 기다리는 중인가.
+
+        push의 가장 긴 대기가 여기다 — 마지막 바이트를 보낸 뒤 서버가
+        연결성 검사와 훅을 도는 동안 git은 아무것도 내보내지 않는다(§4.6.3).
+        그동안 "보내는 중 100%"를 세워두면 다 됐는데 멈춘 것처럼 보인다.
+        """
+        return (
+            snapshot.phase is TransferPhase.SENDING and snapshot.percent == 100
+        )
+
+    def _describe_progress(self, snapshot) -> str:  # noqa: ANN001
+        """진행 상태를 한 줄로. 아는 것만 말하고 모르는 것은 지어내지 않는다."""
+        if self._waiting_on_server(snapshot):
+            return "원격이 처리하는 중  (다 보냈습니다)"
+        label = _PHASE_LABELS.get(
+            (snapshot.phase, snapshot.remote_side), "진행 중"
+        )
+        parts = [label]
+        if snapshot.percent is not None:
+            parts.append(f"{snapshot.percent}%")
+        elif snapshot.current is not None:
+            parts.append(f"{snapshot.current}개")
+        if snapshot.bytes_so_far:
+            parts.append(_format_bytes(snapshot.bytes_so_far))
+        if snapshot.bytes_per_s:
+            parts.append(f"{_format_bytes(snapshot.bytes_per_s)}/s")
+        return "  ".join(parts)
+
+    def _reset_progress(self) -> None:
+        """진행 표시를 치운다. 새 작업 시작과 작업 종료 양쪽에서 부른다."""
+        self._progress_bar.hide()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
 
     def _update_remote_actions(self) -> None:
         """원격 액션의 활성 상태를 한 곳에서 정한다.
@@ -1323,6 +1421,7 @@ class MainWindow(QMainWindow):
         if worker is not self._fetch_worker:
             return  # 이전 저장소의 늦은 결과
         self._fetch_worker = None
+        self._reset_progress()
         self._update_remote_actions()
         self._transfer_label.setText(self._describe_transfer(stats))
 
@@ -1353,6 +1452,7 @@ class MainWindow(QMainWindow):
         if worker is not self._fetch_worker:
             return
         self._fetch_worker = None
+        self._reset_progress()
         self._update_remote_actions()
         self._update_status(self._info)
 

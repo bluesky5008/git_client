@@ -39,6 +39,14 @@ class RemoteSignals(QObject):
     failed = Signal(object)
     """GitClientError."""
 
+    progressed = Signal(object)
+    """ProgressSnapshot — 진행 중 여러 번 방출된다.
+
+    작업당 한 번인 finished/failed와 달리 반복 방출이므로, 받는 쪽은
+    **정체 가드**로 이전 작업의 늦은 진행률을 걸러야 한다. 그러지 않으면
+    새 작업이 시작된 화면에 옛 작업의 퍼센트가 끼어든다.
+    """
+
 
 def _repo_key(repo_path: str) -> str | None:
     """계측 집계 키 — 정규화된 git 디렉터리. 저장소가 아니면 None.
@@ -128,12 +136,26 @@ class RemoteWorker(QRunnable):
     def _operate(self, engine: RemoteEngine) -> TransferStats:
         raise NotImplementedError
 
+    def _emit_progress(self, snapshot) -> None:  # noqa: ANN001 - ProgressSnapshot
+        """엔진의 진행 보고를 Qt 신호로 옮긴다.
+
+        **취소된 뒤에는 내보내지 않는다.** 취소한 사용자에게 진행률이 계속
+        올라가는 화면을 보여줄 이유가 없고, 그 사이 다른 작업이 시작됐다면
+        남의 화면을 덮어쓴다.
+        """
+        with self._lock:
+            if self._cancelled:
+                return
+        self.signals.progressed.emit(snapshot)
+
     def run(self) -> None:
         try:
             from gitclient.infrastructure.remote_engine import RemoteEngine
 
             engine = RemoteEngine(
-                self._repo_path, credentials=self._credentials
+                self._repo_path,
+                credentials=self._credentials,
+                on_progress=self._emit_progress,
             )
             with self._lock:
                 cancelled = self._cancelled
@@ -322,8 +344,13 @@ class CloneWorker(RemoteWorker):
     def _operate(self, engine: RemoteEngine) -> TransferStats:
         from gitclient.infrastructure.remote_engine import RemoteEngine as Engine
 
+        # 복제는 대상의 **상위** 디렉터리에서 실행해야 해서 엔진을 새로
+        # 만든다. 그때 진행 콜백을 빠뜨리면 clone만 진행 표시가 통째로
+        # 사라진다 — **이 앱에서 대기가 가장 긴 작업**인데도 그렇다.
         clone_engine = Engine(
-            self._destination.parent, credentials=self._credentials
+            self._destination.parent,
+            credentials=self._credentials,
+            on_progress=self._emit_progress,
         )
         with self._lock:
             cancelled = self._cancelled
