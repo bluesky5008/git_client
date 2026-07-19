@@ -285,6 +285,59 @@ class ConflictedFile:
         )
 
 
+class ConflictChoice(Enum):
+    """충돌을 해결할 때 어느 쪽을 남길 것인가."""
+
+    OURS = "ours"
+    """현재 브랜치의 것."""
+
+    THEIRS = "theirs"
+    """합치려는 쪽의 것."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictSideContent:
+    """충돌한 파일의 한쪽 내용.
+
+    **없을 수도 있다.** 한쪽이 지운 충돌에서는 그쪽 내용이 존재하지 않는다 —
+    빈 파일과 다르다. `exists`가 그 구분이다.
+    """
+
+    exists: bool
+    data: bytes = b""
+    is_binary: bool = False
+
+    @property
+    def text(self) -> str:
+        """화면에 그릴 문자열. 바이너리면 빈 문자열."""
+        if not self.exists or self.is_binary:
+            return ""
+        return self.data.decode("utf-8", "replace")
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictDetail:
+    """충돌한 파일 하나의 양쪽 내용. 3-way 화면이 그릴 재료다."""
+
+    path: str
+    side: ConflictSide
+    ours: ConflictSideContent
+    theirs: ConflictSideContent
+
+    @property
+    def is_binary(self) -> bool:
+        return self.ours.is_binary or self.theirs.is_binary
+
+    @property
+    def can_show_text(self) -> bool:
+        """내용을 나란히 보여줄 수 있는가.
+
+        바이너리는 줄 개념이 없어 비교할 수 없다. 그때도 **한쪽 선택은
+        가능해야 한다** — 그것이 이 화면이 없으면 해결할 수 없던 경우다.
+        """
+        return not self.is_binary
+
+
 @dataclass(frozen=True, slots=True)
 class MergeOutcome:
     """병합 시도의 결과.
