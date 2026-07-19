@@ -34,8 +34,14 @@ BASE_CONFIG: tuple[str, ...] = (
     # ref 광고량을 줄인다. git 2.26+ 의 기본값이지만 사용자 설정이 덮을 수
     # 있으므로 명령 단위로 강제한다. (performance.md §2.1)
     "protocol.version=2",
-    # 압축은 회선 속도와 무관하게 최대로 — CPU가 남고 바이트가 비싼 환경이다.
-    # (ADR-8) push의 팩 생성에 적용된다.
+    # 압축 **하한선**이다. 최대로 올려서 이득을 보는 게 아니라, 사용자 설정이
+    # 0으로 꺼두는 경우를 막는 것이 목적이다. (ADR-8 정정)
+    #
+    # 실측(파일 120개·커밋 40개 저장소의 push 전송 바이트):
+    #   0 → 142,223 / 1 → 67,000 / 6 → 66,591 / 9 → 66,591
+    # 0을 벗어나는 것이 2.1배 이득이고, 기본값(6) 위로는 **정확히 0.00%**다.
+    # 소요시간도 차이가 없었다. 즉 "CPU를 주고 바이트를 산다"는 거래는 기본값
+    # 위에서 성립하지 않는다 — 살 바이트가 없다.
     "core.compression=9",
     "pack.compression=9",
     # 받은 팩을 풀지 않고 보관한다. 두 가지 이득이 겹친다:
@@ -80,6 +86,17 @@ DEFAULT_TIMEOUT_S = 300
 # 프로세스 트리를 죽인 뒤 파이프가 닫히기를 기다리는 상한.
 # 이 상한이 있어야 timeout_s가 진짜 상한이 된다.
 DRAIN_TIMEOUT_S = 5
+
+
+def _with_stderr(error: GitClientError, stderr: str) -> GitClientError:
+    """실패한 명령의 **원문** stderr를 예외에 붙인다.
+
+    `detail`을 파싱하면 안 된다 — 사용자에게 보여주는 필드라 문구가 바뀔 수
+    있고, 일부 경로에서는 "(출력 없음)"으로 대체된다. 계측이 파싱할 원문은
+    따로 실어 보낸다.
+    """
+    error.git_stderr = stderr
+    return error
 
 
 def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -187,6 +204,51 @@ class RemoteEngine:
             args, kind=OperationKind.FETCH, remote=remote, timeout_s=timeout_s
         )
 
+    def push(
+        self,
+        remote: str = "origin",
+        refspecs: Sequence[str] = (),
+        *,
+        set_upstream: bool = False,
+        timeout_s: int = DEFAULT_TIMEOUT_S,
+    ) -> TransferStats:
+        """로컬 커밋을 원격에 올린다. 계측 결과를 반환한다.
+
+        `--force`는 제공하지 않는다. 강제 push는 남의 커밋을 지울 수 있어
+        확인 절차가 필요한데, 그 UX는 아직 없다. 없는 편이 낫다.
+        """
+        args = ["push", "--progress"]
+        if set_upstream:
+            args.append("--set-upstream")
+        args.append("--")
+        args.append(remote)
+        args.extend(refspecs)
+
+        return self._run_measured(
+            args, kind=OperationKind.PUSH, remote=remote, timeout_s=timeout_s
+        )
+
+    def ahead_behind(self, branch: str, upstream: str) -> tuple[int, int] | None:
+        """(앞선 커밋 수, 뒤처진 커밋 수). 비교할 수 없으면 None.
+
+        push/pull 버튼의 활성 여부와 안내 문구가 이 값에서 나온다.
+        네트워크를 타지 않는 로컬 질의라 계측 대상이 아니다.
+        """
+        try:
+            result = self._run(
+                ["rev-list", "--left-right", "--count", f"{branch}...{upstream}"],
+                measure=False,
+            )
+        except GitClientError:
+            return None  # upstream이 없거나 아직 fetch하지 않았다
+        parts = result.stdout.split()
+        if len(parts) != 2:
+            return None
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+
     # ------------------------------------------------------------------
     # 실행
     # ------------------------------------------------------------------
@@ -208,28 +270,81 @@ class RemoteEngine:
         ) as trace_dir:
             trace_path = Path(trace_dir) / "trace.json"
             started = time.perf_counter()
-            result = self._run(
-                args,
-                timeout_s=timeout_s,
-                extra_env={"GIT_TRACE2_EVENT": str(trace_path)},
-            )
-            duration_ms = int((time.perf_counter() - started) * 1000)
+            try:
+                result = self._run(
+                    args,
+                    timeout_s=timeout_s,
+                    extra_env={"GIT_TRACE2_EVENT": str(trace_path)},
+                )
+            except GitClientError as exc:
+                # **실패해도 바이트는 이미 회선에 실렸다.** push는 호출 단위가
+                # 아니라 ref 단위로 원자적이라, 여러 ref를 올리다 하나만
+                # 거부되면 나머지는 실제로 전송되고 원격에 반영된다(exit 1).
+                # 여기서 버리면 행 자체가 없어 "측정 실패"로도 잡히지 않는
+                # 완전 무기록이 되고, 누적 전송 바이트가 조용히 줄어든다.
+                exc.stats = self._build_stats(
+                    kind=kind,
+                    remote=remote,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    progress=parse_progress(getattr(exc, "git_stderr", "") or ""),
+                    trace=self._read_trace(trace_path),
+                    succeeded=False,
+                )
+                raise
 
+            duration_ms = int((time.perf_counter() - started) * 1000)
             progress = parse_progress(result.stderr)
             trace = self._read_trace(trace_path)
 
-        # 여기까지 왔으면 git은 성공했다 (_run이 0 아닌 종료를 예외로 올린다).
-        # 원격이 팩을 광고하지도(`remote: Total ...`) 보내지도(`Receiving
-        # objects`) 않았다면 받은 팩이 없다는 뜻이다 — **측정 실패가 아니라
-        # 실제 0바이트다.** 일상 사용에서 변경 없는 fetch가 대다수이므로 이
-        # 둘을 섞으면 measured_operations가 영영 낮게 나와 "측정 실패" 신호
-        # 자체가 상시 오탐이 된다. 반대로 팩이 광고됐는데 바이트가 없으면
-        # 그건 진짜 측정 실패이므로 None을 유지한다.
-        received_bytes = progress.received_bytes
-        received_objects = progress.received_objects
-        if received_bytes is None and progress.total_objects is None:
-            received_bytes = 0
-            received_objects = 0
+        return self._build_stats(
+            kind=kind,
+            remote=remote,
+            duration_ms=duration_ms,
+            progress=progress,
+            trace=trace,
+            succeeded=True,
+        )
+
+    def _build_stats(
+        self,
+        *,
+        kind: OperationKind,
+        remote: str,
+        duration_ms: int,
+        progress,  # noqa: ANN001 - ProgressReport
+        trace,  # noqa: ANN001 - TraceReport
+        succeeded: bool,
+    ) -> TransferStats:
+        """파싱 결과를 계측 모델로 옮긴다.
+
+        팩이 오가지 않았다면 그건 **측정 실패가 아니라 실제 0바이트다.**
+        일상 사용에서 변경 없는 작업이 대다수이므로 이 둘을 섞으면
+        measured_operations가 영영 낮게 나와 "측정 실패" 신호 자체가 상시
+        오탐이 된다. 반대로 팩이 광고됐는데(total_objects > 0) 바이트가
+        없으면 그건 진짜 측정 실패이므로 None을 유지한다.
+
+        판별자가 두 가지인 이유: fetch는 팩이 없으면 `Total` 줄 자체가
+        없고(None), push는 `Total 0 (delta 0)`을 내놓는다(0).
+
+        **0 채우기는 성공했을 때만 한다.** 실패 경로에서는 "팩이 필요 없었다"와
+        "팩을 보내기 전에 끊겼다"를 구분할 수 없으므로 None(측정 실패)이 맞다.
+        """
+        no_pack = progress.total_objects in (None, 0)
+
+        # 방향이 다른 두 작업을 한 모델에 담는다. 해당 없는 방향은 None으로
+        # 둔다 — 0으로 채우면 "측정된 0바이트"와 구분되지 않는다.
+        if kind is OperationKind.PUSH:
+            received_bytes = received_objects = None
+            sent_bytes = progress.sent_bytes
+            sent_objects = progress.sent_objects
+            if succeeded and sent_bytes is None and no_pack:
+                sent_bytes = sent_objects = 0
+        else:
+            sent_bytes = sent_objects = None
+            received_bytes = progress.received_bytes
+            received_objects = progress.received_objects
+            if succeeded and received_bytes is None and no_pack:
+                received_bytes = received_objects = 0
 
         return TransferStats(
             kind=kind,
@@ -237,6 +352,8 @@ class RemoteEngine:
             duration_ms=duration_ms,
             received_bytes=received_bytes,
             received_objects=received_objects,
+            sent_bytes=sent_bytes,
+            sent_objects=sent_objects,
             total_objects=progress.total_objects,
             reused_objects=progress.reused_objects,
             throughput_bytes_per_s=progress.throughput_bytes_per_s,
@@ -244,7 +361,7 @@ class RemoteEngine:
             protocol_version=trace.protocol_version,
             ref_updates=tuple(progress.ref_updates),
             regions=tuple(trace.regions),
-            succeeded=True,
+            succeeded=succeeded,
         )
 
     def _read_trace(self, trace_path: Path):  # noqa: ANN201
@@ -360,9 +477,11 @@ class RemoteEngine:
         if self._aborted:
             # 취소로 죽은 프로세스의 0 아닌 종료코드를 사용자 오류로 번역하지
             # 않는다 — 워커의 취소 가드가 이 예외를 삼킨다.
-            raise EngineError(
+            cancelled = EngineError(
                 "원격 작업이 취소되었습니다.", detail=(stderr or "").strip()
             )
+            cancelled.git_stderr = stderr or ""
+            raise cancelled
 
         result = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         if result.returncode != 0:
@@ -379,6 +498,11 @@ class RemoteEngine:
         """
         stderr = (result.stderr or "").strip()
         lowered = stderr.lower()
+        return _with_stderr(self._classify_failure(stderr, lowered, result), stderr)
+
+    def _classify_failure(
+        self, stderr: str, lowered: str, result: subprocess.CompletedProcess[str]
+    ) -> GitClientError:
 
         if "could not read from remote repository" in lowered or (
             "does not appear to be a git repository" in lowered
@@ -400,6 +524,27 @@ class RemoteEngine:
                 "원격에 해당 참조가 없습니다.",
                 detail=stderr,
                 action="브랜치 이름을 확인해 주세요.",
+            )
+        if "[rejected]" in lowered or "failed to push some refs" in lowered:
+            # push에서 가장 흔한 실패다. git의 기본 안내는 "git pull 하세요"인데
+            # 우리는 그 버튼을 갖고 있으므로 그쪽을 가리킨다.
+            if "fetch first" in lowered or "non-fast-forward" in lowered:
+                return EngineError(
+                    "원격에 내가 갖고 있지 않은 커밋이 있어 밀어내지 못했습니다.",
+                    detail=stderr,
+                    action="먼저 '가져와 합치기(Pull)'로 원격 변경을 합친 뒤 "
+                    "다시 시도해 주세요.",
+                )
+            return EngineError(
+                "원격이 push를 거부했습니다.",
+                detail=stderr,
+                action="원격 저장소의 보호 규칙이나 권한을 확인해 주세요.",
+            )
+        if "protected branch" in lowered or "pre-receive hook declined" in lowered:
+            return EngineError(
+                "원격 저장소가 이 브랜치로의 push를 막고 있습니다.",
+                detail=stderr,
+                action="브랜치 보호 규칙을 확인하거나 다른 브랜치로 올려 주세요.",
             )
 
         return EngineError(

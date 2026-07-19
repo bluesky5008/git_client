@@ -196,3 +196,24 @@ class RepositoryInfo:
         """제목 표시줄에 쓸 저장소 이름."""
         base = self.workdir or self.path
         return base.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+class MergeKind(Enum):
+    """upstream을 합칠 때 무엇이 필요한가."""
+
+    UP_TO_DATE = "up_to_date"
+    """이미 최신 — 할 일이 없다."""
+
+    FAST_FORWARD = "fast_forward"
+    """로컬에 고유 커밋이 없어 참조만 앞으로 옮기면 된다."""
+
+    MERGE_REQUIRED = "merge_required"
+    """양쪽에 서로 다른 커밋이 있어 병합 커밋이 필요하다."""
+
+
+@dataclass(frozen=True, slots=True)
+class MergePreview:
+    """합치기 전 분석 결과. 저장소를 바꾸지 않고 얻는다."""
+
+    kind: MergeKind
+    target_sha: str

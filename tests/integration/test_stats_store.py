@@ -143,3 +143,102 @@ class TestPersistence:
         store.record("repo-a", stats(succeeded=False, received_bytes=None))
         rows = store.recent("repo-a")
         assert rows[0]["succeeded"] == 0
+
+
+class TestSchemaMigration:
+    """v1 DB를 v2로 올린다.
+
+    이 경로는 **기존 사용자에게만** 실행된다. 새 파일로만 테스트하면 분기가
+    통째로 미검증인 채 남고, 깨져도 개발 중에는 드러나지 않는다 — 증분 1을
+    쓰던 사용자의 계측이 영구히 멈춘다.
+    """
+
+    V1_SCHEMA = """
+    CREATE TABLE schema_info (version INTEGER NOT NULL);
+    CREATE TABLE remote_stats (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at           TEXT    NOT NULL,
+        repo_key              TEXT    NOT NULL,
+        remote                TEXT    NOT NULL,
+        kind                  TEXT    NOT NULL,
+        succeeded             INTEGER NOT NULL,
+        duration_ms           INTEGER NOT NULL,
+        received_bytes        INTEGER,
+        received_objects      INTEGER,
+        total_objects         INTEGER,
+        negotiation_rounds    INTEGER,
+        protocol_version      INTEGER
+    );
+    """
+
+    def _make_v1(self, path: Path, *, rows: int = 3) -> None:
+        import sqlite3
+
+        with sqlite3.connect(path) as connection:
+            connection.executescript(self.V1_SCHEMA)
+            connection.execute("INSERT INTO schema_info (version) VALUES (1)")
+            for index in range(rows):
+                connection.execute(
+                    """
+                    INSERT INTO remote_stats (
+                        recorded_at, repo_key, remote, kind, succeeded,
+                        duration_ms, received_bytes, received_objects
+                    ) VALUES (?, 'repo-a', 'origin', 'fetch', 1, 100, ?, 2)
+                    """,
+                    (f"2026-07-1{index}T00:00:00+00:00", 100 * (index + 1)),
+                )
+            connection.commit()
+
+    def test_v1_database_is_upgraded(self, tmp_path: Path) -> None:
+        path = tmp_path / "v1.sqlite3"
+        self._make_v1(path)
+
+        store = StatsStore(path)
+
+        import sqlite3
+
+        with sqlite3.connect(path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(remote_stats)")
+            }
+            version = connection.execute(
+                "SELECT version FROM schema_info"
+            ).fetchone()[0]
+        assert "sent_bytes" in columns and "sent_objects" in columns
+        assert version == 2
+        assert store.summarize("repo-a").operations == 3
+
+    def test_existing_rows_keep_their_totals(self, tmp_path: Path) -> None:
+        """기존 fetch 행은 sent_* 가 NULL인 채로 맞다 — 합계가 변하면 안 된다."""
+        path = tmp_path / "v1.sqlite3"
+        self._make_v1(path)
+
+        summary = StatsStore(path).summarize("repo-a")
+
+        assert summary.total_bytes == 100 + 200 + 300
+        assert summary.measured_operations == 3
+        assert summary.fully_measured is True
+
+    def test_push_can_be_recorded_after_upgrade(self, tmp_path: Path) -> None:
+        path = tmp_path / "v1.sqlite3"
+        self._make_v1(path, rows=1)
+        store = StatsStore(path)
+
+        store.record(
+            "repo-a",
+            stats(kind=OperationKind.PUSH, received_bytes=None, sent_bytes=500),
+        )
+
+        summary = store.summarize("repo-a")
+        assert summary.total_bytes == 100 + 500
+        assert summary.measured_operations == 2, "push 행이 미측정으로 잡혔다"
+
+    def test_upgrade_is_idempotent(self, tmp_path: Path) -> None:
+        path = tmp_path / "v1.sqlite3"
+        self._make_v1(path)
+
+        StatsStore(path)
+        StatsStore(path)  # 두 번째 열기가 마이그레이션을 다시 태우면 안 된다
+
+        assert StatsStore(path).summarize("repo-a").operations == 3

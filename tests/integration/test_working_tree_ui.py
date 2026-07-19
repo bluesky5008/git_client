@@ -61,6 +61,21 @@ def wait_settled(window, qtbot) -> None:  # noqa: ANN001
     )
 
 
+def has_content(path: Path, expected: str) -> bool:
+    """파일 내용이 기대값인가. 읽을 수 없으면 '아직 아니다'로 본다.
+
+    `read_text`를 waitUntil 안에서 그대로 쓰면 안 된다. stash/checkout은
+    워커 스레드에서 파일을 지웠다 다시 쓰므로, 폴링이 그 찰나에 걸리면
+    FileNotFoundError가 waitUntil 밖으로 튀어나와 **대기가 아니라 실패**가
+    된다. 실제로 간헐 실패의 원인이었다 — 제품 결함이 아니라 이 술어의
+    결함이다.
+    """
+    try:
+        return path.read_text(encoding="utf-8") == expected
+    except OSError:
+        return False
+
+
 def unstaged_paths(window) -> list[str]:  # noqa: ANN001
     panel = window._work_panel
     return [
@@ -168,7 +183,7 @@ class TestDiscard:
         )
         window._on_discard_requested("a.txt")
         qtbot.waitUntil(
-            lambda: target.read_text(encoding="utf-8") == "one\n", timeout=TIMEOUT
+            lambda: has_content(target, "one\n"), timeout=TIMEOUT
         )
 
     def test_discard_cancelled_keeps_file(
@@ -210,13 +225,13 @@ class TestBranchAndStash:
 
         window._on_stash_save()
         qtbot.waitUntil(
-            lambda: target.read_text(encoding="utf-8") == "one\n", timeout=TIMEOUT
+            lambda: has_content(target, "one\n"), timeout=TIMEOUT
         )
         wait_settled(window, qtbot)
 
         window._on_stash_pop()
         qtbot.waitUntil(
-            lambda: target.read_text(encoding="utf-8") == "wip\n", timeout=TIMEOUT
+            lambda: has_content(target, "wip\n"), timeout=TIMEOUT
         )
         assert window.reported_errors == []
 

@@ -69,8 +69,8 @@ class TestParseProgress:
         report = parse_progress(self.RECEIVING)
         assert len(report.ref_updates) == 1
         update = report.ref_updates[0]
-        assert update.remote_ref == "main"
-        assert update.local_ref == "origin/main"
+        assert update.source == "main"
+        assert update.dest == "origin/main"
         assert update.old_sha == "5a3dcca"
         assert update.is_new is False
 
@@ -79,7 +79,7 @@ class TestParseProgress:
         report = parse_progress(text)
         assert len(report.ref_updates) == 1
         assert report.ref_updates[0].is_new is True
-        assert report.ref_updates[0].local_ref == "origin/feature/x"
+        assert report.ref_updates[0].dest == "origin/feature/x"
 
     def test_carriage_returns_are_line_boundaries(self) -> None:
         """진행률은 \\r로 덮어쓰여 온다 — 경계로 다루지 않으면 값을 놓친다."""
@@ -124,7 +124,7 @@ class TestRefUpdateForms:
         report = parse_progress(text)
         assert len(report.ref_updates) == 1
         update = report.ref_updates[0]
-        assert update.local_ref == "origin/main"
+        assert update.dest == "origin/main"
         assert update.old_sha == "f21f548"
         assert update.new_sha == "5751dba"
         assert update.is_new is False
@@ -139,7 +139,7 @@ class TestRefUpdateForms:
         report = parse_progress(text)
         assert len(report.ref_updates) == 1
         update = report.ref_updates[0]
-        assert update.local_ref == "origin/side"
+        assert update.dest == "origin/side"
         assert update.deleted is True
         assert update.is_new is False  # sha가 없다고 '신규'가 아니다
 

@@ -48,6 +48,8 @@ from gitclient.domain.models import (
     DiffLine,
     DiffLineKind,
     FileChange,
+    MergeKind,
+    MergePreview,
     Ref,
     RefKind,
     RepositoryInfo,
@@ -126,6 +128,16 @@ def _branch_oid(branch: pygit2.Branch) -> pygit2.Oid | None:
     if isinstance(target, pygit2.Oid):
         return target
     return None
+
+
+def _peel_to_commit_id(reference: pygit2.Reference) -> pygit2.Oid:
+    """참조가 최종적으로 가리키는 커밋 Oid.
+
+    심볼릭 참조(`origin/HEAD`)와 어노테이트 태그를 모두 벗겨낸다 —
+    `_branch_oid`가 막았던 것과 같은 함정이다.
+    """
+    resolved = reference.resolve()
+    return resolved.peel(pygit2.Commit).id
 
 
 class LocalGitEngine:
@@ -866,6 +878,144 @@ class LocalGitEngine:
                     action="다른 브랜치로 전환한 뒤 삭제해 주세요.",
                 )
             branch.delete()
+
+    # ------------------------------------------------------------------
+    # 병합 (Phase 3 — pull의 로컬 절반)
+    # ------------------------------------------------------------------
+
+    def upstream_of_head(self) -> tuple[str, str] | None:
+        """현재 브랜치가 따라가는 (원격 이름, 원격 추적 참조 전체 이름).
+
+        `branch.<name>.remote` / `branch.<name>.merge`를 그대로 읽는다 —
+        `<origin>/<브랜치명>` 규약으로 추측하면 안 된다. fork 워크플로처럼
+        origin이 아닌 원격을 따라가는 브랜치에서 **엉뚱한 ref를 합치고도
+        "이미 최신"이라 답하게 된다.**
+
+        분리된 HEAD와 unborn HEAD에서는 None이다. 특히 분리된 HEAD에서
+        pygit2는 `shorthand`로 짧은 sha가 아니라 문자열 `"HEAD"`를 주므로,
+        규약으로 조합하면 `refs/remotes/<remote>/HEAD`가 만들어진다 —
+        이 참조는 모든 clone에 존재하고 원격 기본 브랜치를 가리키므로,
+        bisect 중인 사용자의 HEAD가 조용히 원격 기본 브랜치로 끌려간다.
+        """
+        with _translate("upstream 조회"):
+            if self._repo.head_is_unborn or self._repo.head_is_detached:
+                return None
+            branch = self._repo.branches.local.get(self._repo.head.shorthand)
+            upstream = branch.upstream if branch is not None else None
+            if upstream is None:
+                return None
+            return upstream.remote_name, upstream.name
+
+    def merge_preview(self, upstream_ref: str) -> MergePreview:
+        """합치기 전에 무엇이 필요한지 본다. 저장소를 바꾸지 않는다.
+
+        pull은 네트워크(fetch)와 로컬 쓰기(병합)가 만나는 지점이다. 경계는
+        ADR-2 그대로 유지한다 — 전송은 git CLI가, 병합은 pygit2가 맡는다.
+        """
+        with _translate("병합 분석"):
+            reference = self._repo.references.get(upstream_ref)
+            if reference is None:
+                raise EngineError(
+                    f"원격 추적 참조를 찾을 수 없습니다: {upstream_ref}",
+                    action="먼저 가져오기(Fetch)를 실행해 주세요.",
+                )
+            target = _peel_to_commit_id(reference)
+            analysis, _preference = self._repo.merge_analysis(target)
+
+        flags = pygit2.enums.MergeAnalysis
+        if analysis & flags.UP_TO_DATE:
+            return MergePreview(MergeKind.UP_TO_DATE, str(target))
+        if analysis & flags.FASTFORWARD:
+            return MergePreview(MergeKind.FAST_FORWARD, str(target))
+        return MergePreview(MergeKind.MERGE_REQUIRED, str(target))
+
+    def fast_forward(self, upstream_ref: str, expected_branch: str | None = None) -> str:
+        """현재 브랜치를 upstream으로 빨리 감는다. 새 커밋을 만들지 않는다.
+
+        **순서가 중요하다.** 참조를 먼저 옮기고 checkout하면 libgit2가 이미
+        같아진 HEAD와 비교하게 되어 **워킹트리를 갱신하지 않는다.** 실측에서
+        수정이 반영되지 않고 삭제도 적용되지 않은 채 인덱스에 엉뚱한 변경이
+        스테이징된 상태가 남았다 — 오류 없이.
+
+        그래서 checkout이 먼저다. 이 순서는 커밋하지 않은 변경이 있을 때
+        libgit2가 checkout을 거부하므로 **실패해도 안전하다** — 참조가 아직
+        움직이지 않았고 사용자 작업도 그대로다. (reset --hard로 하면 조용히
+        덮어쓴다. 그래서 쓰지 않는다.)
+        """
+        # 진행 중인 병합·rebase 위로 빨리 감으면 MERGE_HEAD가 살아남아, 다음
+        # 커밋이 create_commit의 병합 부모 경로를 타고 **위조된 머지 커밋**이
+        # 된다. 사용자는 파일 하나짜리 커밋을 의도했는데 히스토리에는 브랜치
+        # 전체를 병합한 커밋이 박히고, state_cleanup이 MERGE_HEAD까지 지워
+        # 되돌릴 단서도 사라진다. 실제 git도 이 상태를 하드 거부한다
+        # ("You have not concluded your merge").
+        state = self._repo.state()
+        if state != pygit2.enums.RepositoryState.NONE:
+            raise EngineError(
+                "진행 중인 작업이 끝나지 않아 빨리 감을 수 없습니다.",
+                detail=f"저장소 상태: {state!r}",
+                action="병합이나 rebase를 마무리하거나 취소한 뒤 "
+                "다시 시도해 주세요.",
+            )
+
+        head = self._repo.references.get("HEAD")
+        head_branch = (
+            head.target
+            if head is not None
+            and head.type == pygit2.enums.ReferenceType.SYMBOLIC
+            else None
+        )
+
+        # 제출 시점의 브랜치를 고정한다. pull의 네트워크 절반이 도는 동안
+        # 사용자가 브랜치를 전환하면 이 작업은 **엉뚱한 브랜치를 원격 위치로
+        # 덮어쓴다** — 오류 없이, reflog로만 복구 가능하게. 두 WriteQueue 작업
+        # 사이의 경합이라 UI 쪽 가드로는 막을 수 없다.
+        if expected_branch is not None and head_branch != f"refs/heads/{expected_branch}":
+            raise EngineError(
+                f"'{expected_branch}'에 합치려 했지만 현재 브랜치가 바뀌었습니다.",
+                detail=f"HEAD={head_branch}",
+                action="브랜치를 확인한 뒤 다시 가져와 합치기를 실행해 주세요.",
+            )
+
+        preview = self.merge_preview(upstream_ref)
+        if preview.kind is MergeKind.UP_TO_DATE:
+            return preview.target_sha
+        if preview.kind is not MergeKind.FAST_FORWARD:
+            raise EngineError(
+                "빨리 감을 수 없는 상태입니다.",
+                action="양쪽에 서로 다른 커밋이 있어 병합이 필요합니다.",
+            )
+
+        target = pygit2.Oid(hex=preview.target_sha)
+        commit = self._repo.get(target)
+
+        try:
+            with _translate("빨리 감기"):
+                # 1) 워킹트리와 인덱스를 먼저 맞춘다 (HEAD는 아직 옛 위치)
+                self._repo.checkout_tree(commit)
+                # 2) 그 다음 참조를 옮긴다
+                if head_branch is not None:
+                    existing = self._repo.references.get(head_branch)
+                    if existing is None:
+                        # unborn HEAD — 브랜치 참조가 아직 없다. 여기서
+                        # KeyError가 나면 워킹트리는 이미 원격 내용으로
+                        # 덮여 있는데 HEAD는 unborn인 채로 남아, 그 상태에서
+                        # 커밋하면 원격과 영영 갈라지는 루트 커밋이 된다.
+                        self._repo.create_reference(head_branch, target)
+                    else:
+                        existing.set_target(target)
+                else:
+                    self._repo.set_head(target)  # 분리된 HEAD
+        except EngineError as exc:
+            if "conflict" in (exc.detail or "").lower():
+                raise EngineError(
+                    "커밋하지 않은 변경이 있어 합칠 수 없습니다.",
+                    detail=exc.detail,
+                    action="변경 사항을 커밋하거나 stash에 보관한 뒤 "
+                    "다시 시도해 주세요.",
+                ) from exc
+            raise
+
+        return preview.target_sha
 
     # ------------------------------------------------------------------
     # Stash (Phase 2)

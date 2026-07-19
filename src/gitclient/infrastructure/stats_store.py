@@ -25,7 +25,7 @@ from gitclient.domain.instrumentation import TransferStats
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS remote_stats (
 CREATE INDEX IF NOT EXISTS idx_remote_stats_repo_time
     ON remote_stats (repo_key, recorded_at);
 """
+
+# v1 → v2: push가 등장하면서 방향이 생겼다. 받은 바이트만으로는 목적함수를
+# 셀 수 없다. 기존 행은 전부 fetch라 sent_* 가 NULL인 채로 맞다.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        "ALTER TABLE remote_stats ADD COLUMN sent_bytes INTEGER",
+        "ALTER TABLE remote_stats ADD COLUMN sent_objects INTEGER",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,13 +118,36 @@ class StatsStore:
                     "SELECT version FROM schema_info LIMIT 1"
                 ).fetchone()
                 if row is None:
+                    # 새 파일. _SCHEMA는 v1 형태이므로 마이그레이션을 태워
+                    # 최신으로 올린다 — 신규와 기존의 스키마가 갈라지면 안 된다.
+                    self._migrate(connection, 1)
                     connection.execute(
                         "INSERT INTO schema_info (version) VALUES (?)",
                         (SCHEMA_VERSION,),
                     )
+                elif int(row["version"]) < SCHEMA_VERSION:
+                    self._migrate(connection, int(row["version"]))
+                    connection.execute(
+                        "UPDATE schema_info SET version = ?", (SCHEMA_VERSION,)
+                    )
                 connection.commit()
         except sqlite3.Error as exc:
             logger.warning("계측 저장소를 준비하지 못했습니다: %s", exc)
+
+    def _migrate(self, connection: sqlite3.Connection, from_version: int) -> None:
+        """계측은 캐시다 — 마이그레이션이 실패하면 버리고 다시 쌓아도 된다.
+
+        다만 조용히 버리지는 않는다. 누적 전송량 추세가 끊기는 것은
+        사용자에게 보이는 손실이므로 로그를 남긴다.
+        """
+        for version in range(from_version + 1, SCHEMA_VERSION + 1):
+            for statement in _MIGRATIONS.get(version, ()):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # 이미 있는 열이면 정상 — 스키마 생성과 겹칠 수 있다.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
     def record(self, repo_key: str, stats: TransferStats) -> None:
         """계측 한 건을 남긴다. 실패해도 예외를 던지지 않는다."""
@@ -126,8 +158,9 @@ class StatsStore:
                     INSERT INTO remote_stats (
                         recorded_at, repo_key, remote, kind, succeeded,
                         duration_ms, received_bytes, received_objects,
+                        sent_bytes, sent_objects,
                         total_objects, negotiation_rounds, protocol_version
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         datetime.now(timezone.utc).isoformat(),
@@ -138,6 +171,8 @@ class StatsStore:
                         stats.duration_ms,
                         stats.received_bytes,
                         stats.received_objects,
+                        stats.sent_bytes,
+                        stats.sent_objects,
                         stats.total_objects,
                         stats.negotiation_rounds,
                         stats.protocol_version,
@@ -166,11 +201,17 @@ class StatsStore:
 
     def summarize(self, repo_key: str, *, since: datetime | None = None) -> TransferSummary:
         """기간 집계. `since`를 주면 그 시각 이후만 센다."""
+        # 목적함수는 방향을 가리지 않는다 — 받은 것과 보낸 것을 함께 센다.
+        # "측정됨"의 판정도 둘 중 **해당 방향**이 채워졌는지로 봐야 한다.
+        # received만 보면 push 행이 전부 미측정으로 잡혀 신호가 무의미해진다.
         query = [
             "SELECT COUNT(*) AS ops,",
-            "       SUM(received_bytes IS NOT NULL) AS measured,",
-            "       COALESCE(SUM(received_bytes), 0) AS bytes,",
-            "       COALESCE(SUM(received_objects), 0) AS objects,",
+            "       SUM(received_bytes IS NOT NULL",
+            "           OR sent_bytes IS NOT NULL) AS measured,",
+            "       COALESCE(SUM(COALESCE(received_bytes, 0)",
+            "                    + COALESCE(sent_bytes, 0)), 0) AS bytes,",
+            "       COALESCE(SUM(COALESCE(received_objects, 0)",
+            "                    + COALESCE(sent_objects, 0)), 0) AS objects,",
             "       COALESCE(SUM(duration_ms), 0) AS duration",
             "  FROM remote_stats WHERE repo_key = ?",
         ]

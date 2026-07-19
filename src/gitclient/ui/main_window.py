@@ -38,12 +38,19 @@ from PySide6.QtWidgets import (
 
 from gitclient.application.commit_loader import CommitLoader
 from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
-from gitclient.application.fetch_worker import FetchWorker
+from gitclient.application.remote_workers import (
+    FetchWorker,
+    PullWorker,
+    PushWorker,
+    RemoteWorker,
+    fast_forward_job,
+)
 from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import GitClientError
-from gitclient.domain.models import Ref, RefKind, RepositoryInfo
+from gitclient.domain.instrumentation import OperationKind
+from gitclient.domain.models import MergeKind, Ref, RefKind, RepositoryInfo
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from gitclient.ui.delegates import DiffDelegate, GraphDelegate, SummaryDelegate
 from gitclient.ui.working_tree_panel import WorkingTreePanel
@@ -88,8 +95,10 @@ class MainWindow(QMainWindow):
         self._write_queue: WriteQueue | None = None
         self._graph_reload_pending = False
 
-        # 원격 작업 (Phase 3). 같은 저장소에 fetch가 중복으로 뜨지 않게 한다.
-        self._fetch_worker: FetchWorker | None = None
+        # 원격 작업 (Phase 3). 한 번에 하나만 — fetch/push/pull이 같은 슬롯을
+        # 공유한다. 동시에 돌면 서로의 참조 갱신을 덮어쓸 수 있고, 무엇보다
+        # 사용자가 무슨 일이 벌어지는지 알 수 없다.
+        self._fetch_worker: RemoteWorker | None = None
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
@@ -287,6 +296,14 @@ class MainWindow(QMainWindow):
         )
         self._fetch_action.triggered.connect(self._on_fetch)
 
+        self._pull_action = QAction("가져와 합치기 (Pull)", self)
+        self._pull_action.setToolTip("원격의 변경을 가져와 현재 브랜치에 합칩니다")
+        self._pull_action.triggered.connect(self._on_pull)
+
+        self._push_action = QAction("올리기 (Push)", self)
+        self._push_action.setToolTip("로컬 커밋을 원격에 올립니다")
+        self._push_action.triggered.connect(self._on_push)
+
         self._branch_action = QAction("새 브랜치...", self)
         self._branch_action.triggered.connect(self._prompt_new_branch)
         self._stash_action = QAction("Stash 보관", self)
@@ -296,6 +313,8 @@ class MainWindow(QMainWindow):
 
         repo_menu = self.menuBar().addMenu("저장소")
         repo_menu.addAction(self._fetch_action)
+        repo_menu.addAction(self._pull_action)
+        repo_menu.addAction(self._push_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._branch_action)
         repo_menu.addSeparator()
@@ -308,6 +327,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(reload_action)
         toolbar.addSeparator()
         toolbar.addAction(self._fetch_action)
+        toolbar.addAction(self._pull_action)
+        toolbar.addAction(self._push_action)
         toolbar.addSeparator()
         toolbar.addAction(self._branch_action)
         toolbar.addAction(self._stash_action)
@@ -399,12 +420,7 @@ class MainWindow(QMainWindow):
         for action in (self._branch_action, self._stash_action, self._stash_pop_action):
             action.setEnabled(has_workdir)
 
-        # fetch는 원격이 있어야 의미가 있다. bare 저장소에서도 가능하다.
-        # 진행 중인 fetch가 있으면 켜지 않는다 — 켜져 있는데 중복 가드에
-        # 걸려 아무 반응도 없는 버튼이 되면 안 된다.
-        self._fetch_action.setEnabled(
-            self._has_remotes() and self._fetch_worker is None
-        )
+        self._update_remote_actions()
 
         self.setWindowTitle(f"{info.display_name} — Git Client")
         self._start_loading(path)
@@ -568,10 +584,32 @@ class MainWindow(QMainWindow):
     def _update_status(self, info: RepositoryInfo) -> None:
         parts = [f"HEAD: {info.head_shorthand or '(unborn)'}"]
         parts.append(f"커밋 {self._commit_model.rowCount()}개")
+        divergence = self._describe_divergence()
+        if divergence:
+            parts.append(divergence)
         if info.is_shallow:
             # shallow 저장소는 기능 제약이 있으므로 명시한다. (doc/performance.md §3.3)
             parts.append("shallow 저장소 — 히스토리가 잘려 있습니다")
         self.statusBar().showMessage("   |   ".join(parts))
+
+    def _describe_divergence(self) -> str | None:
+        """원격과 얼마나 벌어져 있는가.
+
+        이 값이 없으면 사용자는 pull과 push 중 무엇이 필요한지 눌러보기
+        전까지 알 수 없다. 트래픽이 비싼 환경에서 "눌러서 확인"은 비용이다.
+        """
+        counts = self._ahead_behind()
+        if counts is None:
+            return None
+        ahead, behind = counts
+        if not ahead and not behind:
+            return "원격과 동기화됨"
+        pieces = []
+        if ahead:
+            pieces.append(f"↑{ahead}")
+        if behind:
+            pieces.append(f"↓{behind}")
+        return "원격 대비 " + " ".join(pieces)
 
     def _populate_refs(self, refs: list[Ref]) -> None:
         self._ref_list.clear()
@@ -1046,36 +1084,69 @@ class MainWindow(QMainWindow):
         """fetch할 원격이 있는가. 활성 판정과 실행 대상이 어긋나지 않게 한다."""
         return self._fetch_remote() is not None
 
-    def _on_fetch(self) -> None:
-        """원격에서 변경을 가져온다. 계측 결과를 상태바에 보고한다."""
-        if self._repo_path is None or self._fetch_worker is not None:
-            return  # 이미 진행 중 — 중복 fetch를 막는다
+    def _current_branch(self) -> str | None:
+        return self._info.head_shorthand if self._info is not None else None
 
-        remote = self._fetch_remote()
-        if remote is None:
-            return  # 원격이 없으면 액션이 꺼져 있어야 한다
+    def _upstream(self) -> tuple[str, str] | None:
+        """현재 브랜치가 따라가는 (원격 이름, 원격 추적 참조).
 
-        worker = FetchWorker(self._repo_path, remote)
+        규약(`<origin>/<브랜치명>`)으로 **추측하지 않고** 설정을 읽는다.
+        추측하면 두 가지가 조용히 깨진다:
+          - fork 워크플로(origin=내 fork, upstream=원본)에서 엉뚱한 ref를
+            대상으로 삼고 "이미 최신"이라 답한다
+          - 분리된 HEAD에서 pygit2가 `shorthand`로 `"HEAD"`를 주므로
+            `refs/remotes/<remote>/HEAD`가 만들어진다. 이 참조는 모든 clone에
+            존재하고 원격 기본 브랜치를 가리키므로, bisect 중인 사용자의
+            HEAD가 조용히 그쪽으로 끌려간다.
+        """
+        return self._engine.upstream_of_head() if self._engine is not None else None
+
+    def _upstream_ref(self) -> str | None:
+        resolved = self._upstream()
+        return resolved[1] if resolved is not None else None
+
+    # -- 공통 실행 경로 -------------------------------------------------
+
+    def _start_remote(self, worker, message: str) -> None:  # noqa: ANN001
         worker.signals.finished.connect(
-            lambda stats, w=worker: self._on_fetch_finished(w, stats)
+            lambda stats, w=worker: self._on_remote_finished(w, stats)
         )
         worker.signals.failed.connect(
-            lambda error, w=worker: self._on_fetch_failed(w, error)
+            lambda error, w=worker: self._on_remote_failed(w, error)
         )
         self._fetch_worker = worker
-        self._fetch_action.setEnabled(False)
-        self.statusBar().showMessage("원격에서 가져오는 중...")
+        self._update_remote_actions()
+        self.statusBar().showMessage(message)
         self._pool.start(worker)
 
-    def _on_fetch_finished(self, worker: FetchWorker, stats) -> None:  # noqa: ANN001
+    def _update_remote_actions(self) -> None:
+        """원격 액션의 활성 상태를 한 곳에서 정한다.
+
+        판정이 흩어지면 "켜져 있는데 눌러도 아무 일 없는 버튼"이 생긴다 —
+        실제로 겪은 결함이다.
+        """
+        idle = self._fetch_worker is None
+        available = self._has_remotes() and idle
+        self._fetch_action.setEnabled(available)
+        self._pull_action.setEnabled(available)
+        # push는 워킹 트리가 있어야 의미가 있다(bare 저장소는 올릴 것이 없다).
+        has_workdir = self._info is not None and self._info.workdir is not None
+        self._push_action.setEnabled(available and has_workdir)
+
+    def _on_remote_finished(self, worker, stats) -> None:  # noqa: ANN001
         if worker is not self._fetch_worker:
             return  # 이전 저장소의 늦은 결과
         self._fetch_worker = None
-        self._fetch_action.setEnabled(True)
-        self._transfer_label.setText(self._describe_fetch(stats))
+        self._update_remote_actions()
+        self._transfer_label.setText(self._describe_transfer(stats))
 
-        # transferred_anything(팩을 받았는가)이 아니라 changed_anything으로
-        # 판단한다. 객체를 하나도 받지 않고 참조만 바뀌는 fetch가 있다 —
+        # pull은 여기서 끝나지 않는다 — 받은 것을 합쳐야 한다.
+        if isinstance(worker, PullWorker):
+            self._finish_pull()
+            return
+
+        # transferred_anything(팩을 옮겼는가)이 아니라 changed_anything으로
+        # 판단한다. 객체를 하나도 옮기지 않고 참조만 바뀌는 작업이 있다 —
         # 이미 가진 커밋을 가리키는 새 브랜치, prune 삭제. 전자를 쓰면 .git에
         # 있는 브랜치가 화면에 끝내 안 나타나고, 이미 지워진 원격 브랜치가
         # 계속 남는다.
@@ -1087,36 +1158,178 @@ class MainWindow(QMainWindow):
             # 않아, 끝난 작업이 계속 진행 중인 것처럼 보인다.
             self._update_status(self._info)
 
-    def _on_fetch_failed(self, worker: FetchWorker, error: GitClientError) -> None:
+    def _on_remote_failed(self, worker, error: GitClientError) -> None:  # noqa: ANN001
         if worker is not self._fetch_worker:
             return
         self._fetch_worker = None
-        self._fetch_action.setEnabled(True)
+        self._update_remote_actions()
         self._update_status(self._info)
         self._report(error)
 
-    def _describe_fetch(self, stats) -> str:  # noqa: ANN001
+    # -- fetch ----------------------------------------------------------
+
+    def _on_fetch(self) -> None:
+        """원격에서 변경을 가져온다. 계측 결과를 상태바에 보고한다."""
+        if self._repo_path is None or self._fetch_worker is not None:
+            return  # 이미 진행 중 — 중복 실행을 막는다
+
+        remote = self._fetch_remote()
+        if remote is None:
+            return  # 원격이 없으면 액션이 꺼져 있어야 한다
+
+        self._start_remote(
+            FetchWorker(self._repo_path, remote), "원격에서 가져오는 중..."
+        )
+
+    # -- push -----------------------------------------------------------
+
+    def _on_push(self) -> None:
+        """로컬 커밋을 원격에 올린다."""
+        if self._repo_path is None or self._fetch_worker is not None:
+            return
+
+        branch = self._current_branch()
+        resolved = self._upstream()
+        remote = resolved[0] if resolved is not None else self._fetch_remote()
+        if remote is None or branch is None:
+            return
+
+        # upstream이 **설정돼 있지 않을 때만** 함께 설정한다.
+        # "ahead/behind를 계산할 수 없다"로 판정하면 안 된다 — 아직 fetch하지
+        # 않아 비교만 실패한 경우까지 미설정으로 읽어, 사용자가 지정해 둔
+        # 추적 대상(fork 워크플로의 upstream/main 등)을 조용히 덮어쓴다.
+        needs_upstream = resolved is None
+        self._start_remote(
+            PushWorker(
+                self._repo_path, remote, branch, set_upstream=needs_upstream
+            ),
+            f"{remote}로 올리는 중...",
+        )
+
+    # -- pull -----------------------------------------------------------
+
+    def _on_pull(self) -> None:
+        """가져온 뒤 합친다. 네트워크와 로컬 쓰기가 만나는 지점이다.
+
+        앞 절반(fetch)은 워커가, 뒤 절반(빨리 감기)은 WriteQueue가 맡는다.
+        워커가 직접 합치면 같은 저장소에 쓰기 스트림이 둘 생겨 §3.3 규칙 3이
+        깨진다.
+        """
+        if self._repo_path is None or self._fetch_worker is not None:
+            return
+
+        # 브랜치가 실제로 따라가는 원격에서 가져온다. 규약으로 추측한 원격에서
+        # 가져오면 합치기 대상은 맞는데 데이터가 낡는다.
+        resolved = self._upstream()
+        remote = resolved[0] if resolved is not None else self._fetch_remote()
+        if remote is None:
+            return
+
+        self._start_remote(
+            PullWorker(self._repo_path, remote), "가져와 합치는 중..."
+        )
+
+    def _finish_pull(self) -> None:
+        """fetch가 끝난 뒤의 합치기. 필요한 경우에만 큐에 제출한다.
+
+        **어느 갈래로 빠지든 화면을 다시 그린다.** fetch는 이미 원격 추적
+        참조를 갱신했으므로, 합칠 것이 없다고 재로딩을 건너뛰면 받아온 브랜치·
+        태그가 화면에 끝내 나타나지 않는다. 합치기 여부와 화면 갱신 여부는
+        별개다.
+        """
+        upstream, branch = self._upstream_ref(), self._current_branch()
+
+        def reload_and(report: GitClientError | None = None) -> None:
+            if self._repo_path is not None:
+                self.open_repository(self._repo_path)
+            else:
+                self._update_status(self._info)
+            if report is not None:
+                self._report(report)
+
+        if upstream is None or branch is None or self._engine is None:
+            # upstream이 없는 브랜치(아직 push한 적 없음)나 분리된 HEAD.
+            # 가져온 것은 반영하되 합칠 대상이 없다는 것만 알린다.
+            reload_and()
+            return
+
+        try:
+            preview = self._engine.merge_preview(upstream)
+        except GitClientError as exc:
+            reload_and(exc)
+            return
+
+        if preview.kind is MergeKind.UP_TO_DATE:
+            reload_and()
+            return
+
+        if preview.kind is MergeKind.MERGE_REQUIRED:
+            # 병합 커밋과 충돌 해결 UI는 Phase 4다. 여기서 병합을 시작하면
+            # 사용자가 앱 안에서 끝낼 수 없는 상태에 갇힌다 — 받은 것은
+            # 이미 저장했으니 그래프에는 반영하고, 할 수 없는 일은 말한다.
+            reload_and(
+                GitClientError(
+                    "양쪽에 서로 다른 커밋이 있어 자동으로 합칠 수 없습니다.",
+                    detail="원격 변경은 이미 가져왔습니다. "
+                    "합치기(merge)는 아직 지원하지 않습니다.",
+                    action="지금은 git CLI에서 merge 또는 rebase로 "
+                    "해결해 주세요. 앱 안에서의 병합은 Phase 4에서 추가됩니다.",
+                )
+            )
+            return
+
+        if self._write_queue is None:
+            reload_and()
+            return
+        # upstream을 계산한 것과 같은 스냅샷의 브랜치를 고정해 보낸다 —
+        # 참조 이름과 브랜치 정체가 어긋날 수 없게.
+        self._write_queue.submit(
+            "가져와 합치기", fast_forward_job(upstream, branch)
+        )
+        self._graph_reload_pending = True
+
+    def _ahead_behind(self) -> tuple[int, int] | None:
+        """(앞선 커밋 수, 뒤처진 커밋 수). upstream이 없으면 None.
+
+        UI 스레드에서 부른다 — `git rev-list --count`는 로컬 질의라 빠르지만,
+        거대 저장소에서 느려지면 워커로 옮겨야 한다. (G4 예산 50ms)
+        """
+        resolved, branch = self._upstream(), self._current_branch()
+        if resolved is None or branch is None or self._repo_path is None:
+            return None
+        from gitclient.infrastructure.remote_engine import RemoteEngine
+
+        return RemoteEngine(self._repo_path).ahead_behind(branch, resolved[1])
+
+    def _describe_transfer(self, stats) -> str:  # noqa: ANN001
         """계측 결과를 사람이 읽을 문장으로.
 
         전송량을 매번 보여주는 이유는 이 프로젝트의 목적함수가 누적 전송
         바이트이기 때문이다 — 사용자가 비용을 볼 수 있어야 판단할 수 있다.
         (performance.md §8.4)
         """
+        sending = stats.kind is OperationKind.PUSH
+        title = "올리기 완료" if sending else "가져오기 완료"
+        idle_text = "올릴 것이 없습니다" if sending else "이미 최신입니다"
+
         if not stats.changed_anything:
-            return f"이미 최신입니다 ({stats.duration_ms}ms)"
+            return f"{idle_text} ({stats.duration_ms}ms)"
+
+        moved_bytes = stats.sent_bytes if sending else stats.received_bytes
+        moved_objects = stats.sent_objects if sending else stats.received_objects
 
         parts = [f"{len(stats.ref_updates)}개 참조 갱신"]
-        if stats.received_bytes:
-            parts.append(f"{_format_bytes(stats.received_bytes)} 전송")
-        elif stats.received_bytes == 0:
+        if moved_bytes:
+            parts.append(f"{_format_bytes(moved_bytes)} 전송")
+        elif moved_bytes == 0:
             # 참조만 바뀐 경우. 0바이트는 측정 실패가 아니라 측정된 사실이다.
             parts.append("객체 전송 없음")
         else:
             parts.append("전송량 측정 실패")
-        if stats.received_objects:
-            parts.append(f"객체 {stats.received_objects}개")
+        if moved_objects:
+            parts.append(f"객체 {moved_objects}개")
         parts.append(f"{stats.duration_ms}ms")
-        return "가져오기 완료 — " + ", ".join(parts)
+        return f"{title} — " + ", ".join(parts)
 
     def _on_ref_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
         item = self._ref_list.itemAt(pos)

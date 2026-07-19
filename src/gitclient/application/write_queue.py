@@ -150,7 +150,14 @@ class WriteQueue(QObject):
         else:
             self.job_succeeded.emit(job_id, name, result)
 
-        if self._pending:
-            self._start_next_if_idle()
-        else:
+        # 위 방출은 직접 연결이다 — 슬롯이 모달을 띄우면 그 중첩 이벤트 루프
+        # 안에서 새 작업이 제출되고 `_active`가 None이라 **즉시 시작될 수**
+        # 있다. 그때 `self._pending`만 보고 idle을 내면 워킹트리를 쓰는 중에
+        # UI가 전체 재로딩을 시작하고, 정작 그 작업이 끝났을 때의 idle은
+        # 재로딩 플래그가 이미 소비돼 아무 일도 하지 못한다.
+        #
+        # 그래서 방출 **이후**의 상태를 다시 읽는다. 재진입으로 시작된 작업의
+        # idle은 그 작업의 _on_done이 제 차례에 낸다.
+        self._start_next_if_idle()
+        if not self.is_busy:
             self.idle.emit()
