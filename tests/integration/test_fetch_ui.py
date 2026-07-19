@@ -416,20 +416,25 @@ class TestPullRefreshesTheView:
         remote.diverge()
         remote.create_remote_branch("newcomer")
 
+        def labels() -> list[str]:
+            return [
+                window._ref_list.item(row).text()
+                for row in range(window._ref_list.count())
+            ]
+
         window._on_pull()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
+
+        # **최종 상태를 직접 기다린다.** `not _loading`으로 기다리면, 쓰기 큐가
+        # 비는 순간과 그것이 촉발하는 그래프 재로딩이 시작되는 순간 사이의 틈에
+        # 걸려 옛 목록을 읽는다 — 부하가 걸린 전체 실행에서만 재현되는 간헐
+        # 실패였다. 대리 지표가 아니라 단언하려는 것 자체를 기다린다.
         qtbot.waitUntil(
-            lambda: window._write_queue is not None
-            and not window._write_queue.is_busy,
+            lambda: any("newcomer" in label for label in labels()),
             timeout=TIMEOUT,
         )
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
-        labels = [
-            window._ref_list.item(row).text()
-            for row in range(window._ref_list.count())
-        ]
-        assert any("newcomer" in label for label in labels), labels
+        assert any("newcomer" in label for label in labels()), labels()
 
 
 class TestUpstreamAwareness:

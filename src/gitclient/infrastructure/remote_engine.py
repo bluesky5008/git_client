@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -39,8 +39,10 @@ from gitclient.infrastructure.askpass import (
 )
 from gitclient.domain.instrumentation import (
     OperationKind,
+    ProgressSnapshot,
     TransferStats,
     parse_progress,
+    parse_progress_snapshot,
     parse_trace2,
 )
 
@@ -270,6 +272,27 @@ class _PipePump:
             thread.join(max(0.0, deadline - time.monotonic()))
         return not any(thread.is_alive() for thread in self._threads)
 
+    def tail(self, limit: int = 4096) -> str:
+        """stderr의 **마지막 조각만** 돌려준다.
+
+        진행률을 볼 때 전체 버퍼를 다시 이어 붙여 정규식을 돌리면, 큰
+        전송에서 버퍼가 커질수록 매 폴링 비용이 함께 커진다(O(n²)).
+        진행 표시가 전송을 느리게 만들면 목적 함수를 스스로 거스르는 셈이다.
+
+        진행률 줄은 CR로 덮어쓰이며 오고 우리는 **마지막 것**만 쓰므로
+        꼬리로 충분하다. 4KB면 가장 긴 진행률 줄의 수십 배다.
+        """
+        with self._lock:
+            chunks = self._chunks["stderr"]
+            collected: list[str] = []
+            size = 0
+            for chunk in reversed(chunks):
+                collected.append(chunk)
+                size += len(chunk)
+                if size >= limit:
+                    break
+            return "".join(reversed(collected))
+
     def collected(self) -> tuple[str, str]:
         with self._lock:
             return (
@@ -373,9 +396,14 @@ class RemoteEngine:
         git_binary: str = "git",
         *,
         credentials: Credentials | None = None,
+        on_progress: Callable[[ProgressSnapshot], None] | None = None,
     ) -> None:
         self._repo_path = str(repo_path)
         self._git = git_binary
+        # 진행 상황을 알릴 곳. **Qt를 모른다** — 이 층은 인프라이고, 신호로
+        # 바꾸는 일은 application 층(RemoteWorker)이 한다 (§3.1 계층 규칙).
+        # 워커 스레드에서 불리므로 구현체가 스레드 안전해야 한다.
+        self._on_progress = on_progress
         # 사용자가 방금 입력한 자격증명. 저장하지 않고 이 인스턴스가 사는
         # 동안만 들고 있다가 자식 프로세스 환경으로 넘긴다. (ADR-3)
         self._credentials = credentials
@@ -963,6 +991,10 @@ class RemoteEngine:
                 _release_pipes(proc, pump.join(DRAIN_TIMEOUT_S))
                 return pump.collected()
 
+            # 폴링 주기(0.2초)마다 한 번만 알린다. git은 그보다 자주
+            # 내보내지만(실측 0.1초) 화면을 그 속도로 다시 그릴 이유가 없다.
+            self._report_progress(pump.tail())
+
             idle = pump.idle_seconds
             if idle >= stall_timeout_s:
                 _kill_process_tree(proc)
@@ -984,6 +1016,21 @@ class RemoteEngine:
                     ),
                     stderr,
                 )
+
+    def _report_progress(self, stderr_tail: str) -> None:
+        """최근 출력에서 진행 상태를 뽑아 알린다.
+
+        **콜백이 실패해도 원격 작업은 계속된다.** 화면 갱신 실패가 전송을
+        중단시키면 안 된다 — 진행률은 부가 정보이지 작업의 일부가 아니다.
+        """
+        if self._on_progress is None:
+            return
+        try:
+            snapshot = parse_progress_snapshot(stderr_tail)
+            if snapshot is not None:
+                self._on_progress(snapshot)
+        except Exception:  # noqa: BLE001 - 진행률 때문에 전송을 죽이지 않는다
+            logger.debug("진행률 보고 실패", exc_info=True)
 
     def _translate_failure(
         self, command: Sequence[str], result: subprocess.CompletedProcess[str]

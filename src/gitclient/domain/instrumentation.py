@@ -246,6 +246,128 @@ class ProgressReport:
     """"Everything up-to-date" — push할 것이 없었다."""
 
 
+
+class TransferPhase(Enum):
+    """git이 지나가는 진행 단계.
+
+    **단계마다 기다림의 성격이 다르다.** 원격이 준비하는 동안은 회선이 놀고
+    있고, 받는 동안은 회선이 병목이며, 적용하는 동안은 로컬 CPU·디스크가
+    병목이다. 사용자가 "왜 이렇게 오래 걸리나"를 판단하려면 구분이 필요하다.
+    """
+
+    PREPARING = "preparing"
+    """객체를 세고 압축하는 중 (Enumerating/Counting/Compressing).
+
+    회선이 아니라 CPU가 병목인 구간이다. **누구의 CPU인지는 `remote_side`가
+    정한다** — fetch에서는 서버가 세지만 push에서는 우리가 센다.
+    """
+
+    RECEIVING = "receiving"
+    """실제로 받는 중. **느린 회선에서 기다림의 대부분이 여기다.**
+
+    유일하게 바이트와 속도가 함께 오는 단계다.
+    """
+
+    SENDING = "sending"
+    """실제로 보내는 중 (push의 Writing objects)."""
+
+    APPLYING = "applying"
+    """팩을 풀어 반영하는 중 (Resolving deltas / Updating files).
+
+    회선과 무관하다. **다만 누구의 CPU인지는 `remote_side`가 정한다** —
+    fetch에서는 우리 쪽이지만 push에서는 서버 쪽이다.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    """지금 이 순간의 진행 상태. 화면에 그리기 위한 값이다.
+
+    `ProgressReport`와 목적이 다르다 — 그쪽은 작업이 끝난 뒤의 **회계**이고,
+    이쪽은 진행 중의 **표시**다. 섞으면 "끝나야 알 수 있는 값"과 "지금
+    보여줘야 하는 값"이 한 타입에 뒤엉킨다.
+    """
+
+    phase: TransferPhase
+    remote_side: bool = False
+    """이 일을 **누가** 하고 있는가 — 서버(True)인가 우리(False)인가.
+
+    `remote:` 접두어가 유일한 판별 정보다. 단계 이름만으로는 알 수 없고,
+    **fetch와 push에서 정반대로 붙는다**:
+      fetch: `remote: Counting` (서버가 센다) / `Resolving deltas` (우리가 푼다)
+      push:  `Counting` (우리가 센다) / `remote: Resolving deltas` (서버가 푼다)
+    버리면 push에서 귀속이 통째로 뒤집혀, 사용자의 CPU가 돌 때 서버를
+    지목하고 서버가 몇 분 걸릴 때 사용자 디스크를 지목한다.
+    """
+
+    percent: int | None = None
+    current: int | None = None
+    total: int | None = None
+    bytes_so_far: int | None = None
+    bytes_per_s: int | None = None
+
+    # **남은 시간은 표시하지 않는다.**
+    #
+    # 처음에는 `받은 바이트 ÷ 진행률`로 역산해 20% 이상에서만 보여줬다.
+    # 그 추정은 "객체당 바이트가 전송 내내 일정하다"를 가정하는데, 팩은
+    # 커밋 → 트리 → blob 순으로 쓰이고 큰 것은 대개 blob이다. 즉 객체당
+    # 바이트가 **뒤로 갈수록 커진다** — 초반 추정은 구조적으로 낙관적이다.
+    # 임계값을 올려도 편향이 사라지지 않고 틀린 값이 늦게 나올 뿐이다.
+    #
+    # git 자신도 속도만 보여주고 남은 시간은 말하지 않는다. 총 바이트를
+    # 모르기 때문이다. 우리도 모른다. 대신 속도와 받은 양을 그대로 보여주고
+    # 남은 시간은 사용자가 판단하게 둔다. (§4.6.5, ADR-59)
+
+
+# 진행률 줄 하나를 통째로 읽는다. `remote:` 접두어는 서버측 단계를 뜻한다.
+_SNAPSHOT = re.compile(
+    r"(remote:\s*)?"
+    r"(Enumerating objects|Counting objects|Compressing objects|"
+    r"Receiving objects|Writing objects|Resolving deltas|Updating files)"
+    r":\s+(?:(\d+)%\s+\((\d+)/(\d+)\)|(\d+))"
+    r"(?:,\s+([\d.]+)\s+" + _SIZE_UNIT +
+    r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?)?"
+)
+
+_PHASE_BY_LABEL = {
+    "Enumerating objects": TransferPhase.PREPARING,
+    "Counting objects": TransferPhase.PREPARING,
+    "Compressing objects": TransferPhase.PREPARING,
+    "Receiving objects": TransferPhase.RECEIVING,
+    "Writing objects": TransferPhase.SENDING,
+    "Resolving deltas": TransferPhase.APPLYING,
+    "Updating files": TransferPhase.APPLYING,
+}
+
+
+def parse_progress_snapshot(stderr: str) -> ProgressSnapshot | None:
+    """지금까지의 stderr에서 **가장 최근** 진행 상태를 뽑는다.
+
+    진행률은 캐리지 리턴으로 덮어쓰이며 오므로 마지막 매칭이 현재 상태다.
+    아직 어떤 단계도 시작되지 않았으면 None.
+    """
+    latest = None
+    for match in _SNAPSHOT.finditer(stderr):
+        latest = match
+    if latest is None:
+        return None
+
+    (remote_prefix, label, percent, current, total, bare_count,
+     size, size_unit, speed, speed_unit) = latest.groups()
+
+    return ProgressSnapshot(
+        phase=_PHASE_BY_LABEL[label],
+        remote_side=bool(remote_prefix),
+        percent=int(percent) if percent else None,
+        # "Enumerating objects: 13" 처럼 비율 없이 개수만 오는 단계가 있다.
+        current=int(current) if current else (
+            int(bare_count) if bare_count else None
+        ),
+        total=int(total) if total else None,
+        bytes_so_far=parse_size(size, size_unit) if size else None,
+        bytes_per_s=parse_size(speed, speed_unit) if speed else None,
+    )
+
 def parse_progress(stderr: str) -> ProgressReport:
     """git의 stderr progress를 해석한다.
 

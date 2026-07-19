@@ -11,6 +11,8 @@ import json
 import pytest
 
 from gitclient.domain.instrumentation import (
+    TransferPhase,
+    parse_progress_snapshot,
     OperationKind,
     TransferStats,
     parse_progress,
@@ -267,3 +269,100 @@ class TestTransferStats:
 
     def test_true_no_op_changes_nothing(self) -> None:
         assert TransferStats(OperationKind.FETCH, "origin", 10).changed_anything is False
+
+
+class TestProgressSnapshot:
+    """진행 중 화면에 그릴 값. 끝난 뒤의 회계(ProgressReport)와 목적이 다르다.
+
+    아래 문자열은 전부 **실측한 것**이다 (git 2.42, 앱의 BASE_CONFIG 포함).
+    지어낸 형식으로 테스트하면 파서는 통과하는데 화면은 비는 일이 생긴다.
+    """
+
+    def test_no_progress_yet_is_none(self) -> None:
+        assert parse_progress_snapshot("") is None
+        assert parse_progress_snapshot("From file:///tmp/x\n") is None
+
+    def test_remote_side_phases_are_preparing(self) -> None:
+        snapshot = parse_progress_snapshot("remote: Counting objects:  62% (10/16)\r")
+
+        assert snapshot.phase is TransferPhase.PREPARING
+        assert snapshot.percent == 62
+        assert (snapshot.current, snapshot.total) == (10, 16)
+
+    def test_enumerating_has_a_count_without_percent(self) -> None:
+        """이 단계는 비율이 없다 — 총계를 아직 모르기 때문이다."""
+        snapshot = parse_progress_snapshot("remote: Enumerating objects: 13, done.\r")
+
+        assert snapshot.phase is TransferPhase.PREPARING
+        assert snapshot.percent is None
+        assert snapshot.current == 13
+
+    def test_receiving_carries_bytes_and_speed(self) -> None:
+        """느린 회선에서 기다림의 대부분이 이 단계다."""
+        snapshot = parse_progress_snapshot(
+            "Receiving objects:  47% (470/1000), 12.34 MiB | 1.20 MiB/s\r"
+        )
+
+        assert snapshot.phase is TransferPhase.RECEIVING
+        assert snapshot.percent == 47
+        assert snapshot.bytes_so_far == pytest.approx(12.34 * 1024**2, rel=0.01)
+        assert snapshot.bytes_per_s == pytest.approx(1.20 * 1024**2, rel=0.01)
+
+    def test_receiving_without_size_is_still_usable(self) -> None:
+        """전송이 작으면 git이 크기를 생략한다 — 비율은 그래도 보여줘야 한다."""
+        snapshot = parse_progress_snapshot("Receiving objects:   8% (1/12)\r")
+
+        assert snapshot.phase is TransferPhase.RECEIVING
+        assert snapshot.percent == 8
+        assert snapshot.bytes_so_far is None
+
+    def test_writing_is_sending(self) -> None:
+        snapshot = parse_progress_snapshot(
+            "Writing objects: 100% (12/12), 3.13 MiB | 18.94 MiB/s, done.\r"
+        )
+
+        assert snapshot.phase is TransferPhase.SENDING
+
+    def test_resolving_deltas_is_applying(self) -> None:
+        """회선과 무관한 구간 — 여기서 오래 걸리면 원인이 다르다."""
+        snapshot = parse_progress_snapshot("Resolving deltas:  71% (5/7)\r")
+
+        assert snapshot.phase is TransferPhase.APPLYING
+
+    def test_latest_line_wins(self) -> None:
+        """진행률은 CR로 덮어쓰이며 온다 — 마지막이 현재 상태다."""
+        stream = (
+            "remote: Counting objects: 100% (16/16)\r"
+            "Receiving objects:  50% (6/12), 5.00 MiB | 1.00 MiB/s\r"
+        )
+
+        snapshot = parse_progress_snapshot(stream)
+
+        assert snapshot.phase is TransferPhase.RECEIVING
+        assert snapshot.percent == 50
+
+
+class TestNoEtaIsPromised:
+    """남은 시간을 표시하지 않기로 한 결정을 고정한다.
+
+    역산의 가정("객체당 바이트가 일정하다")이 구조적으로 틀리기 때문이다 —
+    팩은 커밋 → 트리 → blob 순으로 쓰이고 큰 것은 대개 blob이라, 객체당
+    바이트가 뒤로 갈수록 커진다. 임계값을 올려도 편향은 남는다. (ADR-59)
+    """
+
+    def test_snapshot_does_not_expose_an_eta(self) -> None:
+        snapshot = parse_progress_snapshot(
+            "Receiving objects:  50% (6/12), 5.00 MiB | 1.00 MiB/s\r"
+        )
+
+        assert not hasattr(snapshot, "eta_seconds"), (
+            "추정 근거가 구조적으로 편향돼 있어 표시하지 않기로 했다"
+        )
+
+    def test_speed_and_amount_are_still_reported(self) -> None:
+        """남은 시간 대신 사실만 보여준다 — 판단은 사용자가 한다."""
+        snapshot = parse_progress_snapshot(
+            "Receiving objects:  50% (6/12), 5.00 MiB | 1.00 MiB/s\r"
+        )
+
+        assert snapshot.bytes_so_far and snapshot.bytes_per_s
