@@ -108,6 +108,13 @@ class OperationKind(Enum):
     FETCH = "fetch"
     PULL = "pull"
     PUSH = "push"
+    PREFETCH = "prefetch"
+    """사용자가 요청하지 않은 배경 fetch.
+
+    별도 종류로 기록한다 — 사용자가 실제로 기다린 시간과 배경에서 미리
+    치른 시간을 섞으면, 대기 시간이 목적 함수인 이 앱에서 가장 중요한
+    수치가 흐려진다. (ADR-7)
+    """
 
 
 def parse_size(value: str, unit: str) -> int:
