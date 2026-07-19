@@ -187,6 +187,13 @@ class RepositoryInfo:
     is_empty: bool = False
     is_bare: bool = False
     is_shallow: bool = False
+    is_partial: bool = False
+    """부분 복제(blob 지연 수신) 저장소인가.
+
+    shallow와 마찬가지로 **지속되는 제약**이다 — 오프라인에서 과거 파일을
+    열 수 없다. 고른 시점과 막히는 시점이 멀어서 상시 표시가 필요하다.
+    """
+
     refs: list[Ref] = field(default_factory=list)
     remotes: list[str] = field(default_factory=list)
     """설정된 원격 이름들. 비어 있으면 원격 작업이 불가능하다."""

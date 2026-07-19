@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from gitclient.application.commit_loader import CommitLoader
 from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
 from gitclient.application.remote_workers import (
+    CloneWorker,
     FetchWorker,
     PullWorker,
     PushWorker,
@@ -53,6 +54,7 @@ from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.domain.instrumentation import OperationKind
 from gitclient.domain.models import MergeKind, Ref, RefKind, RepositoryInfo
 from gitclient.infrastructure.local_engine import LocalGitEngine
+from gitclient.ui.clone_dialog import CloneDialog
 from gitclient.ui.credential_dialog import CredentialDialog
 from gitclient.ui.delegates import DiffDelegate, GraphDelegate, SummaryDelegate
 from gitclient.ui.working_tree_panel import WorkingTreePanel
@@ -121,6 +123,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        # 저장소가 없는 첫 화면에서도 복제는 눌러야 한다 — 오히려 그때
+        # 가장 필요하다. 나머지 원격 액션은 저장소가 열려야 켜진다.
+        self._update_remote_actions()
         self._show_placeholder()
 
     # ------------------------------------------------------------------
@@ -301,6 +306,10 @@ class MainWindow(QMainWindow):
         )
         self._fetch_action.triggered.connect(self._on_fetch)
 
+        self._clone_action = QAction("복제 (Clone)...", self)
+        self._clone_action.setToolTip("원격 저장소를 복제해 옵니다")
+        self._clone_action.triggered.connect(self._on_clone)
+
         self._pull_action = QAction("가져와 합치기 (Pull)", self)
         self._pull_action.setToolTip("원격의 변경을 가져와 현재 브랜치에 합칩니다")
         self._pull_action.triggered.connect(self._on_pull)
@@ -317,6 +326,8 @@ class MainWindow(QMainWindow):
         self._stash_pop_action.triggered.connect(self._on_stash_pop)
 
         repo_menu = self.menuBar().addMenu("저장소")
+        repo_menu.addAction(self._clone_action)
+        repo_menu.addSeparator()
         repo_menu.addAction(self._fetch_action)
         repo_menu.addAction(self._pull_action)
         repo_menu.addAction(self._push_action)
@@ -330,6 +341,7 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         toolbar.addAction(open_action)
         toolbar.addAction(reload_action)
+        toolbar.addAction(self._clone_action)
         toolbar.addSeparator()
         toolbar.addAction(self._fetch_action)
         toolbar.addAction(self._pull_action)
@@ -586,15 +598,25 @@ class MainWindow(QMainWindow):
         self._pool.waitForDone(2000)
         super().closeEvent(event)
 
-    def _update_status(self, info: RepositoryInfo) -> None:
+    def _update_status(self, info: RepositoryInfo | None) -> None:
+        # 복제는 저장소가 열려 있지 않아도 실행된다 — 그 실패 경로에서
+        # info가 None으로 들어온다. 원격 작업 중 처음 생긴 경우다.
+        if info is None:
+            self.statusBar().showMessage("저장소를 열어 주세요 (Ctrl+O)")
+            return
+
         parts = [f"HEAD: {info.head_shorthand or '(unborn)'}"]
         parts.append(f"커밋 {self._commit_model.rowCount()}개")
         divergence = self._describe_divergence()
         if divergence:
             parts.append(divergence)
+        # 아래 둘은 **지속되는 제약**이라 상시 표시한다. 임시 메시지로 한 번만
+        # 띄우면 그래프 로딩 메시지에 덮이고, 정작 blame이 막히는 시점에는
+        # 아무 단서도 남지 않는다. (전송량 표시에서 이미 겪은 문제)
         if info.is_shallow:
-            # shallow 저장소는 기능 제약이 있으므로 명시한다. (doc/performance.md §3.3)
-            parts.append("shallow 저장소 — 히스토리가 잘려 있습니다")
+            parts.append("히스토리가 잘려 있습니다 (shallow)")
+        if info.is_partial:
+            parts.append("파일 내용을 지연 수신합니다 (오프라인 제약)")
         self.statusBar().showMessage("   |   ".join(parts))
 
     def _describe_divergence(self) -> str | None:
@@ -1138,6 +1160,9 @@ class MainWindow(QMainWindow):
         실제로 겪은 결함이다.
         """
         idle = self._fetch_worker is None
+        # 복제는 저장소가 열려 있지 않아도 된다 — 오히려 그때 가장 필요하다.
+        # 다만 원격 작업 슬롯은 공유하므로 진행 중이면 잠근다.
+        self._clone_action.setEnabled(idle)
         available = self._has_remotes() and idle
         self._fetch_action.setEnabled(available)
         self._pull_action.setEnabled(available)
@@ -1155,6 +1180,11 @@ class MainWindow(QMainWindow):
         # pull은 여기서 끝나지 않는다 — 받은 것을 합쳐야 한다.
         if isinstance(worker, PullWorker):
             self._finish_pull()
+            return
+
+        # clone은 방금 만든 저장소를 열어 준다.
+        if isinstance(worker, CloneWorker):
+            self._finish_clone(worker)
             return
 
         # transferred_anything(팩을 옮겼는가)이 아니라 changed_anything으로
@@ -1230,6 +1260,50 @@ class MainWindow(QMainWindow):
             "원격에서 가져오는 중...",
             retry=lambda creds: FetchWorker(path, remote, credentials=creds),
         )
+
+    # -- clone ----------------------------------------------------------
+
+    def _on_clone(self) -> None:
+        """원격 저장소를 복제한다.
+
+        저장소가 열려 있지 않아도 되는 유일한 원격 작업이다 — 다른 작업들과
+        달리 `_repo_path`를 요구하지 않는다. 다만 슬롯은 공유하므로 진행 중인
+        원격 작업이 있으면 시작하지 않는다.
+        """
+        if self._fetch_worker is not None:
+            return
+
+        dialog = CloneDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        request = dialog.request()
+
+        def build(credentials=None):  # noqa: ANN001, ANN202
+            return CloneWorker(
+                request.url,
+                request.destination,
+                filter_spec=request.filter_spec,
+                depth=request.depth,
+                credentials=credentials,
+            )
+
+        self._start_remote(
+            build(),
+            f"{request.destination.name}(으)로 복제하는 중...",
+            retry=build,
+        )
+
+    def _finish_clone(self, worker) -> None:  # noqa: ANN001
+        """복제가 끝나면 그 저장소를 연다.
+
+        복제해 놓고 열지 않으면 사용자가 다시 "저장소 열기"를 눌러야 한다 —
+        방금 어디에 받았는지 기억해야 하는 것도 부담이다.
+        """
+        destination = str(worker.destination)
+        try:
+            self.open_repository(destination)
+        except GitClientError as exc:  # pragma: no cover - 방어적
+            self._report(exc)
 
     # -- push -----------------------------------------------------------
 
@@ -1365,21 +1439,30 @@ class MainWindow(QMainWindow):
         (performance.md §8.4)
         """
         sending = stats.kind is OperationKind.PUSH
-        title = "올리기 완료" if sending else "가져오기 완료"
+        cloning = stats.kind is OperationKind.CLONE
+        title = "복제 완료" if cloning else ("올리기 완료" if sending else "가져오기 완료")
         idle_text = "올릴 것이 없습니다" if sending else "이미 최신입니다"
 
-        if not stats.changed_anything:
+        if not stats.changed_anything and not cloning:
             return f"{idle_text} ({stats.duration_ms}ms)"
 
         moved_bytes = stats.sent_bytes if sending else stats.received_bytes
         moved_objects = stats.sent_objects if sending else stats.received_objects
 
-        parts = [f"{len(stats.ref_updates)}개 참조 갱신"]
+        # 복제는 참조 갱신 줄을 fetch와 같은 형태로 내지 않는다 —
+        # "0개 참조 갱신"은 사실이 아니라 파싱의 부재다. 말하지 않는다.
+        parts = [] if cloning else [f"{len(stats.ref_updates)}개 참조 갱신"]
         if moved_bytes:
             parts.append(f"{_format_bytes(moved_bytes)} 전송")
         elif moved_bytes == 0:
             # 참조만 바뀐 경우. 0바이트는 측정 실패가 아니라 측정된 사실이다.
             parts.append("객체 전송 없음")
+        elif moved_objects:
+            # 객체는 왔는데 크기가 없다 — git이 작은 전송에는 크기를 붙이지
+            # 않기 때문이다. "측정 실패"라고 하면 앱이 고장 난 것처럼 들리는데,
+            # 실제로는 git이 말해주지 않은 것이다. 집계에는 여전히 미측정으로
+            # 남지만 화면에서는 사실대로 적는다.
+            parts.append("전송량 미보고")
         else:
             parts.append("전송량 측정 실패")
         if moved_objects:

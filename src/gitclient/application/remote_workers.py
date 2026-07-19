@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -76,6 +77,7 @@ class RemoteWorker(QRunnable):
         # 넘긴다 — 어디에도 저장하지 않는다. (ADR-3)
         self._credentials = credentials
         self._cancelled = False
+        self._succeeded = False
         self._engine: RemoteEngine | None = None
         self._lock = threading.Lock()
         self.signals = RemoteSignals()
@@ -123,6 +125,7 @@ class RemoteWorker(QRunnable):
                 return
 
             stats = self._operate(engine)
+            self._succeeded = True
             self._record(stats)
 
             # 통한 자격증명만 저장을 위임한다. 실패한 값을 저장하면 다음
@@ -155,7 +158,11 @@ class RemoteWorker(QRunnable):
                 )
 
     def _record(self, stats: TransferStats) -> None:
-        """계측 저장은 실패해도 본 작업의 성공을 뒤집지 않는다."""
+        """계측 저장은 실패해도 본 작업의 성공을 뒤집지 않는다.
+
+        clone은 성공한 뒤에야 저장소가 생기므로, 키를 구하지 못하면 조용히
+        건너뛴다 — 실패한 clone에는 귀속시킬 저장소가 없다.
+        """
         try:
             from gitclient.infrastructure.stats_store import StatsStore
 
@@ -218,6 +225,181 @@ class PullWorker(RemoteWorker):
 
     def _operate(self, engine: RemoteEngine) -> TransferStats:
         return engine.fetch(self._remote)
+
+
+class CloneWorker(RemoteWorker):
+    """원격을 복제한다.
+
+    다른 워커와 두 가지가 다르다:
+      - 시작할 때 **저장소가 없다.** 계측 키도 끝나야 정해진다.
+      - 취소·실패 시 **부분 생성물을 우리가 치워야 한다.** git은 자기
+        실패에서는 정리하지만, 프로세스를 강제 종료당하면 반쯤 만들어진
+        디렉터리를 그대로 남긴다(실측 확인). 남겨두면 사용자는 정체 모를
+        폴더를 마주하고, 같은 자리에 다시 clone하려 하면 "이미 존재한다"로
+        막힌다.
+    """
+
+    label = "복제"
+
+    def __init__(
+        self,
+        url: str,
+        destination: str | Path,
+        *,
+        filter_spec: str | None = None,
+        depth: int | None = None,
+        credentials: Credentials | None = None,
+    ) -> None:
+        # 부모의 repo_path 자리에 대상 경로를 넣는다 — 계측 키는 성공 후에
+        # 그 경로에서 구한다.
+        super().__init__(destination, url, credentials=credentials)
+        self._url = url
+        self._destination = Path(destination)
+        self._filter = filter_spec
+        self._depth = depth
+        self._started = False
+        self._created_destination = not self._destination.exists()
+        # clone은 클래스 메서드라 부모가 만든 엔진을 쓰지 않는다. 취소가
+        # 실제 프로세스를 끊으려면 **실행 중인 그 엔진**을 붙잡아야 한다.
+        self._clone_engine: RemoteEngine | None = None
+        self._cleanup_allowed = self._decide_cleanup_policy()
+
+    def _decide_cleanup_policy(self) -> bool:
+        """대상을 정리해도 되는가 — **시작 전에** 한 번만 판단한다.
+
+        규칙은 하나다: **우리가 넣은 것만 치운다.**
+
+        처음에는 "사용자가 미리 만든 폴더면 내용만 비운다"고 했는데, 그 근거가
+        정반대였다. git은 비어있지 않은 대상을 **거부하고 손도 대지 않으므로**,
+        그 경우 안에 있는 것은 전부 사용자 것이다 — 우리가 만든 부분 생성물은
+        하나도 없다. 그 상태에서 "정리"하면 논문이든 사진이든 통째로 지운다.
+        실측으로 재현된 데이터 손실이었다.
+
+        정리 시점이 아니라 **시작 시점**에 재는 것도 중요하다. 나중에 재면
+        부분 생성물 때문에 항상 "비어있지 않음"이 되어 의도한 정리까지 막힌다.
+        """
+        try:
+            if self._destination.is_symlink():
+                # 링크를 따라가면 삭제가 대상 경로 **밖**에서 일어난다.
+                # 사용자는 무엇이 지워졌는지 짐작조차 못 한다.
+                return False
+            if not self._destination.exists():
+                return True  # 우리가 만들 것이다
+            if not self._destination.is_dir():
+                return False
+            return not any(self._destination.iterdir())  # 비어 있을 때만
+        except OSError:
+            return False  # 읽을 수 없으면 손대지 않는다
+
+    def _operate(self, engine: RemoteEngine) -> TransferStats:
+        from gitclient.infrastructure.remote_engine import RemoteEngine as Engine
+
+        clone_engine = Engine(
+            self._destination.parent, credentials=self._credentials
+        )
+        with self._lock:
+            cancelled = self._cancelled
+            self._clone_engine = clone_engine
+        if cancelled:
+            raise GitClientError("복제가 취소되었습니다.")
+
+        self._started = True
+        return clone_engine.clone_with(
+            self._url,
+            self._destination,
+            filter_spec=self._filter,
+            depth=self._depth,
+        )
+
+    def cancel(self) -> None:
+        super().cancel()
+        # 부모는 자기가 만든 엔진만 끊는다. clone을 실제로 돌리는 것은
+        # 이쪽이므로 함께 끊어야 프로세스가 죽는다.
+        with self._lock:
+            engine = self._clone_engine
+        if engine is not None:
+            engine.abort()
+
+    def run(self) -> None:
+        super().run()
+        if self._succeeded or not self._cleanup_allowed:
+            return
+        if not self._started:
+            # git을 아예 실행하지 않았다 — 치울 부분 생성물이 없다.
+            # (대상이 우리가 만들지 않은 폴더라면 더더욱 손대면 안 된다.)
+            if self._destination.exists() and self._is_our_empty_creation():
+                self._clean_partial_clone()
+            return
+        if self._destination.exists() and not self._has_complete_repository():
+            self._clean_partial_clone()
+
+    def _is_our_empty_creation(self) -> bool:
+        """시작도 못 했는데 남은 것이 있다면 그건 우리가 만든 빈 폴더뿐이다."""
+        try:
+            return self._destination.is_dir() and not any(
+                self._destination.iterdir()
+            )
+        except OSError:
+            return False
+
+    def _has_complete_repository(self) -> bool:
+        """객체는 다 받고 체크아웃만 실패한 경우인가.
+
+        git은 그때 "Clone succeeded, but checkout failed"라 말하고 저장소를
+        남긴다. 여기서 지우면 **이미 치른 전송을 통째로 버리는 것**이라
+        목적함수에 정면으로 어긋난다. 사용자가 `git checkout`으로 마저
+        복구할 수 있는 상태이므로 남긴다.
+        """
+        try:
+            return (self._destination / ".git" / "HEAD").exists()
+        except OSError:
+            return False
+
+    def _clean_partial_clone(self) -> None:
+        """우리가 만든 부분 생성물을 치운다."""
+        import shutil
+        import stat as stat_module
+
+        def force_writable(func, path, _exc):  # noqa: ANN001
+            # git은 Windows에서 팩 파일을 읽기 전용으로 쓴다. 그대로 두면
+            # rmtree가 조용히 실패하고, 같은 자리에 다시 복제할 수 없게 된다.
+            try:
+                os.chmod(path, stat_module.S_IWRITE)
+                func(path)
+            except OSError:
+                pass
+
+        def remove(path: Path) -> None:
+            try:
+                shutil.rmtree(path, onexc=force_writable)
+            except (OSError, TypeError):
+                # onexc는 3.12+. 실패해도 원래 오류를 덮지 않는다.
+                shutil.rmtree(path, ignore_errors=True)
+
+        if self._created_destination:
+            remove(self._destination)
+            return
+
+        # 사용자가 미리 만들어 둔 폴더는 남긴다 — 그들이 만든 것이다.
+        # 내용만 비운다. `_cleanup_allowed`가 **시작 시점에 비어 있었고
+        # 링크가 아님**을 이미 보장하므로, 지금 안에 있는 것은 전부 우리가
+        # 넣은 것이다. 그 보장 없이 이 순회를 돌면 사용자 파일을 지운다.
+        try:
+            for child in self._destination.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    remove(child)
+                else:
+                    try:
+                        os.chmod(child, stat_module.S_IWRITE)
+                    except OSError:
+                        pass
+                    child.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @property
+    def destination(self) -> Path:
+        return self._destination
 
 
 def fast_forward_job(upstream_ref: str, branch: str) -> Callable[[Any], str]:
