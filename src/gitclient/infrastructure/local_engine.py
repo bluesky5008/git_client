@@ -929,6 +929,28 @@ class LocalGitEngine:
                 return None
             return upstream.remote_name, upstream.name
 
+    def ahead_behind(self, branch: str, upstream_ref: str) -> tuple[int, int] | None:
+        """(앞선 커밋 수, 뒤처진 커밋 수). 비교할 수 없으면 None.
+
+        **로컬 질의라 여기(pygit2)에 있다.** 처음에는 `git rev-list --count`로
+        RemoteEngine에 두었는데, 네트워크를 한 바이트도 쓰지 않으면서
+        프로세스 생성 비용만 냈다 — 실측 19ms 대 pygit2 0.002ms. §2.3의
+        엔진 경계(로컬은 pygit2, 네트워크는 CLI)에 어긋났고, UI 스레드에서
+        불리므로 G4 예산 50ms의 40%를 이유 없이 태우고 있었다.
+
+        ADR-2가 CLI를 정당화한 근거는 **전송 바이트를 줄이는 수단**
+        (protocol v2, 필터, 협상 튜닝)인데 이 질의는 그중 어느 것도 쓰지 않는다.
+        """
+        with _translate("ahead/behind 계산"):
+            local = self._repo.references.get(f"refs/heads/{branch}")
+            upstream = self._repo.references.get(upstream_ref)
+            if local is None or upstream is None:
+                return None
+            counts = self._repo.ahead_behind(
+                _peel_to_commit_id(local), _peel_to_commit_id(upstream)
+            )
+            return int(counts[0]), int(counts[1])
+
     def merge_preview(self, upstream_ref: str) -> MergePreview:
         """합치기 전에 무엇이 필요한지 본다. 저장소를 바꾸지 않는다.
 

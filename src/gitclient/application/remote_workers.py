@@ -40,17 +40,33 @@ class RemoteSignals(QObject):
     """GitClientError."""
 
 
-def _repo_key(repo_path: str) -> str:
-    """계측 집계 키 — 정규화된 git 디렉터리.
+def _repo_key(repo_path: str) -> str | None:
+    """계측 집계 키 — 정규화된 git 디렉터리. 저장소가 아니면 None.
 
     사용자가 입력한 경로를 그대로 쓰면 같은 저장소를 다른 표기(하위
     디렉터리, 슬래시 방향, 드라이브 문자 대소문자)로 열 때 누적 집계가
     쪼개진다. workdir이 아니라 git 디렉터리를 쓰는 이유는 bare 저장소에
     workdir이 없기 때문이다. (WriteQueue 키와 같은 취지)
+
+    **탐색을 상위로 올리지 않는다.** `discover_repository`는 부모를 거슬러
+    올라가므로, 기존 저장소 **안**에 복제하려다 실패하면 그 바이트가 감싸는
+    저장소 앞으로 기록된다 — 과소 집계보다 나쁜 오귀속이다(ADR-26).
+    존재하지 않는 경로에는 None을 돌려주는데, 그것을 그대로 `Path()`에
+    넘기면 TypeError로 워커가 죽었다.
     """
     import pygit2
 
-    return str(Path(pygit2.discover_repository(repo_path)).resolve())
+    target = Path(repo_path)
+    if not (target / ".git").exists() and not (target / "HEAD").exists():
+        return None
+    discovered = pygit2.discover_repository(str(target))
+    if not discovered:
+        return None
+    # 상위로 샜는지 확인한다 — 우리가 지목한 저장소가 아니면 기록하지 않는다.
+    resolved = Path(discovered).resolve()
+    if target.resolve() not in (resolved.parent, resolved):
+        return None
+    return str(resolved)
 
 
 class RemoteWorker(QRunnable):
@@ -131,7 +147,7 @@ class RemoteWorker(QRunnable):
             # 통한 자격증명만 저장을 위임한다. 실패한 값을 저장하면 다음
             # 시도가 그 값으로 조용히 거부된다. (ADR-3 — 우리가 쓰지 않는다)
             if self._credentials is not None:
-                url = engine.remote_url(self._remote)
+                url = self._credential_url(engine)
                 if url:
                     engine.remember_credentials(url)
 
@@ -157,6 +173,15 @@ class RemoteWorker(QRunnable):
                     )
                 )
 
+    def _credential_url(self, engine: RemoteEngine) -> str | None:
+        """자격증명을 묶을 주소.
+
+        기본은 원격 **이름**을 주소로 푸는 것이다. clone은 이름이 아직 없어
+        하위 클래스가 주소를 직접 준다 — 이 갈래가 없으면 `remote get-url`이
+        URL을 이름으로 받아 실패하고, 저장 위임이 조용히 건너뛰어진다.
+        """
+        return engine.remote_url(self._remote)
+
     def _record(self, stats: TransferStats) -> None:
         """계측 저장은 실패해도 본 작업의 성공을 뒤집지 않는다.
 
@@ -166,9 +191,10 @@ class RemoteWorker(QRunnable):
         try:
             from gitclient.infrastructure.stats_store import StatsStore
 
-            StatsStore(StatsStore.default_path()).record(
-                _repo_key(self._repo_path), stats
-            )
+            key = _repo_key(self._repo_path)
+            if key is None:
+                return  # 귀속시킬 저장소가 없다 (실패한 복제 등)
+            StatsStore(StatsStore.default_path()).record(key, stats)
         except Exception:  # noqa: BLE001 - 계측은 부가 기능이다
             pass
 
@@ -396,6 +422,10 @@ class CloneWorker(RemoteWorker):
                     child.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _credential_url(self, engine: RemoteEngine) -> str | None:
+        """복제는 원격 이름이 없다 — 사용자가 입력한 주소가 곧 키다."""
+        return self._url
 
     @property
     def destination(self) -> Path:

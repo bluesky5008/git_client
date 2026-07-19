@@ -274,7 +274,11 @@ class RemoteEngine:
         `--force`는 제공하지 않는다. 강제 push는 남의 커밋을 지울 수 있어
         확인 절차가 필요한데, 그 UX는 아직 없다. 없는 편이 낫다.
         """
-        args = ["push", "--progress"]
+        # 서브모듈 재귀는 push에서도 막는다. ADR-20의 근거("계측의 귀속
+        # 단위는 저장소 하나여야 한다")는 방향과 무관한데, 처음엔 결함이
+        # fetch에서 발견돼 fetch에만 넣었다. push도 재귀하면 서브모듈이
+        # 보낸 바이트가 상위 저장소 앞으로 기록된다.
+        args = ["push", "--progress", "--no-recurse-submodules"]
         if set_upstream:
             args.append("--set-upstream")
         args.append("--")
