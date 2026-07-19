@@ -977,13 +977,15 @@ class MainWindow(QMainWindow):
                 "삭제한 파일). 지금 워킹 트리에는 우리 쪽 내용만 있으므로, "
                 "그대로 커밋하면 상대 변경이 버려집니다."
             )
-        self._report(
-            GitClientError(
-                f"충돌 {len(outcome.conflicts)}개를 해결해야 합니다.",
-                detail=detail,
-                action="파일을 정리한 뒤 스테이징하고 커밋하면 병합이 "
-                "완료됩니다. 되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
-            )
+        # 오류 경로로 보내지 않는다 — 충돌은 실패가 아니라 다음 할 일이 있는
+        # 정상 상태다 (§4.10.1, ADR-38). 경고 아이콘에 "오류" 제목으로 띄우면
+        # 사용자는 되돌려야 할 사고로 읽는다.
+        self._notify(
+            "충돌 해결 필요",
+            f"충돌 {len(outcome.conflicts)}개를 해결해야 합니다.",
+            detail=detail,
+            action="파일을 정리한 뒤 스테이징하고 커밋하면 병합이 완료됩니다. "
+            "되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
         )
 
     def _drain_writes(self, *, deadline_ms: int) -> None:
@@ -1387,6 +1389,20 @@ class MainWindow(QMainWindow):
             retry=lambda creds: FetchWorker(path, remote, credentials=creds),
         )
 
+    def _start_merge(self, shorthand: str, is_local: bool) -> None:
+        """참조 하나를 현재 브랜치에 합친다.
+
+        네트워크를 쓰지 않는다 — 이미 가진 것끼리 합치는 순수 로컬 작업이다.
+        """
+        branch = self._current_branch()
+        if self._write_queue is None or branch is None:
+            return
+        prefix = "refs/heads/" if is_local else "refs/remotes/"
+        self._write_queue.submit(
+            f"병합: {shorthand}", merge_job(f"{prefix}{shorthand}", branch)
+        )
+        self._graph_reload_pending = True
+
     def _on_abort_merge(self) -> None:
         """진행 중인 병합을 되돌린다.
 
@@ -1640,6 +1656,44 @@ class MainWindow(QMainWindow):
         parts.append(f"{stats.duration_ms}ms")
         return f"{title} — " + ", ".join(parts)
 
+    def _ref_menu_entries(
+        self, kind, shorthand: str, is_head: bool
+    ) -> list[tuple[str, object]]:  # noqa: ANN001
+        """참조 하나에 붙일 (라벨, 실행) 목록.
+
+        메뉴 구성을 표시와 분리해 둔다 — 모달을 띄우지 않고 "무엇을 할 수
+        있는가"를 확인할 수 있어야 테스트가 실제 사용자 경로를 검증한다.
+        빈 목록이면 메뉴를 띄우지 않는다.
+        """
+        is_local = kind == RefKind.LOCAL_BRANCH.value
+        is_remote = kind == RefKind.REMOTE_BRANCH.value
+        if not (is_local or is_remote) or is_head:
+            return []
+
+        entries: list[tuple[str, object]] = []
+        if is_local:
+            entries.append((
+                f"'{shorthand}' 브랜치로 전환",
+                lambda: self._submit_write(
+                    f"브랜치 전환: {shorthand}",
+                    lambda engine: engine.checkout_branch(shorthand),
+                    reload_graph=True,
+                ),
+            ))
+        # 병합을 시작할 길이 pull 하나뿐이면, 원격을 따라가지 않는 로컬
+        # 기능 브랜치는 앱 안에서 영영 합칠 수 없다 — 가장 흔한 병합인데도
+        # 그렇다 (정합성 감사에서 확정된 기능 공백).
+        entries.append((
+            f"'{shorthand}'을(를) 현재 브랜치에 합치기",
+            lambda: self._start_merge(shorthand, is_local),
+        ))
+        if is_local:
+            entries.append((
+                f"'{shorthand}' 삭제...",
+                lambda: self._confirm_delete_branch(shorthand),
+            ))
+        return entries
+
     def _on_ref_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
         item = self._ref_list.itemAt(pos)
         if item is None:
@@ -1647,26 +1701,25 @@ class MainWindow(QMainWindow):
         kind = item.data(Qt.ItemDataRole.UserRole + 1)
         shorthand = item.data(Qt.ItemDataRole.UserRole + 2)
         is_head = bool(item.data(Qt.ItemDataRole.UserRole + 3))
-        if kind != RefKind.LOCAL_BRANCH.value or shorthand is None:
+        if shorthand is None:
             return
 
         from PySide6.QtWidgets import QMenu
 
+        entries = self._ref_menu_entries(kind, shorthand, is_head)
         menu = QMenu(self)
-        if not is_head:
-            checkout = menu.addAction(f"'{shorthand}' 브랜치로 전환")
-            checkout.triggered.connect(
-                lambda: self._submit_write(
-                    f"브랜치 전환: {shorthand}",
-                    lambda engine: engine.checkout_branch(shorthand),
-                    reload_graph=True,
+        if not entries:
+            if is_head and kind == RefKind.LOCAL_BRANCH.value:
+                menu.addAction("현재 브랜치").setEnabled(False)
+            else:
+                return
+        for label, run in entries:
+            action = menu.addAction(label)
+            if "합치기" in label:
+                action.setEnabled(
+                    not self._merging and self._write_queue is not None
                 )
-            )
-            delete = menu.addAction(f"'{shorthand}' 삭제...")
-            delete.triggered.connect(lambda: self._confirm_delete_branch(shorthand))
-        else:
-            current = menu.addAction("현재 브랜치")
-            current.setEnabled(False)
+            action.triggered.connect(run)
         menu.exec(self._ref_list.mapToGlobal(pos))
 
     def _confirm_delete_branch(self, shorthand: str) -> None:
@@ -1703,4 +1756,24 @@ class MainWindow(QMainWindow):
             box.setInformativeText(error.action)
         if error.detail:
             box.setDetailedText(error.detail)
+        box.exec()
+
+    def _notify(
+        self, title: str, message: str, *, detail: str = "", action: str = ""
+    ) -> None:
+        """오류가 아닌 상태 전이를 알린다.
+
+        충돌이 대표적이다 — git이 할 수 있는 만큼 합쳐 둔 **정상 결과**이지
+        실패가 아니다 (§4.10.1, ADR-38). 경고 아이콘에 제목 "오류"로 띄우면
+        사용자는 무언가 잘못됐다고 읽고, 실제로는 다음 할 일이 있을 뿐인데
+        되돌리려 든다. 오류 경로와 채널을 나눠 그 오독을 막는다.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(title)
+        box.setText(message)
+        if action:
+            box.setInformativeText(action)
+        if detail:
+            box.setDetailedText(detail)
         box.exec()

@@ -1143,26 +1143,30 @@ class LocalGitEngine:
                     ConflictedFile(
                         path=entry.path,
                         side=side,
-                        has_markers=self._has_conflict_markers(entry.path, side),
+                        has_markers=self._has_conflict_markers(side, ours, theirs),
                     )
                 )
             return tuple(sorted(found, key=lambda c: c.path))
 
-    def _has_conflict_markers(self, path: str, side: ConflictSide) -> bool:
-        """워킹 트리 파일에 충돌 마커가 실제로 들어 있는가.
+    def _has_conflict_markers(self, side: ConflictSide, ours, theirs) -> bool:  # noqa: ANN001
+        """워킹 트리 파일에 충돌 마커가 들어가는가.
 
-        추측하지 않고 파일을 본다. 바이너리 충돌에는 마커가 없고, 삭제
-        계열 충돌은 파일이 아예 없을 수도 있다 — 그런데도 "마커를 정리하라"고
-        안내하면 사용자는 있지도 않은 것을 찾게 된다.
+        **blob에게 묻는다 — 워킹 트리 파일을 읽지 않는다.** 마커가 없는 경우는
+        정확히 "libgit2가 3-way 텍스트 병합을 포기했을 때"이고, 그 판단 기준이
+        곧 blob의 바이너리 여부다. 파일 내용을 훑어 `<<<<<<<`를 찾는 방법도
+        되지만, 이 함수는 저장소를 열 때마다 UI 스레드에서 도는 경로에 있다
+        (§3.3 G4: 단일 블로킹 구간 50ms). 충돌 파일이 수백 개인 대형 병합에서
+        파일마다 수십~수백 KB를 읽으면 그 예산을 통째로 넘긴다.
         """
         if side is not ConflictSide.BOTH_MODIFIED and side is not ConflictSide.BOTH_ADDED:
-            return False
-        target = Path(self._repo.workdir or "") / path
-        try:
-            with target.open("rb") as handle:
-                return b"<<<<<<<" in handle.read(1_000_000)
-        except OSError:
-            return False
+            return False  # 삭제 계열은 합칠 상대가 없어 마커도 없다
+        for entry in (ours, theirs):
+            if entry is None:
+                return False
+            blob = self._repo.get(entry.id)
+            if blob is None or getattr(blob, "is_binary", False):
+                return False
+        return True
 
     def abort_merge(self) -> None:
         """진행 중인 병합을 되돌린다.

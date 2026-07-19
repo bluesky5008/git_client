@@ -39,6 +39,12 @@ def window(qtbot, remote: RemoteFixture):  # noqa: ANN001, ANN201
     errors: list = []
     w._report = errors.append
     w.reported_errors = errors
+    # 충돌은 오류가 아니라 정상 상태 전이라 별도 채널로 알린다 (ADR-38).
+    notices: list = []
+    w._notify = lambda title, message, **kw: notices.append(
+        {"title": title, "message": message, **kw}
+    )
+    w.notices = notices
     w.open_repository(str(remote.work))
     qtbot.waitUntil(lambda: not w._loading, timeout=TIMEOUT)
     return w
@@ -98,12 +104,13 @@ class TestConflictIsSurfaced:
 
         window._on_pull()
         settle(window, qtbot)
-        qtbot.waitUntil(lambda: bool(window.reported_errors), timeout=TIMEOUT)
+        qtbot.waitUntil(lambda: bool(window.notices), timeout=TIMEOUT)
 
-        error = window.reported_errors[-1]
-        assert "충돌" in error.message
-        assert "f0.txt" in (error.detail or "")
-        assert error.action is not None
+        notice = window.notices[-1]
+        assert "충돌" in notice["message"]
+        assert "f0.txt" in notice["detail"]
+        assert notice["action"]
+        assert window.reported_errors == [], "충돌을 오류로 보고했다"
 
     def test_abort_action_becomes_available(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
@@ -267,9 +274,65 @@ class TestMarkerlessConflictIsExplained:
 
         window._on_pull()
         settle(window, qtbot)
-        qtbot.waitUntil(lambda: bool(window.reported_errors), timeout=TIMEOUT)
+        qtbot.waitUntil(lambda: bool(window.notices), timeout=TIMEOUT)
 
-        detail = window.reported_errors[-1].detail or ""
+        detail = window.notices[-1]["detail"]
         assert "img.bin" in detail
         assert "충돌 마커가 없습니다" in detail
         assert "버려집니다" in detail
+
+
+class TestMergeEntryPoint:
+    """pull 말고도 병합을 시작할 길이 있어야 한다.
+
+    진입점이 pull 하나뿐이면 원격을 따라가지 않는 로컬 기능 브랜치는 앱
+    안에서 영영 합칠 수 없다 — 가장 흔한 병합인데도.
+    """
+
+    def test_local_branch_offers_merge(
+        self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
+    ) -> None:
+        from gitclient.domain.models import RefKind
+
+        git("branch", "feature", cwd=remote.work)
+        window.open_repository(str(remote.work))
+        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
+
+        labels = [
+            label for label, _ in window._ref_menu_entries(
+                RefKind.LOCAL_BRANCH.value, "feature", False
+            )
+        ]
+
+        assert any("합치기" in label for label in labels), labels
+
+    def test_current_branch_offers_nothing_to_merge_into_itself(
+        self, window  # noqa: ANN001
+    ) -> None:
+        from gitclient.domain.models import RefKind
+
+        assert window._ref_menu_entries(
+            RefKind.LOCAL_BRANCH.value, "main", True
+        ) == []
+
+    def test_merging_a_local_branch_creates_a_merge_commit(
+        self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
+    ) -> None:
+        git("checkout", "--quiet", "-b", "feature", cwd=remote.work)
+        (remote.work / "feature.txt").write_text("기능\n", encoding="utf-8")
+        commit_all(remote.work, "기능 작업")
+        git("checkout", "--quiet", "main", cwd=remote.work)
+        (remote.work / "main.txt").write_text("본선\n", encoding="utf-8")
+        commit_all(remote.work, "본선 작업")
+        window.open_repository(str(remote.work))
+        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
+
+        window._start_merge("feature", is_local=True)
+        settle(window, qtbot)
+
+        parents = git(
+            "rev-list", "--parents", "-n", "1", "HEAD", cwd=remote.work
+        ).stdout.split()
+        assert len(parents) == 3
+        assert (remote.work / "feature.txt").exists()
+        assert (remote.work / "main.txt").exists()
