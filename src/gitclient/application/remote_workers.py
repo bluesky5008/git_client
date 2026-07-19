@@ -109,13 +109,15 @@ class RemoteWorker(QRunnable):
         """결과를 버리고 진행 중인 git 프로세스를 끊는다.
 
         프로세스를 실제로 죽여야 하는 이유: 죽이지 않으면 전역 스레드풀 슬롯이
-        원격 응답까지(최대 `DEFAULT_TIMEOUT_S`) 붙잡힌다. 창을 닫은 뒤에도
+        원격 응답까지(진행이 이어지는 한) 붙잡힌다. 창을 닫은 뒤에도
         프로세스가 남아, 사용자가 앱을 다시 띄우면 두 인스턴스가 같은 계측
         DB에 쓰게 된다.
 
-        중간에 끊어도 저장소가 깨지지 않는다 — fetch는 원격 추적 참조만
-        갱신하고, 받은 객체는 다음 작업에서 재사용된다. push는 원자적이라
-        받아들여졌거나 아니거나 둘 중 하나다.
+        중간에 끊어도 저장소가 깨지지 않는다 — fetch는 원격 추적 참조를
+        마지막에 갱신한다. 다만 **받다 만 팩은 재사용되지 않는다**:
+        index-pack이 완결되기 전에는 임시 파일로만 존재하므로 다음 시도는
+        처음부터 받는다. push는 원자적이라 받아들여졌거나 아니거나 둘 중
+        하나다.
         """
         with self._lock:
             self._cancelled = True
@@ -375,9 +377,28 @@ class CloneWorker(RemoteWorker):
         남긴다. 여기서 지우면 **이미 치른 전송을 통째로 버리는 것**이라
         목적함수에 정면으로 어긋난다. 사용자가 `git checkout`으로 마저
         복구할 수 있는 상태이므로 남긴다.
+
+        **`.git/HEAD`로는 판별할 수 없다.** git은 전송을 시작하기 **전에**
+        저장소 뼈대를 만들므로 HEAD는 t=0부터 존재한다(실측: 복제 시작
+        30ms 안에 생기고 전송 완료는 950ms). 전송 도중 죽은 디렉터리도
+        HEAD를 갖고 있어서, 옛 판별자는 쓸 수 없는 반쪽 저장소를 "완성됨"으로
+        보고 남겼다. 그러면 같은 경로로 다시 시도할 때 git이 "이미 존재하고
+        비어 있지 않다"며 거부해, 사용자가 손으로 지우기 전까지 복제가 아예
+        막힌다 — 바이트를 아끼려다 재시도 자체를 막은 셈이다.
+
+        객체가 실제로 다 왔는지는 **참조가 만들어졌는지**로 본다. git은
+        팩을 완결하고 index-pack이 끝난 뒤에야 참조를 쓴다.
         """
         try:
-            return (self._destination / ".git" / "HEAD").exists()
+            git_dir = self._destination / ".git"
+            if not git_dir.exists():
+                return False
+            if (git_dir / "refs" / "heads").exists() and any(
+                (git_dir / "refs" / "heads").iterdir()
+            ):
+                return True
+            packed = git_dir / "packed-refs"
+            return packed.exists() and packed.stat().st_size > 0
         except OSError:
             return False
 

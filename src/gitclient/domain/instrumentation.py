@@ -40,8 +40,16 @@ _SIZE_UNIT = r"(bytes|byte|[KMGT]iB|[KMGT]B|B)"
 # 크기를 필수로 두면 그런 경우에 **객체 수까지 통째로 놓친다** — 알 수 있는
 # 것마저 "측정 못함"으로 버리는 셈이다. 개수는 받고, 크기는 없으면 None으로
 # 둔다(진짜 측정 실패). 둘은 별개의 사실이다.
+# **100%를 요구하지 않는다.** stall이나 취소로 끊긴 전송은 정의상 100% 이전에
+# 죽는다. 100%를 필수로 두면 회선에 **이미 실린 바이트가 통째로 기록되지
+# 않아**(billed_bytes=None) 누적 전송량이 조용히 과소 집계된다 — 하필 느리고
+# 불안정한 회선에서만 일어나므로 집계표만 봐서는 탐지되지 않는다. ADR-26이
+# 막으려던 바로 그 무기록이다.
+#
+# 진행률 줄은 CR로 덮어쓰이며 순서대로 오고 아래 루프가 마지막 매칭으로
+# 덮어쓰므로, 성공 경로에서는 여전히 마지막 100% 줄의 값이 남는다.
 _RECEIVING = re.compile(
-    r"Receiving objects:\s+100%\s+\((\d+)/(\d+)\)"
+    r"Receiving objects:\s+\d+%\s+\((\d+)/(\d+)\)"
     r"(?:,\s+([\d.]+)\s+" + _SIZE_UNIT +
     r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?)?"
 )
@@ -49,7 +57,7 @@ _RECEIVING = re.compile(
 # push의 대응물. 형태는 같지만 방향이 반대다 — 우리가 **보낸** 바이트다.
 # "Writing objects: 100% (3/3), 429 bytes | 429.00 KiB/s, done."
 _WRITING = re.compile(
-    r"Writing objects:\s+100%\s+\((\d+)/(\d+)\),\s+"
+    r"Writing objects:\s+\d+%\s+\((\d+)/(\d+)\),\s+"
     r"([\d.]+)\s+" + _SIZE_UNIT +
     r"(?:\s*\|\s*([\d.]+)\s+" + _SIZE_UNIT + r"/s)?"
 )

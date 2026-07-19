@@ -45,7 +45,7 @@ class TestEngineBoundary:
 
     def test_ahead_behind_counts_divergence(self, remote: RemoteFixture) -> None:
         remote.diverge()
-        RemoteEngine(remote.work).fetch(timeout_s=TIMEOUT)
+        RemoteEngine(remote.work).fetch(stall_timeout_s=TIMEOUT)
 
         engine = LocalGitEngine.open(str(remote.work))
 
@@ -148,7 +148,7 @@ class TestSubmoduleRecursionIsOffEverywhere:
 
         engine._run_measured = spy  # type: ignore[method-assign]
         remote.commit_locally(1)
-        engine.push(refspecs=["main"], timeout_s=TIMEOUT)
+        engine.push(refspecs=["main"], stall_timeout_s=TIMEOUT)
 
         assert captured, "push가 실행되지 않았다"
         assert "--no-recurse-submodules" in captured[0]
@@ -163,6 +163,6 @@ class TestSubmoduleRecursionIsOffEverywhere:
             return original(args, **kwargs)
 
         engine._run_measured = spy  # type: ignore[method-assign]
-        engine.fetch(timeout_s=TIMEOUT)
+        engine.fetch(stall_timeout_s=TIMEOUT)
 
         assert "--no-recurse-submodules" in captured[0]
