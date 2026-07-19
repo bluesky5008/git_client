@@ -20,6 +20,7 @@ from PySide6.QtCore import QModelIndex, QSettings, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -48,10 +49,11 @@ from gitclient.application.remote_workers import (
 from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
-from gitclient.domain.errors import GitClientError
+from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.domain.instrumentation import OperationKind
 from gitclient.domain.models import MergeKind, Ref, RefKind, RepositoryInfo
 from gitclient.infrastructure.local_engine import LocalGitEngine
+from gitclient.ui.credential_dialog import CredentialDialog
 from gitclient.ui.delegates import DiffDelegate, GraphDelegate, SummaryDelegate
 from gitclient.ui.working_tree_panel import WorkingTreePanel
 from gitclient.viewmodel.commit_graph_model import (
@@ -99,6 +101,9 @@ class MainWindow(QMainWindow):
         # 공유한다. 동시에 돌면 서로의 참조 갱신을 덮어쓸 수 있고, 무엇보다
         # 사용자가 무슨 일이 벌어지는지 알 수 없다.
         self._fetch_worker: RemoteWorker | None = None
+        # 인증 실패 시 같은 작업을 자격증명과 함께 다시 만드는 함수.
+        # 한 번 쓰면 비운다 — 무한히 되묻는 고리를 막는다.
+        self._remote_retry = None
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
         self._current_sha: str | None = None
@@ -1107,7 +1112,14 @@ class MainWindow(QMainWindow):
 
     # -- 공통 실행 경로 -------------------------------------------------
 
-    def _start_remote(self, worker, message: str) -> None:  # noqa: ANN001
+    def _start_remote(self, worker, message: str, *, retry=None) -> None:  # noqa: ANN001
+        """원격 작업 하나를 시작한다.
+
+        `retry`는 자격증명을 받아 같은 작업을 다시 만드는 함수다. 인증은
+        "물어보면 해결되는" 유일한 실패라, 실패 시 되풀이할 방법을 여기서
+        기억해 둔다. None이면 다시 시도하지 않는다.
+        """
+        self._remote_retry = retry
         worker.signals.finished.connect(
             lambda stats, w=worker: self._on_remote_finished(w, stats)
         )
@@ -1164,7 +1176,42 @@ class MainWindow(QMainWindow):
         self._fetch_worker = None
         self._update_remote_actions()
         self._update_status(self._info)
+
+        if isinstance(error, AuthenticationRequired) and self._ask_and_retry(error):
+            return
         self._report(error)
+
+    def _ask_and_retry(self, error: AuthenticationRequired) -> bool:
+        """자격증명을 받아 같은 작업을 한 번 더 시도한다.
+
+        `True`면 재시도를 시작했으므로 오류를 보고하지 않는다 — 사용자가
+        아직 결과를 모르는 상태에서 실패 모달을 띄우면 혼란스럽다.
+
+        **한 번만 되풀이한다.** `retry`를 소비하고 비우므로, 두 번째 실패는
+        그대로 보고된다. 그러지 않으면 틀린 자격증명으로 무한히 되묻는
+        고리가 생긴다.
+        """
+        retry, self._remote_retry = self._remote_retry, None
+        if retry is None or self._repo_path is None:
+            return False
+
+        dialog = CredentialDialog(
+            url=error.url,
+            username=error.username,
+            rejected=error.rejected,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            # 취소는 실패가 아니라 사용자의 선택이다. 모달을 한 번 더 띄우지
+            # 않고 상태바로만 알린다.
+            self.statusBar().showMessage("로그인을 취소했습니다.")
+            return True
+
+        worker = retry(dialog.credentials())
+        if worker is None:
+            return False
+        self._start_remote(worker, "자격증명으로 다시 시도하는 중...")
+        return True
 
     # -- fetch ----------------------------------------------------------
 
@@ -1177,8 +1224,11 @@ class MainWindow(QMainWindow):
         if remote is None:
             return  # 원격이 없으면 액션이 꺼져 있어야 한다
 
+        path = self._repo_path
         self._start_remote(
-            FetchWorker(self._repo_path, remote), "원격에서 가져오는 중..."
+            FetchWorker(path, remote),
+            "원격에서 가져오는 중...",
+            retry=lambda creds: FetchWorker(path, remote, credentials=creds),
         )
 
     # -- push -----------------------------------------------------------
@@ -1199,11 +1249,14 @@ class MainWindow(QMainWindow):
         # 않아 비교만 실패한 경우까지 미설정으로 읽어, 사용자가 지정해 둔
         # 추적 대상(fork 워크플로의 upstream/main 등)을 조용히 덮어쓴다.
         needs_upstream = resolved is None
+        path = self._repo_path
         self._start_remote(
-            PushWorker(
-                self._repo_path, remote, branch, set_upstream=needs_upstream
-            ),
+            PushWorker(path, remote, branch, set_upstream=needs_upstream),
             f"{remote}로 올리는 중...",
+            retry=lambda creds: PushWorker(
+                path, remote, branch,
+                set_upstream=needs_upstream, credentials=creds,
+            ),
         )
 
     # -- pull -----------------------------------------------------------
@@ -1225,8 +1278,11 @@ class MainWindow(QMainWindow):
         if remote is None:
             return
 
+        path = self._repo_path
         self._start_remote(
-            PullWorker(self._repo_path, remote), "가져와 합치는 중..."
+            PullWorker(path, remote),
+            "가져와 합치는 중...",
+            retry=lambda creds: PullWorker(path, remote, credentials=creds),
         )
 
     def _finish_pull(self) -> None:
