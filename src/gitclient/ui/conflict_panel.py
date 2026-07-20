@@ -27,21 +27,9 @@ from PySide6.QtWidgets import (
 
 from gitclient.domain.models import (
     ConflictChoice,
-    ConflictSide,
     RepoOperation,
     conflict_labels,
 )
-
-#: 충돌 종류를 사용자의 말로. git 원문(both modified)으로는 무엇을 골라야
-#: 하는지 알 수 없다 — 특히 한쪽이 지운 경우가 그렇다.
-_SIDE_LABELS = {
-    ConflictSide.BOTH_MODIFIED: "양쪽이 고침",
-    ConflictSide.BOTH_ADDED: "양쪽이 새로 만듦",
-    ConflictSide.DELETED_BY_THEM: "상대가 지움 / 내가 고침",
-    ConflictSide.DELETED_BY_US: "내가 지움 / 상대가 고침",
-    ConflictSide.BOTH_DELETED: "양쪽이 지움",
-}
-
 
 class ConflictPanel(QWidget):
     """충돌 목록과 양쪽 내용, 그리고 한쪽을 고르는 버튼.
@@ -142,6 +130,18 @@ class ConflictPanel(QWidget):
         self._take_theirs.setText(f"{labels.theirs} 사용")
         self._note.setText(labels.note)
         self._note.setVisible(bool(labels.note))
+        # 목록 행에도 주체 이름이 들어가므로 함께 다시 그린다. 라벨만 바꾸고
+        # 목록을 두면 화면 안에서 두 문장이 서로를 반박한다.
+        if self._list.count():
+            self._relabel_rows()
+
+    def _relabel_rows(self) -> None:
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            side = item.data(Qt.ItemDataRole.UserRole + 1)
+            if side is not None:
+                item.setText(f"{path}  —  {self._labels.side_summary(side)}")
 
     def set_conflicts(self, conflicts) -> None:  # noqa: ANN001
         """충돌 목록을 갱신한다. 비어 있으면 패널 자체가 쓸모없다."""
@@ -149,9 +149,15 @@ class ConflictPanel(QWidget):
         self._list.blockSignals(True)
         self._list.clear()
         for conflict in conflicts:
-            label = _SIDE_LABELS.get(conflict.side, "충돌")
+            # **종류 이름도 라벨에서 유도한다.** 여기 상수 표를 두었을 때
+            # 병합 기준 주체("내가 지움 / 상대가 고침")가 리베이스 목록에
+            # 그대로 나와 사실과 **정반대인 행**을 만들었다 — upstream이
+            # 지운 것을 "내가 지움"이라 불렀고, 그것을 믿고 고르면 사용자
+            # 커밋이 사라진다. 버튼만 고치고 목록을 놓친 것이었다 (ADR-68).
+            label = self._labels.side_summary(conflict.side)
             item = QListWidgetItem(f"{conflict.path}  —  {label}")
             item.setData(Qt.ItemDataRole.UserRole, conflict.path)
+            item.setData(Qt.ItemDataRole.UserRole + 1, conflict.side)
             self._list.addItem(item)
         self._list.blockSignals(False)
 

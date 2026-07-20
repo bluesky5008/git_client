@@ -47,6 +47,8 @@ class WorkingTreePanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._head_message: str | None = None
+        # 시퀀서(리베이스·cherry-pick·revert)가 도는 동안 False가 된다.
+        self._commit_allowed = True
         self._build()
         self.set_enabled_for_repo(False)
 
@@ -126,6 +128,18 @@ class WorkingTreePanel(QWidget):
     # ------------------------------------------------------------------
     # 상태 주입 (MainWindow → 패널)
     # ------------------------------------------------------------------
+
+    def set_commit_enabled(self, enabled: bool) -> None:
+        """커밋으로 마무리할 수 있는 상태인가.
+
+        스테이징은 그대로 열어 둔다 — 리베이스 충돌을 해결하려면 파일을
+        스테이징해야 하고, 막는 것은 **마무리 수단**뿐이다. 시퀀서가 도는
+        중에 커밋하면 git이 받아 주기는 하지만(실측) 이후 `--continue`가
+        "가져올 변경이 없으니 건너뛰라"며 방금 만든 커밋을 버리라고
+        안내하는 막다른 길이 된다 (design.md §4.12.4).
+        """
+        self._commit_allowed = enabled
+        self._update_commit_button()
 
     def set_enabled_for_repo(self, enabled: bool) -> None:
         """저장소가 열려 있고 워킹 트리가 있을 때만 조작 가능하다."""
@@ -248,6 +262,7 @@ class WorkingTreePanel(QWidget):
         amend = self._amend_check.isChecked()
         self._commit_button.setEnabled(
             self._message_edit.isEnabled()
+            and self._commit_allowed
             and has_message
             and (has_staged or amend)
         )

@@ -569,3 +569,74 @@ def test_git_messages_carry_no_ansi_escapes(diverged: Path) -> None:
 
     assert ESC not in outcome.message, repr(outcome.message)
     assert "Successfully" in outcome.message, "메시지 자체는 남아야 한다"
+
+
+# ----------------------------------------------------------------------
+# 9. 시퀀서가 도는 동안 HEAD를 옮기지 않는다 (감사에서 확정)
+# ----------------------------------------------------------------------
+
+
+def test_branch_switch_is_refused_during_a_sequencer(diverged: Path) -> None:
+    """리베이스 중 브랜치 전환은 reset과 **같은 위험**이다.
+
+    reset은 막고 있었는데 전환은 열려 있었다. 실측에서 전환 후
+    `--continue`가 엉뚱한 충돌을 냈고, 되돌린 뒤 로그에 커밋이 중복돼
+    남았다 (감사).
+    """
+    engine = LocalGitEngine.open(diverged)
+    engine.rebase("main")
+
+    with pytest.raises(EngineError) as caught:
+        engine.checkout_branch("main")
+
+    assert "리베이스" in str(caught.value)
+    assert engine.current_operation() is RepoOperation.REBASE
+
+
+def test_branch_switch_is_allowed_during_a_merge(diverged: Path) -> None:
+    """병합은 예외다 — git 자신의 판단이 우리 것보다 정확하다.
+
+    시퀀서 상태 파일이 없으므로 어긋날 시퀀서도 없다. 여기까지 막으면
+    git이 허용하는 것을 앱만 거부하게 된다.
+    """
+    git("checkout", "--quiet", "main", cwd=diverged)
+    engine = LocalGitEngine.open(diverged)
+    engine.merge("refs/heads/topic", "main")
+    assert engine.current_operation() is RepoOperation.MERGE
+
+    # 우리 가드는 통과시킨다. 실제 성공 여부는 git이 정한다.
+    try:
+        engine.checkout_branch("topic")
+    except EngineError as exc:
+        assert "진행 중이라 브랜치를 바꿀 수 없습니다" not in str(exc), (
+            "병합까지 우리 가드가 막았다"
+        )
+
+
+def test_discover_failure_becomes_a_domain_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """저장소 **탐색**이 실패해도 raw pygit2 예외가 나가면 안 된다 (§7).
+
+    libgit2는 "못 찾음"만 None으로 주고 권한 거부·I/O 오류는 예외로 올린다.
+    UI의 `except GitClientError`가 잡지 못하면 Qt 이벤트 루프까지 올라간다.
+
+    **권한 거부 디렉터리를 이식 가능하게 만들 수 없어 예외를 주입한다.**
+    검증 대상은 "권한 거부가 실제로 일어나는가"가 아니라 "그런 예외가 왔을
+    때 우리가 번역하는가"이므로 주입으로 충분하다. 없는 경로는 이 경로에
+    닿지 않는다 — 그쪽은 더 앞의 `RepositoryNotFoundError`가 잡는다.
+    """
+    import pygit2
+
+    from gitclient.domain.errors import GitClientError
+
+    target = tmp_path / "repo"
+    target.mkdir()
+
+    def boom(_path):
+        raise pygit2.GitError("permission denied")
+
+    monkeypatch.setattr(pygit2, "discover_repository", boom)
+
+    with pytest.raises(GitClientError):
+        LocalGitEngine.open(target)

@@ -10,10 +10,10 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | 1 | 읽기 전용 — 커밋 그래프, diff 뷰, 브랜치/태그 | ✅ 완료 |
 | 2 | 로컬 쓰기 — stage/commit/branch/stash, 라인 단위 스테이징 | ✅ 완료 |
 | 3 | 원격 통신 — clone/fetch/push + 계측·최적화 | 🚧 clone/fetch/push/pull + 인증 완료 |
-| 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 🚧 병합·충돌 감지 완료 |
+| 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 🚧 증분 1~3 완료 (merge · 충돌 해결 · 히스토리 재작성) |
 | 5 | 다듬기 — 테마, 단축키, 다국어 | 대기 |
 
-테스트 **672개 통과**. 커밋 10만 개 저장소에서 첫 행 표시까지 **469ms** (목표 1,500ms).
+테스트 **742개 통과**(1 skip). 커밋 10만 개 저장소에서 첫 행 표시까지 **493ms** (목표 1,500ms).
 
 ---
 
@@ -95,8 +95,9 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 
 - 원격 관리(추가·삭제·주소 변경) — Phase 3 증분 5
 - 파일시스템 감시 — 외부 CLI 조작은 F5로 수동 갱신
-- 줄 단위로 골라 합치기(양쪽에서 일부씩) — Phase 4 증분 3
-- rebase/cherry-pick/revert/reset — Phase 4 증분 3
+- 줄 단위로 골라 합치기(양쪽에서 일부씩)
+- 인터랙티브 rebase(커밋 재배열·squash), reflog 탐색
+- 테마·단축키·다국어, 배포 패키징 — Phase 5
 
 ---
 
