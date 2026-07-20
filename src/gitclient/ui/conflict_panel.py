@@ -25,7 +25,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gitclient.domain.models import ConflictChoice, ConflictSide
+from gitclient.domain.models import (
+    ConflictChoice,
+    ConflictSide,
+    RepoOperation,
+    conflict_labels,
+)
 
 #: 충돌 종류를 사용자의 말로. git 원문(both modified)으로는 무엇을 골라야
 #: 하는지 알 수 없다 — 특히 한쪽이 지운 경우가 그렇다.
@@ -54,6 +59,9 @@ class ConflictPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._current_path: str | None = None
+        # 양쪽을 뭐라고 부를지는 **진행 중인 연산이 정한다.** 기본값은
+        # 중립적인 이름이고, `set_labels()`로 갱신된다 (ADR-65).
+        self._labels = conflict_labels(RepoOperation.NONE)
 
         self._list = QListWidget()
         self._list.setSelectionMode(
@@ -67,8 +75,8 @@ class ConflictPanel(QWidget):
             view.setReadOnly(True)
             view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
 
-        self._take_ours = QPushButton("내 것 사용")
-        self._take_theirs = QPushButton("상대 것 사용")
+        self._take_ours = QPushButton()
+        self._take_theirs = QPushButton()
         self._take_ours.clicked.connect(
             lambda: self._request(ConflictChoice.OURS)
         )
@@ -79,9 +87,14 @@ class ConflictPanel(QWidget):
         self._hint = QLabel("")
         self._hint.setWordWrap(True)
 
+        self._ours_title = QLabel()
+        self._theirs_title = QLabel()
+        self._note = QLabel()
+        self._note.setWordWrap(True)
+
         panes = QSplitter(Qt.Orientation.Horizontal)
-        panes.addWidget(self._wrap("내 것 (현재 브랜치)", self._ours))
-        panes.addWidget(self._wrap("상대 것 (합치려는 쪽)", self._theirs))
+        panes.addWidget(self._wrap_titled(self._ours_title, self._ours))
+        panes.addWidget(self._wrap_titled(self._theirs_title, self._theirs))
         panes.setSizes([1, 1])
 
         buttons = QHBoxLayout()
@@ -93,19 +106,42 @@ class ConflictPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel("충돌한 파일"))
         layout.addWidget(self._list, 1)
+        layout.addWidget(self._note)
         layout.addWidget(self._hint)
         layout.addWidget(panes, 3)
         layout.addLayout(buttons)
+        self.set_labels(self._labels)
         self.set_conflicts(())
 
     @staticmethod
-    def _wrap(title: str, widget: QWidget) -> QWidget:
+    def _wrap_titled(title: QLabel, widget: QWidget) -> QWidget:
+        """제목이 **나중에 바뀔 수 있는** 상자.
+
+        제목을 문자열로 받아 즉석에서 QLabel을 만들면 나중에 고칠 손잡이가
+        없다. 라벨은 연산에 따라 바뀌므로 위젯을 들고 있어야 한다.
+        """
         box = QWidget()
         layout = QVBoxLayout(box)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(title))
+        layout.addWidget(title)
         layout.addWidget(widget)
         return box
+
+    def set_labels(self, labels) -> None:  # noqa: ANN001 - ConflictLabels
+        """양쪽을 부르는 이름을 갱신한다.
+
+        **이 화면에서 가장 중요한 한 줄이다.** 인덱스의 스테이지 2/3은 연산에
+        상관없이 ours/theirs지만 그 자리에 누가 오는지는 연산마다 다르다.
+        리베이스에서 병합 기준 이름을 쓰면 "내 것 사용" 버튼이 사용자 자신의
+        커밋을 버린다 — 실측으로 확인된 손실이다 (ADR-65).
+        """
+        self._labels = labels
+        self._ours_title.setText(labels.ours)
+        self._theirs_title.setText(labels.theirs)
+        self._take_ours.setText(f"{labels.ours} 사용")
+        self._take_theirs.setText(f"{labels.theirs} 사용")
+        self._note.setText(labels.note)
+        self._note.setVisible(bool(labels.note))
 
     def set_conflicts(self, conflicts) -> None:  # noqa: ANN001
         """충돌 목록을 갱신한다. 비어 있으면 패널 자체가 쓸모없다."""
@@ -148,13 +184,13 @@ class ConflictPanel(QWidget):
             )
         elif not detail.theirs.exists:
             self._hint.setText(
-                "상대가 이 파일을 지웠습니다. '상대 것 사용'을 고르면 "
-                "파일이 삭제됩니다."
+                f"'{self._labels.theirs}' 쪽에는 이 파일이 없습니다. "
+                f"'{self._labels.theirs} 사용'을 고르면 파일이 삭제됩니다."
             )
         elif not detail.ours.exists:
             self._hint.setText(
-                "내가 이 파일을 지웠습니다. '내 것 사용'을 고르면 파일이 "
-                "삭제됩니다."
+                f"'{self._labels.ours}' 쪽에는 이 파일이 없습니다. "
+                f"'{self._labels.ours} 사용'을 고르면 파일이 삭제됩니다."
             )
         else:
             self._hint.setText(
@@ -176,6 +212,25 @@ class ConflictPanel(QWidget):
 
     def _show_empty(self) -> None:
         self._hint.setText("해결할 충돌이 없습니다.")
+        self._ours.setPlainText("")
+        self._theirs.setPlainText("")
+
+    def show_unavailable(self, path: str) -> None:
+        """내용을 읽지 못했다는 사실을 화면에 남긴다.
+
+        **조용히 넘어가면 이전 파일의 내용이 그대로 남는다.** 선택은 B로
+        옮겨졌는데 화면은 A의 내용과 A의 안내를 보여주고, 버튼도 A 기준으로
+        켜진 채다 — 그 상태에서 "사용"을 누르면 사용자는 A용 설명을 읽고
+        **B를** 해결한다. 이 화면이 하려는 일(양쪽을 정확히 이름 붙여
+        보여주기)과 정반대다.
+        """
+        if path != self._current_path:
+            return
+        self._take_ours.setEnabled(False)
+        self._take_theirs.setEnabled(False)
+        self._hint.setText(
+            f"'{path}'의 내용을 읽지 못했습니다. 목록을 새로 고쳐 주세요."
+        )
         self._ours.setPlainText("")
         self._theirs.setPlainText("")
         self._take_ours.setEnabled(False)

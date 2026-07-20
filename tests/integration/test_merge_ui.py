@@ -116,13 +116,13 @@ class TestConflictIsSurfaced:
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
     ) -> None:
         """빠져나갈 길이 없으면 충돌을 보여주는 것만으로는 부족하다."""
-        assert not window._abort_merge_action.isEnabled()
+        assert not window._abort_operation_action.isEnabled()
         make_conflicting_divergence(remote)
 
         window._on_pull()
         settle(window, qtbot)
         qtbot.waitUntil(
-            lambda: window._abort_merge_action.isEnabled(), timeout=TIMEOUT
+            lambda: window._abort_operation_action.isEnabled(), timeout=TIMEOUT
         )
 
     def test_conflicted_files_are_remembered(
@@ -151,12 +151,12 @@ class TestAbortFlow:
             module.QMessageBox, "warning",
             staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard),
         )
-        window._on_abort_merge()
+        window._on_abort_operation()
         settle(window, qtbot)
 
         assert (remote.work / "f0.txt").read_text(encoding="utf-8") == mine
         assert not (remote.work / ".git" / "MERGE_HEAD").exists()
-        assert not window._abort_merge_action.isEnabled()
+        assert not window._abort_operation_action.isEnabled()
 
     def test_cancelling_the_confirmation_keeps_the_merge(
         self, window, qtbot, remote: RemoteFixture, monkeypatch  # noqa: ANN001
@@ -171,11 +171,11 @@ class TestAbortFlow:
             module.QMessageBox, "warning",
             staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel),
         )
-        window._on_abort_merge()
+        window._on_abort_operation()
         settle(window, qtbot)
 
         assert (remote.work / ".git" / "MERGE_HEAD").exists(), "취소했는데 중단됐다"
-        assert window._abort_merge_action.isEnabled()
+        assert window._abort_operation_action.isEnabled()
 
 
 class TestMergeStateSurvivesReopen:
@@ -192,11 +192,11 @@ class TestMergeStateSurvivesReopen:
         window.open_repository(str(remote.work))
         qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
-        assert window._abort_merge_action.isEnabled()
+        assert window._abort_operation_action.isEnabled()
         assert [c.path for c in window._merge_conflicts] == ["f0.txt"]
 
     def test_clean_repository_has_the_action_disabled(self, window) -> None:  # noqa: ANN001
-        assert not window._abort_merge_action.isEnabled()
+        assert not window._abort_operation_action.isEnabled()
         assert window._merge_conflicts == ()
 
 
@@ -220,7 +220,7 @@ class TestNoDeadEnds:
         settle(window, qtbot)
 
         assert window._merge_conflicts == (), "전제가 깨졌다"
-        assert window._abort_merge_action.isEnabled(), "빠져나갈 길이 사라졌다"
+        assert window._abort_operation_action.isEnabled(), "빠져나갈 길이 사라졌다"
 
     def test_pull_and_push_are_locked_during_a_merge(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
@@ -234,7 +234,7 @@ class TestNoDeadEnds:
 
         window._on_pull()
         settle(window, qtbot)
-        qtbot.waitUntil(lambda: window._merging, timeout=TIMEOUT)
+        qtbot.waitUntil(lambda: window._operation.is_active, timeout=TIMEOUT)
 
         assert not window._pull_action.isEnabled()
         assert not window._push_action.isEnabled()
@@ -253,7 +253,7 @@ class TestNoDeadEnds:
 
         window._on_pull()
         settle(window, qtbot)
-        qtbot.waitUntil(lambda: window._merging, timeout=TIMEOUT)
+        qtbot.waitUntil(lambda: window._operation.is_active, timeout=TIMEOUT)
 
         assert window._fetch_action.isEnabled(), (
             "병합 중 fetch를 막으면 나중에 받을 것을 지금 받을 기회를 버린다"
@@ -265,18 +265,18 @@ class TestNoDeadEnds:
         make_conflicting_divergence(remote)
         window._on_pull()
         settle(window, qtbot)
-        qtbot.waitUntil(lambda: window._merging, timeout=TIMEOUT)
+        qtbot.waitUntil(lambda: window._operation.is_active, timeout=TIMEOUT)
 
         monkeypatch.setattr(
             module.QMessageBox, "warning",
             staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard),
         )
-        window._on_abort_merge()
+        window._on_abort_operation()
         settle(window, qtbot)
         qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
         assert window._pull_action.isEnabled(), "중단했는데 잠긴 채로 남았다"
-        assert not window._merging
+        assert not window._operation.is_active
 
 
 class TestMarkerlessConflictIsExplained:

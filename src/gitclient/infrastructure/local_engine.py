@@ -1,7 +1,11 @@
 """pygit2 기반 로컬 Git 엔진.
 
-로컬 읽기 경로 전담이다. 네트워크 작업은 Phase 3에서 별도의 git CLI 엔진이 맡는다.
+로컬 경로 전담이다. 네트워크 작업은 별도의 git CLI 엔진이 맡는다.
 (doc/design.md §2.3 하이브리드 엔진)
+
+**예외가 하나 있다.** 히스토리 재작성(rebase·cherry-pick·revert)만 이 모듈
+안에서 git CLI를 부른다 — pygit2에 rebase가 없고, 시퀀서 상태는 git 자신만
+완전히 이해하기 때문이다 (ADR-67). 그 구획은 아래에 따로 표시해 두었다.
 
 pygit2 타입은 이 모듈 밖으로 새어나가지 않는다. 바깥에는 domain.models의
 순수 파이썬 객체만 전달한다. **예외도 마찬가지다** — raw pygit2 예외가
@@ -13,6 +17,9 @@ pygit2 타입은 이 모듈 밖으로 새어나가지 않는다. 바깥에는 do
 from __future__ import annotations
 
 import logging
+import os
+import re
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -34,6 +41,7 @@ from gitclient.domain.errors import (
     RepositoryNotFoundError,
     RepositoryOpenError,
 )
+from gitclient.infrastructure.remote_engine import INHERITED_ENV_BLOCKLIST
 from gitclient.domain.patch import (
     FilePatch,
     PatchError,
@@ -53,12 +61,17 @@ from gitclient.domain.models import (
     DiffLine,
     DiffLineKind,
     FileChange,
+    HistoryOutcome,
+    HistoryOutcomeKind,
     MergeKind,
     MergeOutcome,
     MergePreview,
     Ref,
+    OperationState,
     RefKind,
+    RepoOperation,
     RepositoryInfo,
+    ResetKind,
     Signature,
     WorkAreaStatus,
     WorkingFileChange,
@@ -87,6 +100,138 @@ def _translate(context: str):
             f"{context} 중 Git 엔진 오류가 발생했습니다.",
             detail=f"{type(exc).__name__}: {exc}",
         ) from exc
+
+# rebase 백엔드가 셋이라 상태 상수도 셋이지만 사용자에게는 하나의 일이다.
+_STATE_TO_OPERATION: dict[object, RepoOperation] = {
+    pygit2.enums.RepositoryState.NONE: RepoOperation.NONE,
+    pygit2.enums.RepositoryState.MERGE: RepoOperation.MERGE,
+    pygit2.enums.RepositoryState.REVERT: RepoOperation.REVERT,
+    pygit2.enums.RepositoryState.REVERT_SEQUENCE: RepoOperation.REVERT,
+    pygit2.enums.RepositoryState.CHERRYPICK: RepoOperation.CHERRY_PICK,
+    pygit2.enums.RepositoryState.CHERRYPICK_SEQUENCE: RepoOperation.CHERRY_PICK,
+    pygit2.enums.RepositoryState.REBASE: RepoOperation.REBASE,
+    pygit2.enums.RepositoryState.REBASE_INTERACTIVE: RepoOperation.REBASE,
+    pygit2.enums.RepositoryState.REBASE_MERGE: RepoOperation.REBASE,
+}
+
+# `--continue` / `--skip` / `--abort`를 받는 명령. 병합은 여기 없다 —
+# 병합을 이어가는 방법은 `--continue`가 아니라 그냥 커밋이다.
+_SEQUENCER_COMMAND: dict[RepoOperation, str] = {
+    RepoOperation.REBASE: "rebase",
+    RepoOperation.CHERRY_PICK: "cherry-pick",
+    RepoOperation.REVERT: "revert",
+}
+
+_RESET_MODES = {
+    ResetKind.SOFT: pygit2.enums.ResetMode.SOFT,
+    ResetKind.MIXED: pygit2.enums.ResetMode.MIXED,
+    ResetKind.HARD: pygit2.enums.ResetMode.HARD,
+}
+
+# 로컬 연산이라 네트워크 같은 정지 판정이 필요 없다. 이 값은 "무한정
+# 붙잡히지 않는다"는 보험이지 성능 목표가 아니다 — 실제 rebase는 수백 개
+# 커밋도 초 단위로 끝난다.
+_HISTORY_TIMEOUT_S = 600
+
+# 원격 경로의 블록리스트는 **저장소 위치** 변수만 걷어낸다. 그쪽은 `-c`로
+# 설정을 덮어쓰므로 그것으로 충분했다. 여기는 `-c`를 쓰지 않으므로(사용자
+# 설정을 살려야 한다, §4.12.2) 같은 논리가 옮겨오지 않는다.
+#
+# 실측으로 확인한 두 가지:
+#   GIT_CONFIG_COUNT/KEY_n/VALUE_n → 임의 설정 주입. `rebase.backend=apply`가
+#     조용히 켜졌다. 사용자 설정을 존중하는 것과 **환경변수로 주입된 설정을
+#     존중하는 것은 다르다** — 후자는 앱을 어디서 띄웠느냐로 동작이 바뀐다.
+#   GIT_COMMITTER_NAME → 재생된 커밋의 커미터가 그대로 바뀌었다. pygit2
+#     경로(create_commit)는 config의 default_signature만 보므로, 같은 앱이
+#     병합 커밋과 리베이스 커밋에 **다른 사람 이름을 적게 된다.**
+_HISTORY_ENV_BLOCKLIST: frozenset[str] = INHERITED_ENV_BLOCKLIST | frozenset(
+    {
+        # 둘 다 단독으로 통하는 주입 경로다 (실측). `GIT_CONFIG_KEY_n`/
+        # `VALUE_n`은 `COUNT` 없이는 무시되므로 따로 막지 않는다 — 막는
+        # 시늉만 하는 코드는 다음 사람이 그 줄을 지웠을 때 아무 일도 일어나지
+        # 않아 "안전하구나"로 잘못 읽게 만든다.
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+    }
+)
+
+
+# **백엔드마다 파일 이름이 다르다.** merge 백엔드는 msgnum/end, apply 백엔드는
+# next/last를 쓴다 (실측). 한쪽 이름만 알면 다른 백엔드에서 진행 표시가 통째로
+# 사라진다 — `rebase.backend=apply`는 설정 한 줄이면 켜지고 상속된
+# `GIT_CONFIG_*`로도 켜진다.
+_REBASE_PROGRESS_FILES = (
+    ("rebase-merge", "msgnum", "end"),
+    ("rebase-apply", "next", "last"),
+)
+
+# git이 뱉는 ANSI 제어 시퀀스. 진행률을 지우려고 `[K`를 섞어 보내는데
+# 그대로 오류 상세에 실으면 사용자에게 깨진 문자로 보인다.
+_ANSI = re.compile(r"\[[0-9;?]*[a-zA-Z]")
+
+
+def _shorthand_of(ref: str | None) -> str | None:
+    """`refs/heads/feature/x` → `feature/x`.
+
+    **마지막 슬래시로 자르면 안 된다.** 슬래시가 든 브랜치 이름은 예외가
+    아니라 기본에 가깝고(이 저장소부터 `feat/...`다), 자르면 배너가 존재하지
+    않는 브랜치를 가리킨다 — "어디로 돌아가는가"가 배너의 존재 이유인데
+    그 답이 틀리는 것이다.
+    """
+    if not ref:
+        return None
+    for prefix in ("refs/heads/", "refs/remotes/"):
+        if ref.startswith(prefix):
+            return ref[len(prefix):]
+    return ref if not ref.startswith("refs/") else None
+
+
+def _read_state_file(base: Path, name: str) -> str | None:
+    """`.git/rebase-merge/` 아래 작은 상태 파일 하나. 못 읽으면 None."""
+    try:
+        return (base / name).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _read_state_number(base: Path, name: str) -> int | None:
+    raw = _read_state_file(base, name)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _message_of(result: subprocess.CompletedProcess[str]) -> str:
+    """사용자에게 보여줄 git의 설명.
+
+    stderr를 먼저 본다. git은 진단을 그쪽에 쓰고 stdout에는 진행 상황을
+    쓴다. 둘 다 비었을 수 있다 (조용히 성공한 경우).
+    """
+    for stream in (result.stderr, result.stdout):
+        text = _ANSI.sub("", stream or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _looks_empty(result: subprocess.CompletedProcess[str]) -> bool:
+    """"커밋할 것이 없다"는 git의 거부인가.
+
+    문구로 판정하는 것은 취약하지만 종료 코드가 이 경우를 구분해 주지
+    않는다(실측: rc=1, 상태 유지 — 진짜 오류와 같다). 놓치면 일반 오류로
+    보여주게 되는데, 그때도 안내가 없을 뿐 데이터는 안전하다.
+    """
+    text = _message_of(result).lower()
+    return "empty" in text and "skip" in text
 
 _STATUS_MAP = {
     "A": ChangeStatus.ADDED,
@@ -169,8 +314,11 @@ def _peel_to_commit_id(reference: pygit2.Reference) -> pygit2.Oid:
 class LocalGitEngine:
     """열려 있는 저장소 하나에 대한 읽기 연산을 제공한다."""
 
-    def __init__(self, repo: pygit2.Repository) -> None:
+    def __init__(self, repo: pygit2.Repository, git_binary: str = "git") -> None:
         self._repo = repo
+        # 히스토리 재작성 구획에서만 쓴다 (ADR-67). 이름을 주입받는 이유는
+        # 테스트가 가짜 git으로 실패 경로를 만들 수 있게 하기 위해서다.
+        self._git = git_binary
 
     @classmethod
     def open(cls, path: str | Path) -> LocalGitEngine:
@@ -1167,27 +1315,18 @@ class LocalGitEngine:
         의미가 있는 기능이 쓰고, 이쪽은 "충돌을 보여주고 해결한다"처럼
         출처를 가리지 않는 기능이 쓴다.
 
-        **다만 rebase·cherry-pick·revert는 제외한다.** 두 가지 이유로
-        지금 보여주면 위험하다:
+        **한때 rebase·cherry-pick·revert를 걸러냈다** (ADR-65). 두 가지가
+        위험했기 때문이다: 스테이지 2/3의 주체가 rebase에서 뒤집혀 "내 것
+        사용"이 사용자 자신의 커밋을 버렸고, `--continue`가 없어 해결해
+        놓고도 마무리를 못 했다. 실측에서 커밋이 조용히 사라졌다.
 
-        1. **스테이지 2/3의 의미가 뒤집힌다.** rebase는 upstream을 체크아웃한
-           뒤 사용자 커밋을 재생하므로 stage 2가 "올라탈 곳", stage 3이
-           "사용자 자신의 커밋"이다. 병합 기준 라벨("내 것"/"상대 것")을 그대로
-           두면 "내 것 사용"이 **사용자의 커밋을 버린다** — 실측으로 확인했고,
-           `rebase --continue`가 성공으로 끝나 커밋이 조용히 사라진다.
-        2. **끝낼 방법이 없다.** 이 앱에는 `rebase --continue`가 없다(증분 3).
-           해결해 놓고 마무리를 못 하는 상태로 사용자를 몰아넣게 된다.
-
-        제대로 다루는 것은 증분 3의 몫이다. 그때까지는 **보여주지 않는 편이
-        낫다** — 반쯤 도와주다 데이터를 잃게 하는 것보다.
+        증분 3에서 둘 다 해소됐다 — 라벨은 `conflict_labels()`가 연산에서
+        유도하고(`OperationState.labels`), 마무리는 `continue_operation()`이
+        맡는다. 그래서 다시 상태를 가리지 않는다. **이 함수를 상태로 거르는
+        방향으로 되돌리려는 사람에게**: 감추는 것은 해결이 아니었다.
+        사용자는 마커가 든 파일을 아무 안내 없이 마주할 뿐이었다.
         """
         with _translate("충돌 목록 조회"):
-            state = self._repo.state()
-            if state not in (
-                pygit2.enums.RepositoryState.NONE,
-                pygit2.enums.RepositoryState.MERGE,
-            ):
-                return ()
             return self._collect_conflicts()
 
     def merge_conflicts(self) -> tuple[ConflictedFile, ...]:
@@ -1442,12 +1581,26 @@ class LocalGitEngine:
     def _require_expected_branch(
         self, head_branch: str | None, expected: str | None
     ) -> None:
-        if expected is not None and head_branch != expected:
+        """실행 시점의 HEAD가 사용자가 보고 고른 그 브랜치인가.
+
+        큐에 브랜치 전환이 먼저 들어 있으면 어긋난다. 문구가 "합치려"였을
+        때는 병합만 이 검사를 썼는데, 지금은 리베이스·cherry-pick·revert·
+        reset도 쓴다 — reset이 "합치려 했지만"이라고 말하면 사용자는 자기가
+        하지 않은 작업의 오류를 읽는다.
+        """
+        if expected is None or head_branch == expected:
+            return
+        if head_branch is None:
             raise EngineError(
-                f"'{expected}'에 합치려 했지만 현재 브랜치가 바뀌었습니다.",
-                detail=f"현재 브랜치: {head_branch}",
-                action="브랜치를 확인한 뒤 다시 시도해 주세요.",
+                "현재 브랜치가 아닌 곳(분리된 HEAD)에서는 할 수 없는 작업입니다.",
+                detail=f"기대한 브랜치: {expected}",
+                action="브랜치를 체크아웃한 뒤 다시 시도해 주세요.",
             )
+        raise EngineError(
+            f"'{expected}'에서 시작한 작업인데 현재 브랜치가 바뀌었습니다.",
+            detail=f"현재 브랜치: {head_branch}",
+            action="브랜치를 확인한 뒤 다시 시도해 주세요.",
+        )
 
     def fast_forward(self, upstream_ref: str, expected_branch: str | None = None) -> str:
         """현재 브랜치를 upstream으로 빨리 감는다. 새 커밋을 만들지 않는다.
@@ -1596,3 +1749,353 @@ class LocalGitEngine:
         if not isinstance(obj, pygit2.Commit):
             raise EngineError(f"커밋이 아닙니다: {sha[:12]}")
         return obj
+
+    # ------------------------------------------------------------------
+    # 히스토리 재작성 (Phase 4 증분 3)
+    #
+    # **이 구획만 git CLI를 쓴다** — 나머지 로컬 경로는 전부 pygit2다.
+    # 근거는 ADR-67. 요약하면: pygit2에 rebase가 아예 없고, 시퀀서 상태
+    # (`.git/rebase-merge/`, `.git/sequencer/`)는 git 자신만 완전히 이해한다.
+    # 시작은 pygit2로 하고 마무리는 CLI로 하는 식의 혼합이 가장 위험하다.
+    # 프로세스 기동 20~40ms는 rebase가 하는 일에 비하면 반올림 오차다.
+    # ------------------------------------------------------------------
+
+    def current_operation(self) -> RepoOperation:
+        """지금 저장소에 진행 중인 히스토리 연산.
+
+        `state()`의 rebase 계열이 셋(REBASE / REBASE_INTERACTIVE /
+        REBASE_MERGE)인 이유는 백엔드가 셋이기 때문이지 사용자에게 다른
+        일이어서가 아니다. 실측한 git은 평범한 `git rebase <upstream>`에도
+        REBASE_INTERACTIVE(8)를 남긴다 — merge 백엔드가 기본이라
+        `interactive` 파일을 쓴다. 하나로 접지 않으면 "리베이스 중"을 놓친다.
+        """
+        with _translate("저장소 상태 조회"):
+            return _STATE_TO_OPERATION.get(self._repo.state(), RepoOperation.OTHER)
+
+    def operation_state(
+        self, *, conflict_count: int | None = None
+    ) -> OperationState:
+        """진행 중인 연산의 배너용 요약.
+
+        UI 스레드에서 불린다.
+
+        **`conflict_count`를 받는 이유는 순전히 예산 때문이다.** 호출부가
+        방금 `index_conflicts()`를 불렀다면 충돌 목록을 이미 만든 것이고,
+        여기서 또 만들면 같은 일을 두 번 한다. 실측에서 충돌 100개짜리
+        저장소의 sync 한 번이 71ms였다 — G4(50ms)를 43% 넘긴다. 중복만
+        걷어내면 절반이 돌아온다.
+        """
+        with _translate("진행 중 작업 조회"):
+            operation = self.current_operation()
+            if operation is RepoOperation.NONE:
+                return OperationState()
+            step, total, branch = self._rebase_progress()
+            if conflict_count is None:
+                conflict_count = len(self._collect_conflicts())
+            return OperationState(
+                operation=operation,
+                step=step,
+                total=total,
+                head_branch=branch or self._head_branch(),
+                conflict_count=conflict_count,
+            )
+
+    def _rebase_progress(self) -> tuple[int | None, int | None, str | None]:
+        """rebase 진행 정보 (현재/전체/원래 브랜치).
+
+        `.git/rebase-merge/`의 msgnum·end·head-name에서 읽는다. rebase는
+        HEAD를 분리시키므로 **`repo.head`로는 원래 브랜치를 알 수 없다** —
+        배너에 "→ topic"을 띄우려면 이 파일이 유일한 출처다.
+
+        파일이 없거나 읽히지 않으면 조용히 None을 준다. 진행 표시가 없는
+        것은 불편할 뿐이지만, 여기서 던지면 배너 자체가 사라진다.
+        """
+        git_dir = Path(self._repo.path)
+        for name, current, total in _REBASE_PROGRESS_FILES:
+            base = git_dir / name
+            if not base.is_dir():
+                continue
+            return (
+                _read_state_number(base, current),
+                _read_state_number(base, total),
+                _shorthand_of(_read_state_file(base, "head-name")),
+            )
+        return None, None, None
+
+    def rebase(
+        self, upstream_ref: str, *, expected_branch: str | None = None
+    ) -> HistoryOutcome:
+        """현재 브랜치의 커밋들을 upstream 위로 옮겨 심는다.
+
+        **커밋 안 된 변경은 git이 지켜준다.** 실측에서 세 연산 모두 더러운
+        워킹 트리를 거부하고 파일을 그대로 남겼다. 우리가 앞서 검사를 덧붙이면
+        git보다 부정확한 판단을 하나 더 얹는 것일 뿐이라 하지 않는다 —
+        거부 사유는 git의 stderr를 그대로 전한다.
+        """
+        self._require_quiet_repository()
+        self._require_expected_branch(self._head_branch(), expected_branch)
+        return self._sequencer(
+            ["rebase", "--", upstream_ref],
+            context="리베이스",
+            expected=RepoOperation.REBASE,
+        )
+
+    def cherry_pick(
+        self, sha: str, *, expected_branch: str | None = None
+    ) -> HistoryOutcome:
+        """다른 곳의 커밋 하나를 현재 브랜치 위에 다시 만든다."""
+        self._require_quiet_repository()
+        self._require_expected_branch(self._head_branch(), expected_branch)
+        commit = self._lookup_commit(sha)
+        return self._sequencer(
+            ["cherry-pick", "--no-edit", str(commit.id)],
+            context="커밋 가져오기",
+            expected=RepoOperation.CHERRY_PICK,
+        )
+
+    def revert(
+        self, sha: str, *, expected_branch: str | None = None
+    ) -> HistoryOutcome:
+        """커밋 하나의 변경을 뒤집는 새 커밋을 만든다.
+
+        히스토리를 고치지 않는다 — 되돌리는 커밋을 **앞에 덧붙인다.**
+        이미 공유된 커밋을 무르는 유일한 안전한 방법이다.
+        """
+        self._require_quiet_repository()
+        self._require_expected_branch(self._head_branch(), expected_branch)
+        commit = self._lookup_commit(sha)
+        return self._sequencer(
+            ["revert", "--no-edit", str(commit.id)],
+            context="되돌리기",
+            expected=RepoOperation.REVERT,
+        )
+
+    def continue_operation(self) -> HistoryOutcome:
+        """해결을 마친 연산을 이어서 진행한다.
+
+        **먼저 남은 충돌을 확인한다.** git도 거부하긴 하지만 그 메시지는
+        영어 한 줄이고, 우리는 몇 개가 남았는지 알고 있다. 사용자가
+        "계속"을 눌렀는데 아무 일도 일어나지 않는 것이 최악이다.
+        """
+        operation = self._require_continuable()
+        remaining = self._collect_conflicts()
+        if remaining:
+            raise EngineError(
+                f"아직 해결되지 않은 충돌이 {len(remaining)}개 있습니다.",
+                detail=", ".join(c.path for c in remaining[:5]),
+                action="충돌 목록에서 각 파일을 해결한 뒤 다시 시도해 주세요.",
+            )
+        return self._sequencer(
+            [_SEQUENCER_COMMAND[operation], "--continue"],
+            context=f"{operation.label} 계속",
+            expected=operation,
+            empty_hint=True,
+        )
+
+    def skip_operation(self) -> HistoryOutcome:
+        """지금 멈춰 있는 커밋을 **버리고** 다음으로 넘어간다.
+
+        파괴적이다 — 재생 중이던 커밋의 변경이 결과에 남지 않는다.
+        호출 전에 §5.2의 확인 절차를 거칠 것.
+        """
+        operation = self._require_continuable()
+        return self._sequencer(
+            [_SEQUENCER_COMMAND[operation], "--skip"],
+            context=f"{operation.label} 건너뛰기",
+            expected=operation,
+        )
+
+    def abort_operation(self) -> None:
+        """진행 중인 연산을 통째로 되돌린다.
+
+        병합은 `abort_merge()`에 맡긴다. 그쪽은 **병합이 건드린 경로만**
+        복구해 무관한 작업을 지키는데, 그 조심스러움은 pygit2로 직접
+        구현한 것이라 CLI 경로로 대체하면 잃는다.
+        """
+        operation = self.current_operation()
+        if operation is RepoOperation.NONE:
+            return
+        if operation is RepoOperation.MERGE:
+            self.abort_merge()
+            return
+        if operation not in _SEQUENCER_COMMAND:
+            raise EngineError(
+                "이 작업은 앱에서 중단할 수 없습니다.",
+                detail=f"저장소 상태: {self._repo.state()!r}",
+                action="git CLI에서 정리해 주세요.",
+            )
+        result = self._run_git(
+            [_SEQUENCER_COMMAND[operation], "--abort"],
+            context=f"{operation.label} 중단",
+            check=False,
+        )
+        if result.returncode != 0:
+            # 중단은 다른 실패의 **탈출구**로 안내되는 경로다(타임아웃 메시지가
+            # 그렇게 말한다). 그 탈출구가 막혔을 때 조치를 주지 않으면
+            # 사용자는 앱 안에서 갈 곳이 없다.
+            raise EngineError(
+                f"{operation.label} 중단에 실패했습니다.",
+                detail=_message_of(result) or f"exit {result.returncode}",
+                action="다른 git 프로세스가 저장소를 쓰고 있을 수 있습니다. "
+                "잠시 후 다시 시도하거나, 계속 실패하면 터미널에서 "
+                f"`git {_SEQUENCER_COMMAND[operation]} --abort`로 정리해 주세요.",
+            )
+
+    def reset_to(
+        self, sha: str, kind: ResetKind, *, expected_branch: str | None = None
+    ) -> None:
+        """현재 브랜치를 다른 커밋으로 옮긴다.
+
+        `HARD`는 **커밋하지 않은 작업을 지운다.** 되돌릴 방법이 없으므로
+        호출 전에 §5.2의 확인 절차가 필요하다. 커밋 자체는 reflog에 남지만
+        워킹 트리는 어디에도 남지 않는다 — 그 비대칭이 이 연산의 위험이다.
+
+        진행 중인 연산 위에서는 거부한다. rebase 도중 reset은 시퀀서가
+        기대하는 HEAD를 어긋내 `--continue`도 `--abort`도 못 하게 만든다.
+
+        **브랜치를 대조한다.** 큐에 브랜치 전환이 먼저 들어 있으면 이 작업이
+        실행될 때 HEAD가 이미 다른 곳이다 — 확인창은 `main`을 말했는데
+        `feature`가 옮겨진다. 다른 파괴적 연산은 되돌릴 여지라도 있지만
+        `HARD`는 커밋 안 된 작업을 지우고 그것은 reflog에도 없다.
+        """
+        self._require_quiet_repository()
+        self._require_expected_branch(self._head_branch(), expected_branch)
+        with _translate("되돌리기"):
+            commit = self._lookup_commit(sha)
+            self._repo.reset(commit.id, _RESET_MODES[kind])
+
+    # -- 내부 -----------------------------------------------------------
+
+    def _require_continuable(self) -> RepoOperation:
+        operation = self.current_operation()
+        if operation not in _SEQUENCER_COMMAND:
+            raise EngineError(
+                "이어서 진행할 작업이 없습니다.",
+                detail=f"저장소 상태: {self._repo.state()!r}",
+                action="병합은 '계속'이 아니라 커밋으로 마무리합니다.",
+            )
+        return operation
+
+    def _sequencer(
+        self,
+        args: list[str],
+        *,
+        context: str,
+        expected: RepoOperation,
+        empty_hint: bool = False,
+    ) -> HistoryOutcome:
+        """시퀀서 명령 하나를 돌리고 **저장소 상태로** 결과를 판정한다.
+
+        종료 코드만 보면 안 된다. rebase는 충돌로 멈출 때도 1을 주고
+        더러운 워킹 트리로 거부할 때도 1을 준다 — 전자는 정상 흐름이고
+        후자는 오류다. 둘을 가르는 것은 `state()`다: 멈췄다면 연산이
+        진행 중으로 남고, 거부됐다면 NONE 그대로다.
+        """
+        result = self._run_git(args, context=context, check=False)
+        state = self.current_operation()
+
+        if state.is_active:
+            conflicts = self._collect_conflicts()
+            if not conflicts and _looks_empty(result):
+                # 충돌 0개인데 멈춰 있다 = 남길 변경이 없다는 뜻이다.
+                # 이것을 CONFLICTED로 돌려주면 화면이 "충돌 0개를 해결해야
+                # 합니다"라는 말이 안 되는 안내를 띄우고, 충돌 패널은 목록이
+                # 비어 있어 나타나지도 않는다 — 사용자가 할 수 있는 일이 없다.
+                raise EngineError(
+                    "가져올 변경이 남아 있지 않습니다.",
+                    detail=_message_of(result),
+                    action=(
+                        "이 커밋을 버리려면 '건너뛰기'를 선택해 주세요."
+                        if empty_hint
+                        else "이 커밋의 변경은 이미 반영되어 있습니다. "
+                        "'중단'으로 정리해 주세요."
+                    ),
+                )
+            return HistoryOutcome(
+                kind=HistoryOutcomeKind.CONFLICTED,
+                operation=state,
+                conflicts=conflicts,
+                message=_message_of(result),
+            )
+
+        if result.returncode != 0:
+            raise EngineError(
+                f"{context}에 실패했습니다.",
+                detail=_message_of(result) or f"exit {result.returncode}",
+                action="위 내용을 확인한 뒤 다시 시도해 주세요.",
+            )
+        return HistoryOutcome(
+            kind=HistoryOutcomeKind.COMPLETED,
+            operation=expected,
+            message=_message_of(result),
+        )
+
+    def _run_git(
+        self, args: list[str], *, context: str, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """저장소 안에서 git 명령 하나를 돌린다. 워커 스레드 전용.
+
+        **편집기를 환경 변수로 막는다.** `-c core.editor=true`로는 부족하다 —
+        GIT_EDITOR가 설정에 우선하므로, 사용자 셸에 `GIT_EDITOR=vim`이 있으면
+        `--continue`가 터미널 없는 GUI 프로세스에서 vim을 띄우려다 워커
+        스레드째로 멈춘다. 시퀀스 편집기도 같은 이유로 함께 막는다.
+
+        시스템·전역 설정은 **걷어내지 않는다.** 여기서 만들어지는 것은
+        사용자의 커밋이라 user.name·user.email이 필요하고,
+        merge.conflictStyle이나 rerere도 사용자가 정한 대로 도는 것이 맞다.
+        (원격 경로가 설정을 통제하는 것은 계측 기준선을 지키기 위해서다.)
+        """
+        workdir = self._repo.workdir
+        if not workdir:
+            raise EngineError(
+                "워킹 트리가 없는 저장소에서는 할 수 없는 작업입니다.",
+                action="bare 저장소가 아닌 사본에서 시도해 주세요.",
+            )
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _HISTORY_ENV_BLOCKLIST
+        }
+        env["GIT_EDITOR"] = "true"
+        env["GIT_SEQUENCE_EDITOR"] = "true"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        # **메시지는 영어로 고정한다.** `_looks_equal`이 아니라 `_looks_empty`가
+        # git의 문구로 "커밋할 것이 없다"를 알아본다 — 번역된 git에서는 그
+        # 판정이 무너져 안내가 일반 오류로 떨어진다. 원격 경로가 진행률
+        # 파싱을 위해 하는 것과 같은 이유다. 로케일은 config가 아니므로
+        # "사용자 설정을 살린다"는 결정과 부딪히지 않는다.
+        env["LC_ALL"] = "C"
+        # (이 줄은 변이 검증으로 지킬 수 없다 — 개발 환경의 git에 번역 카탈로그가
+        # 없어 지워도 테스트가 붉어지지 않는다. 근거는 실측이 아니라 원격
+        # 경로에서 같은 이유로 이미 확인된 것이다.)
+        try:
+            result = subprocess.run(
+                [self._git, "-C", workdir, *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                timeout=_HISTORY_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # git은 상태 파일을 원자적으로 쓰므로 죽여도 저장소는 일관적이다.
+            # 다만 연산이 진행 중으로 남을 수 있어 빠져나갈 길을 알려준다.
+            raise EngineError(
+                f"{context}이(가) {_HISTORY_TIMEOUT_S}초 안에 끝나지 않았습니다.",
+                detail=str(exc),
+                action="작업이 진행 중으로 남아 있다면 '중단'으로 되돌릴 수 있습니다.",
+            ) from exc
+        except OSError as exc:
+            raise EngineError(
+                "git 실행에 실패했습니다.",
+                detail=str(exc),
+                action="git이 설치되어 있고 PATH에 있는지 확인해 주세요.",
+            ) from exc
+
+        if check and result.returncode != 0:
+            raise EngineError(
+                f"{context}에 실패했습니다.",
+                detail=_message_of(result) or f"exit {result.returncode}",
+            )
+        return result

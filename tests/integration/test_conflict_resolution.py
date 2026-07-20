@@ -364,16 +364,18 @@ class TestConflictsFromOtherSources:
         assert engine.merge_conflicts() == ()
 
 
-class TestUnfinishableStatesAreNotShown:
-    """**끝낼 수 없는 상태는 보여주지 않는다.**
+class TestRebaseConflictsAreShownWithHonestLabels:
+    """**감추는 것은 해결이 아니었다** (ADR-65 → 증분 3에서 해제).
 
-    rebase에서는 스테이지 2/3의 의미가 병합과 **반대다** — stage 2가
-    "올라탈 곳"이고 stage 3이 사용자 자신의 커밋이다. 병합 기준 라벨을
-    그대로 두면 "내 것 사용"이 사용자의 커밋을 버리고, `rebase --continue`가
-    성공으로 끝나 조용히 사라진다 (실측).
+    증분 2는 rebase 충돌을 목록에서 뺐다. 스테이지 2/3의 주체가 병합과
+    반대라 "내 것 사용"이 사용자 자신의 커밋을 버렸고(실측: `rebase
+    --continue`가 성공하며 소실), 앱에 `--continue`가 없어 라벨을 고쳐도
+    마무리를 못 했기 때문이다.
 
-    게다가 이 앱에는 `rebase --continue`가 없다(증분 3). 반쯤 도와주다
-    데이터를 잃게 하느니 그때까지는 보여주지 않는다.
+    그런데 감춘 결과 사용자는 **아무 안내 없이 마커가 든 파일을 마주했다.**
+    증분 3에서 두 이유가 모두 해소되어 제한을 푼다. 이 클래스가 지키는 것은
+    "노출한다"가 아니라 **"노출하되 이름이 내용과 맞는다"**이다 — 그 짝이
+    깨지면 옛 손실이 그대로 돌아온다.
     """
 
     def _rebase_conflict(self, tmp_path: Path) -> Path:
@@ -400,22 +402,37 @@ class TestUnfinishableStatesAreNotShown:
         )
         return root
 
-    def test_rebase_conflicts_are_not_listed(self, tmp_path: Path) -> None:
+    def test_rebase_conflicts_are_listed(self, tmp_path: Path) -> None:
+        engine = LocalGitEngine.open(str(self._rebase_conflict(tmp_path)))
+
+        assert [c.path for c in engine.index_conflicts()] == ["f.txt"]
+
+    def test_the_side_called_mine_holds_my_commit(self, tmp_path: Path) -> None:
+        """**이 한 줄이 옛 손실을 막는다.**
+
+        화면이 "내 커밋"이라 부르는 쪽에 정말 사용자의 내용이 있어야 한다.
+        라벨과 내용을 함께 확인하지 않으면 노출을 되살린 것이 곧 결함을
+        되살린 것이 된다.
+        """
         root = self._rebase_conflict(tmp_path)
         engine = LocalGitEngine.open(str(root))
 
-        assert engine.index_conflicts() == (), (
-            "라벨이 뒤집힌 채로 노출하면 '내 것 사용'이 사용자 커밋을 버린다"
-        )
+        state = engine.operation_state()
+        detail = engine.conflict_detail("f.txt")
 
-    def test_the_conflict_really_is_there(self, tmp_path: Path) -> None:
-        """전제 확인 — 충돌이 없어서 빈 게 아니라 일부러 감춘 것이다."""
-        import pygit2
+        assert "내 커밋" in state.labels.theirs
+        assert detail.theirs.text.strip() == "MY OWN WORK"
+        assert "upstream" in state.labels.ours
+        assert detail.ours.text.strip() == "UPSTREAM"
 
-        root = self._rebase_conflict(tmp_path)
-        repo = pygit2.Repository(str(root))
+    def test_merge_specific_view_still_excludes_a_rebase(
+        self, tmp_path: Path
+    ) -> None:
+        """'병합 중단'이 rebase를 되돌리면 시퀀서가 파괴된다."""
+        engine = LocalGitEngine.open(str(self._rebase_conflict(tmp_path)))
 
-        assert repo.index.conflicts is not None
+        assert engine.merge_conflicts() == ()
+        assert not engine.is_merging()
 
 
 class TestSpecialFileTypesAreRefused:

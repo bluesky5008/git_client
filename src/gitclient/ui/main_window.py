@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QInputDialog,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -59,8 +61,15 @@ from gitclient.application.remote_workers import (
     PushWorker,
     RemoteWorker,
     abort_merge_job,
+    abort_operation_job,
+    cherry_pick_job,
+    continue_operation_job,
     resolve_conflict_job,
     fast_forward_job,
+    rebase_job,
+    reset_job,
+    revert_job,
+    skip_operation_job,
     merge_job,
 )
 from gitclient.application.refs_loader import RefsLoader
@@ -69,6 +78,9 @@ from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
+    HistoryOutcome,
+    OperationState,
+    ResetKind,
     ConflictChoice,
     ConflictSide,
     MergeKind,
@@ -177,7 +189,10 @@ class MainWindow(QMainWindow):
         self._prefetch_timer = QTimer(self)
         self._prefetch_timer.timeout.connect(self._maybe_prefetch)
         self._merge_conflicts: tuple = ()
-        self._merging = False
+        # 진행 중인 히스토리 연산. 예전에는 `_merging` 불리언이었는데, 그
+        # 표현으로는 리베이스 중인 저장소가 "아무 일도 없음"으로 보였다 —
+        # pull도 열려 있고 충돌 라벨도 병합 기준이었다 (ADR-65).
+        self._operation = OperationState()
 
 
         # diff 비동기 상태 (§3.3 — 세대 토큰으로 순서 역전을 막는다)
@@ -245,6 +260,29 @@ class MainWindow(QMainWindow):
         self._conflict_box = self._wrap("충돌 해결", self._conflict_panel)
         self._conflict_box.hide()
 
+        # **진행 중인 연산 배너.** 저장소가 리베이스 중이라는 사실은
+        # 저장소에 있는데, 예전에는 화면 어디에도 없었다. 무엇이 진행 중인지와
+        # 빠져나가는 방법을 함께 보여주지 않으면 충돌 화면은 막다른 길이다.
+        self._operation_label = QLabel("")
+        self._operation_label.setWordWrap(True)
+        self._continue_button = QPushButton("계속")
+        self._continue_button.setToolTip("충돌을 모두 해결한 뒤 이어서 진행합니다")
+        self._continue_button.clicked.connect(self._on_continue_operation)
+        self._skip_button = QPushButton("이 커밋 건너뛰기")
+        self._skip_button.setToolTip("멈춰 있는 커밋을 버리고 다음으로 넘어갑니다")
+        self._skip_button.clicked.connect(self._on_skip_operation)
+        self._abort_button = QPushButton("중단")
+        self._abort_button.setToolTip("진행 중인 작업을 시작 이전으로 되돌립니다")
+        self._abort_button.clicked.connect(self._on_abort_operation)
+
+        banner_row = QHBoxLayout()
+        banner_row.addWidget(self._operation_label, 1)
+        for button in (self._continue_button, self._skip_button, self._abort_button):
+            banner_row.addWidget(button)
+        self._operation_banner = QWidget()
+        self._operation_banner.setLayout(banner_row)
+        self._operation_banner.hide()
+
         left_splitter = QSplitter(Qt.Orientation.Vertical)
         left_splitter.addWidget(self._conflict_box)
         left_splitter.addWidget(self._wrap("작업 디렉터리", self._work_panel))
@@ -260,7 +298,12 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([260, 1020])
 
-        self.setCentralWidget(main_splitter)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.addWidget(self._operation_banner)
+        central_layout.addWidget(main_splitter, 1)
+        self.setCentralWidget(central)
 
         # 진행 표시. **느린 회선에서 이게 없으면 앱이 멎은 것처럼 보인다** —
         # 목적 함수가 "사용자가 기다리는 시간"이므로 얼마나 더 기다려야
@@ -271,6 +314,16 @@ class MainWindow(QMainWindow):
         self._progress_bar.setTextVisible(False)
         self._progress_bar.hide()
         self.statusBar().addPermanentWidget(self._progress_bar)
+
+        # **빠져나갈 길.** 대기 시간이 목적 함수인데(ADR-56) 진행 중인 작업을
+        # 멈출 방법이 없으면, 잘못 누른 큰 clone 앞에서 사용자가 할 수 있는
+        # 일은 앱을 강제 종료하는 것뿐이다. 취소 경로는 이미 있었고(저장소
+        # 전환·창 닫기가 쓴다) 버튼만 없었다.
+        self._cancel_button = QPushButton("중단")
+        self._cancel_button.setToolTip("진행 중인 원격 작업을 멈춥니다")
+        self._cancel_button.clicked.connect(self._on_cancel_remote)
+        self._cancel_button.hide()
+        self.statusBar().addPermanentWidget(self._cancel_button)
 
         # 전송량은 임시 메시지로 띄우면 곧바로 다른 메시지에 덮인다 — 특히
         # fetch 직후의 그래프 재로딩에. 사용자가 방금 치른 대기의 규모를
@@ -320,6 +373,8 @@ class MainWindow(QMainWindow):
         view.setColumnWidth(Column.SHA, 80)
 
         view.selectionModel().currentRowChanged.connect(self._on_commit_selected)
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(self._on_commit_context_menu)
         return view
 
     def _build_diff_view(self) -> QListView:
@@ -412,12 +467,12 @@ class MainWindow(QMainWindow):
         )
         self._prefetch_action.toggled.connect(self._set_prefetch_enabled)
 
-        self._abort_merge_action = QAction("병합 중단", self)
-        self._abort_merge_action.setToolTip(
+        self._abort_operation_action = QAction("진행 중인 작업 중단", self)
+        self._abort_operation_action.setToolTip(
             "진행 중인 병합을 되돌립니다 (워킹 트리가 병합 이전으로 복구됩니다)"
         )
-        self._abort_merge_action.triggered.connect(self._on_abort_merge)
-        self._abort_merge_action.setEnabled(False)
+        self._abort_operation_action.triggered.connect(self._on_abort_operation)
+        self._abort_operation_action.setEnabled(False)
 
         self._pull_action = QAction("가져와 합치기 (Pull)", self)
         self._pull_action.setToolTip("원격의 변경을 가져와 현재 브랜치에 합칩니다")
@@ -443,7 +498,7 @@ class MainWindow(QMainWindow):
         repo_menu.addSeparator()
         repo_menu.addAction(self._prefetch_action)
         repo_menu.addSeparator()
-        repo_menu.addAction(self._abort_merge_action)
+        repo_menu.addAction(self._abort_operation_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._branch_action)
         repo_menu.addSeparator()
@@ -568,7 +623,7 @@ class MainWindow(QMainWindow):
             action.setEnabled(has_workdir)
 
         self._update_remote_actions()
-        self._sync_merge_state()
+        self._sync_operation_state()
 
         # 배경 미리 가져오기를 건다. 열자마자가 아니라 조금 뒤에 시작해
         # 사용자가 지금 하려는 일과 회선을 두고 다투지 않게 한다.
@@ -1084,6 +1139,13 @@ class MainWindow(QMainWindow):
         def _ok(jid: int, _done_name: str, result: object) -> None:
             if jid != job_id:
                 return
+            if queue is not self._write_queue:
+                # 저장소를 바꾼 뒤 도착한 이전 저장소의 결과다. job_id만
+                # 대조하면 통과해 버리고, `reload_graph`가 **지금 보고 있는**
+                # 저장소의 재로딩 플래그를 세운다 — 다음 쓰기가 끝날 때
+                # 화면이 통째로 다시 그려지며 선택과 스크롤이 초기화된다.
+                _cleanup()
+                return
             _cleanup()
             if reload_graph:
                 # 성공했을 때만 재로딩한다. 제출 시점에 플래그를 세우면
@@ -1095,6 +1157,9 @@ class MainWindow(QMainWindow):
         def _fail(jid: int, _done_name: str, _error: object) -> None:
             if jid != job_id:
                 return
+            if queue is not self._write_queue:
+                _cleanup()
+                return
             _cleanup()
 
         queue.job_succeeded.connect(_ok)
@@ -1103,26 +1168,47 @@ class MainWindow(QMainWindow):
     def _on_write_succeeded(
         self, queue: WriteQueue, name: str, result: object
     ) -> None:
-        """쓰기 작업이 끝났다. 병합만 결과를 들여다본다.
+        """쓰기 작업이 끝났다. 충돌을 남긴 결과만 들여다본다.
 
         **충돌은 실패 시그널로 오지 않는다** — git이 할 수 있는 만큼 합친
         정상 결과이기 때문이다. 그래서 여기서 값을 보고 분기한다.
+
+        병합과 히스토리 연산이 서로 다른 결과 타입을 쓰는 이유는 마무리하는
+        방법이 다르기 때문이다: 병합은 커밋으로, 나머지는 '계속'으로 끝난다.
         """
         if queue is not self._write_queue:
             return  # 교체된 저장소의 늦은 결과
-        if isinstance(result, MergeOutcome) and result.is_conflicted:
+        if isinstance(result, (MergeOutcome, HistoryOutcome)) and result.is_conflicted:
             self._enter_conflict_mode(result)
 
-    def _enter_conflict_mode(self, outcome: MergeOutcome) -> None:
+    def _enter_conflict_mode(self, outcome) -> None:  # noqa: ANN001
         """충돌 상태를 화면에 드러낸다.
 
         여기서 조용히 넘어가면 사용자는 워킹 트리에 충돌 마커가 든 줄도
         모른 채 작업을 이어간다 — 그 상태로 커밋하면 마커가 그대로 들어간다.
         """
         self._merge_conflicts = outcome.conflicts
-        self._merging = True
-        self._abort_merge_action.setEnabled(True)
-        self._update_remote_actions()
+        # **저장소에게 다시 묻는다.** 결과 객체에 연산 종류가 실려 오지만,
+        # 배너·라벨·버튼을 세우려면 진행 정보(몇 번째 커밋인지)도 필요하고
+        # 그것은 저장소에만 있다. 무엇보다 라벨을 여기서 손으로 정하면
+        # 병합 기준 이름이 리베이스 화면에 남는 그 결함이 돌아온다.
+        if self._engine is not None:
+            try:
+                self._operation = self._engine.operation_state(
+                    conflict_count=len(self._merge_conflicts)
+                )
+            except GitClientError:
+                # **조용히 넘어가면 안 된다.** 옛 값(대개 NONE)이 남으면
+                # 충돌 패널은 뜨는데 배너는 숨고, 라벨은 중립 기본값으로
+                # 떨어진다 — 리베이스 화면에서 "내 것 사용"이 다시 사용자
+                # 커밋을 가리키고(ADR-65) 빠져나갈 버튼도 함께 사라진다.
+                # 이 증분이 존재하는 이유 두 가지가 한 번에 무너지는 조합이라,
+                # 결과 객체가 아는 만큼이라도 세워 둔다.
+                self._operation = OperationState(
+                    operation=outcome.operation,
+                    conflict_count=len(self._merge_conflicts),
+                )
+        self._apply_operation_state()
         summary = ", ".join(c.path for c in outcome.conflicts[:3])
         if len(outcome.conflicts) > 3:
             summary += f" 외 {len(outcome.conflicts) - 3}개"
@@ -1148,12 +1234,21 @@ class MainWindow(QMainWindow):
         # 오류 경로로 보내지 않는다 — 충돌은 실패가 아니라 다음 할 일이 있는
         # 정상 상태다 (§4.10.1, ADR-38). 경고 아이콘에 "오류" 제목으로 띄우면
         # 사용자는 되돌려야 할 사고로 읽는다.
+        # 마무리하는 방법이 연산마다 다르다. 병합에 맞춘 "커밋하면 완료"를
+        # 리베이스에서 그대로 말하면 사용자는 커밋을 만들어 시퀀서를 어긋내고,
+        # 그 다음에는 `--continue`도 통하지 않는다.
+        if self._operation.operation.can_continue:
+            finish = (
+                f"파일을 정리한 뒤 스테이징하고 위쪽 '계속'을 누르면 "
+                f"{self._operation.operation.label}이(가) 이어집니다."
+            )
+        else:
+            finish = "파일을 정리한 뒤 스테이징하고 커밋하면 병합이 완료됩니다."
         self._notify(
             "충돌 해결 필요",
             f"충돌 {len(outcome.conflicts)}개를 해결해야 합니다.",
             detail=detail,
-            action="파일을 정리한 뒤 스테이징하고 커밋하면 병합이 완료됩니다. "
-            "되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
+            action=f"{finish} 되돌리려면 위쪽 '중단'을 눌러 주세요.",
         )
 
     def _drain_writes(self, *, deadline_ms: int) -> None:
@@ -1184,11 +1279,17 @@ class MainWindow(QMainWindow):
             return  # 교체된 저장소의 늦은 idle
         if self._graph_reload_pending and self._repo_path is not None:
             self._graph_reload_pending = False
-            self.open_repository(self._repo_path)  # 여기서 병합 상태도 다시 읽는다
+            # 여기서 진행 중 상태도 다시 읽는다. 다만 `open_repository`가
+            # 초입에서 실패하면(저장소 삭제, index.lock 점유) 거기까지 가지
+            # 못하고 플래그는 이미 소비돼 배너가 직전 상태로 굳는다.
+            self.open_repository(self._repo_path)
+            if self._engine is not None:
+                return
+            self._sync_operation_state()
             return
         # 쓰기 하나로 병합이 끝났을 수 있다(마지막 충돌을 해결한 커밋). 저장소에
         # 다시 물어야 중단 메뉴와 원격 액션이 실제 상태와 어긋나지 않는다.
-        self._sync_merge_state()
+        self._sync_operation_state()
         self._refresh_status()
         self._update_status(self._info)
 
@@ -1366,8 +1467,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _prompt_new_branch(self) -> None:
-        from PySide6.QtWidgets import QInputDialog
-
         name, ok = QInputDialog.getText(self, "새 브랜치", "브랜치 이름:")
         name = name.strip()
         if not ok or not name:
@@ -1458,6 +1557,7 @@ class MainWindow(QMainWindow):
         )
         self._fetch_worker = worker
         self._reset_progress()
+        self._cancel_button.show()
         self._update_remote_actions()
         self.statusBar().showMessage(message)
         self._pool.start(worker)
@@ -1511,8 +1611,27 @@ class MainWindow(QMainWindow):
             parts.append(f"{_format_bytes(snapshot.bytes_per_s)}/s")
         return "  ".join(parts)
 
+    def _on_cancel_remote(self) -> None:
+        """진행 중인 원격 작업을 멈춘다.
+
+        **확인을 받지 않는다.** 중단은 되돌릴 수 없는 작업이 아니다 —
+        받다 만 팩은 버려지지만 저장소는 그대로고, 다시 누르면 된다.
+        멈추고 싶어 누른 버튼에 다시 묻는 것은 그 자체로 방해다.
+        """
+        worker = self._fetch_worker
+        if worker is None:
+            return
+        # 워커를 먼저 놓아준다 — 그래야 늦게 오는 결과가 정체 가드에 걸린다.
+        self._fetch_worker = None
+        self._remote_retry = None  # 취소했는데 인증을 되물으면 안 된다
+        self._reset_progress()
+        self._update_remote_actions()
+        self.statusBar().showMessage("중단하는 중...")
+        worker.cancel()
+
     def _reset_progress(self) -> None:
         """진행 표시를 치운다. 새 작업 시작과 작업 종료 양쪽에서 부른다."""
+        self._cancel_button.hide()
         self._progress_bar.hide()
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
@@ -1553,7 +1672,7 @@ class MainWindow(QMainWindow):
             return  # 사용자 작업 중이거나 이전 prefetch가 아직 돈다
         if self._write_queue is not None and self._write_queue.is_busy:
             return
-        if self._merging:
+        if self._operation.is_active:
             return  # 병합 중에는 저장소를 조용히 두는 편이 낫다
 
         remote = self._fetch_remote()
@@ -1625,11 +1744,11 @@ class MainWindow(QMainWindow):
         # 줄어든다. pull·push는 저장소 상태가 거부하므로 계속 잠근다.
         available = self._has_remotes() and idle
         self._fetch_action.setEnabled(available)
-        self._pull_action.setEnabled(available and not self._merging)
+        self._pull_action.setEnabled(available and not self._operation.is_active)
         # push는 워킹 트리가 있어야 의미가 있다(bare 저장소는 올릴 것이 없다).
         has_workdir = self._info is not None and self._info.workdir is not None
         self._push_action.setEnabled(
-            available and has_workdir and not self._merging
+            available and has_workdir and not self._operation.is_active
         )
 
     def _on_remote_finished(self, worker, stats) -> None:  # noqa: ANN001
@@ -1754,8 +1873,10 @@ class MainWindow(QMainWindow):
         try:
             self._conflict_panel.show_detail(self._engine.conflict_detail(path))
         except GitClientError:
-            # 그 사이 해결됐거나 저장소가 바뀌었다 — 다음 동기화가 정리한다.
-            pass
+            # 그 사이 해결됐거나 저장소가 바뀌었다. **조용히 넘어가지 않는다** —
+            # 그러면 이전 파일의 내용과 안내가 그대로 남아, 사용자가 A의
+            # 설명을 읽으며 B를 해결하게 된다 (ADR-65와 같은 부류의 오도).
+            self._conflict_panel.show_unavailable(path)
 
     def _on_resolve_conflict(self, path: str, choice) -> None:  # noqa: ANN001
         """한쪽을 골라 충돌을 해결한다.
@@ -1780,7 +1901,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Cancel,
             )
             if answer is not QMessageBox.StandardButton.Discard:
-                self._sync_merge_state()  # 잠가둔 버튼을 되살린다
+                self._sync_operation_state()  # 잠가둔 버튼을 되살린다
                 return
 
         label = "내 것" if choice is ConflictChoice.OURS else "상대 것"
@@ -1817,41 +1938,17 @@ class MainWindow(QMainWindow):
             return False
         return data not in (detail.ours.data, detail.theirs.data)
 
-    def _on_abort_merge(self) -> None:
-        """진행 중인 병합을 되돌린다.
+    def _sync_operation_state(self) -> None:
+        """저장소에 진행 중인 연산이 있는지 확인해 UI 전체에 반영한다.
 
-        **되돌릴 수 없는 작업이다** — 충돌 마커를 편집한 내용도, 충돌 없이
-        이미 반영된 변경도 전부 사라진다. 그래서 확인을 받는다.
-        """
-        if self._write_queue is None:
-            return
-        answer = QMessageBox.warning(
-            self,
-            "병합 중단",
-            "진행 중인 병합을 되돌립니다.\n\n"
-            "워킹 트리가 병합 이전 상태로 복구되며, 충돌을 해결하던 내용은 "
-            "사라집니다. 이 작업은 되돌릴 수 없습니다.",
-            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Discard:
-            return
-        self._merge_conflicts = ()
-        self._abort_merge_action.setEnabled(False)
-        self._write_queue.submit("병합 중단", abort_merge_job())
-        self._graph_reload_pending = True
-
-    def _sync_merge_state(self) -> None:
-        """저장소가 병합 중인지 확인해 UI에 반영한다.
-
-        앱을 껐다 켜거나 다른 저장소를 열어도 병합은 **저장소에 남아 있다** —
-        메모리 상태만 믿으면 중단 메뉴가 꺼진 채로 갇힌다.
+        앱을 껐다 켜거나 다른 저장소를 열어도 리베이스는 **저장소에 남아
+        있다** — 메모리 상태만 믿으면 배너가 뜨지 않고 중단 메뉴도 꺼진 채로
+        갇힌다. 그래서 저장소에게 묻는다.
         """
         if self._engine is None:
             self._merge_conflicts = ()
-            self._merging = False
-            self._abort_merge_action.setEnabled(False)
-            self._update_remote_actions()
+            self._operation = OperationState()
+            self._apply_operation_state()
             return
         try:
             # **출처를 가리지 않는다.** 충돌은 병합에서만 생기지 않는다 —
@@ -1859,17 +1956,58 @@ class MainWindow(QMainWindow):
             # 상태로 걸러내면 그 충돌이 화면에서 사라져, 사용자는 아무 안내
             # 없이 마커가 든 파일을 마주한다 (§13-2).
             self._merge_conflicts = self._engine.index_conflicts()
-            self._merging = self._engine.is_merging()
+            # 충돌을 이미 셌으므로 넘겨준다 — 엔진이 다시 세면 UI 스레드에서
+            # 같은 일을 두 번 하게 되고, 충돌이 많은 저장소에서 G4를 넘긴다.
+            self._operation = self._engine.operation_state(
+                conflict_count=len(self._merge_conflicts)
+            )
         except GitClientError:
             self._merge_conflicts = ()
-            self._merging = False
+            self._operation = OperationState()
+        self._apply_operation_state()
+
+    def _apply_operation_state(self) -> None:
+        """`self._operation`을 화면에 옮긴다. 이 함수만 위젯을 만진다."""
+        state = self._operation
+        active = state.is_active
+
+        # **쓰기가 도는 동안에는 전부 잠근다.** 확인은 제출 **전에** 받는데
+        # 제출 후에도 버튼이 살아 있으면 같은 확인을 두 번 통과할 수 있다.
+        # `git rebase --skip`은 idempotent가 아니라서, 두 번 누르면 커밋이
+        # **두 개** 사라진다 — 두 번째 확인창은 첫 번째와 같은 커밋을
+        # 설명하지만 실제로 버려지는 것은 그 다음 커밋이다 (리뷰 실측).
+        # 계속은 파괴적이진 않지만 성공 직후에 "이어서 진행할 작업이
+        # 없습니다" 오류를 띄워 리베이스가 실패한 것처럼 보이게 한다.
+        busy = self._write_queue is not None and self._write_queue.is_busy
+
         # 충돌 목록이 아니라 **저장소 상태**로 판단한다. 사용자가 마지막
-        # 충돌을 해결해 스테이징하면 목록은 비지만 병합은 아직 진행 중이고,
+        # 충돌을 해결해 스테이징하면 목록은 비지만 작업은 아직 진행 중이고,
         # 그때도 중단할 수 있어야 한다.
-        self._abort_merge_action.setEnabled(self._merging)
-        # **패널은 저장소 상태에서 나온다.** 이전에는 병합이 충돌로 끝나는
-        # 순간의 모달이 전부였고, 앱을 다시 켜면 저장소는 병합 중인데 화면에
-        # 아무 흔적이 없었다 (§13-3).
+        # **중단할 수 있는 것만 중단을 내준다.** bisect처럼 우리가 다루지
+        # 않는 상태에서 버튼을 내주면 누를 때마다 오류만 돌아온다.
+        abortable = state.operation.can_abort
+        self._abort_operation_action.setEnabled(abortable and not busy)
+        self._abort_operation_action.setText(
+            f"{state.operation.label} 중단" if active else "진행 중인 작업 중단"
+        )
+        self._abort_button.setVisible(abortable)
+
+        self._operation_label.setText(state.summary())
+        self._operation_banner.setVisible(active)
+
+        # 병합은 `--continue`가 아니라 커밋으로 마무리한다. 버튼을 내주면
+        # 누를 때마다 "이어서 진행할 작업이 없습니다"만 돌아온다.
+        self._continue_button.setVisible(state.operation.can_continue)
+        self._skip_button.setVisible(state.operation.can_continue)
+        # 남은 충돌이 있으면 '계속'은 반드시 거부당한다 — 눌리게 두는 것은
+        # 실패를 한 번 더 겪게 하는 것일 뿐이다.
+        self._continue_button.setEnabled(not state.has_conflicts and not busy)
+        self._skip_button.setEnabled(not busy)
+        self._abort_button.setEnabled(not busy)
+
+        # **라벨이 먼저다.** 목록보다 먼저 세워야 사용자가 첫 화면에서부터
+        # 올바른 이름을 본다 (ADR-65).
+        self._conflict_panel.set_labels(state.labels)
         self._conflict_panel.set_conflicts(self._merge_conflicts)
         self._conflict_box.setVisible(bool(self._merge_conflicts))
         self._update_remote_actions()
@@ -2110,6 +2248,10 @@ class MainWindow(QMainWindow):
             f"'{shorthand}'을(를) 현재 브랜치에 합치기",
             lambda: self._start_merge(shorthand, is_local),
         ))
+        entries.append((
+            f"'{shorthand}' 위로 현재 브랜치 리베이스...",
+            lambda: self._start_rebase(shorthand, is_local),
+        ))
         if is_local:
             entries.append((
                 f"'{shorthand}' 삭제...",
@@ -2127,10 +2269,9 @@ class MainWindow(QMainWindow):
         if shorthand is None:
             return
 
-        from PySide6.QtWidgets import QMenu
-
         entries = self._ref_menu_entries(kind, shorthand, is_head)
         menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         if not entries:
             if is_head and kind == RefKind.LOCAL_BRANCH.value:
                 menu.addAction("현재 브랜치").setEnabled(False)
@@ -2138,9 +2279,10 @@ class MainWindow(QMainWindow):
                 return
         for label, run in entries:
             action = menu.addAction(label)
-            if "합치기" in label:
+            if "합치기" in label or "리베이스" in label:
                 action.setEnabled(
-                    not self._merging and self._write_queue is not None
+                    not self._busy_with_history()
+                    and self._write_queue is not None
                 )
             action.triggered.connect(run)
         menu.exec(self._ref_list.mapToGlobal(pos))
@@ -2200,3 +2342,223 @@ class MainWindow(QMainWindow):
         if detail:
             box.setDetailedText(detail)
         box.exec()
+
+    # -- 진행 중인 히스토리 연산 (Phase 4 증분 3) -----------------------
+
+    def _start_rebase(self, upstream: str, is_local: bool = True) -> None:
+        """현재 브랜치를 다른 브랜치 위로 옮겨 심는다.
+
+        §5.2 원칙 2에 따라 무엇이 벌어지는지 먼저 말한다. 병합과 달리
+        **기존 커밋이 새 커밋으로 대체된다** — 이미 공유한 브랜치에서
+        하면 다른 사람의 히스토리와 어긋난다.
+        """
+        branch = self._current_branch()
+        if self._write_queue is None or branch is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "리베이스",
+            f"'{branch}'의 커밋들을 '{upstream}' 위로 옮겨 심습니다.\n\n"
+            "기존 커밋은 같은 내용의 새 커밋으로 대체됩니다. 이미 원격에\n"
+            "올린 브랜치라면 다른 사람의 히스토리와 어긋나므로 강제 푸시가\n"
+            "필요해집니다.\n\n계속할까요?",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        # **완전한 참조를 넘긴다.** `_start_merge`와 같은 이유다 — shorthand는
+        # 같은 이름의 태그가 있으면 모호하게 해석된다. 사용자가 브랜치를
+        # 골랐는데 태그 위로 옮겨 심는 일이 있어서는 안 된다.
+        prefix = "refs/heads/" if is_local else "refs/remotes/"
+        self._submit_write(
+            f"리베이스: {upstream}",
+            rebase_job(f"{prefix}{upstream}", branch),
+            reload_graph=True,
+        )
+
+    def _on_cherry_pick(self, sha: str) -> None:
+        if self._write_queue is None:
+            return
+        self._submit_write(
+            f"커밋 가져오기: {sha[:7]}",
+            cherry_pick_job(sha, self._current_branch()),
+            reload_graph=True,
+        )
+
+    def _on_revert(self, sha: str) -> None:
+        if self._write_queue is None:
+            return
+        self._submit_write(
+            f"되돌리는 커밋: {sha[:7]}",
+            revert_job(sha, self._current_branch()),
+            reload_graph=True,
+        )
+
+    def _on_reset(self, sha: str) -> None:
+        """현재 브랜치를 고른 커밋으로 옮긴다.
+
+        **세 방식의 위험도가 다르다.** 그 차이를 버튼 이름이 아니라 설명으로
+        말한다 — soft/mixed/hard는 git을 아는 사람에게만 뜻이 통한다
+        (§5.2 원칙 2).
+        """
+        if self._write_queue is None:
+            return
+        # **라벨 문자열을 키로 되받지 않는다.** 번역이나 오타 수정으로 라벨이
+        # 한 글자만 달라져도 KeyError가 나고, 슬롯에서 난 예외는 트레이스백만
+        # 찍힌 채 삼켜져 사용자에게는 "눌렀는데 아무 일도 안 일어남"이 된다.
+        choices = (
+            ("커밋만 되돌리기 (변경은 스테이징된 채로 남김)", ResetKind.SOFT),
+            ("커밋과 스테이징 되돌리기 (파일 내용은 그대로)", ResetKind.MIXED),
+            ("전부 버리기 (파일 내용까지 되돌림 — 되돌릴 수 없음)", ResetKind.HARD),
+        )
+        label, accepted = QInputDialog.getItem(
+            self,
+            "커밋으로 되돌리기",
+            f"현재 브랜치를 {sha[:7]}(으)로 옮깁니다.\n어디까지 되돌릴까요?",
+            [text for text, _ in choices],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        kind = next((k for text, k in choices if text == label), ResetKind.MIXED)
+        if kind.discards_working_tree:
+            # 커밋은 reflog에 남지만 **워킹 트리는 어디에도 남지 않는다.**
+            # 그 비대칭이 이 연산의 진짜 위험이라 그것만 따로 말한다.
+            answer = QMessageBox.warning(
+                self,
+                "전부 버리기",
+                "커밋하지 않은 변경이 모두 사라집니다.\n\n"
+                "커밋 자체는 git reflog로 되찾을 수 있지만, 커밋하지 않은\n"
+                "작업은 어디에도 남지 않습니다. 이 작업은 되돌릴 수 없습니다.",
+                QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Discard:
+                return
+        self._submit_write(
+            f"되돌리기: {sha[:7]}",
+            reset_job(sha, kind, self._current_branch()),
+            reload_graph=True,
+        )
+
+    def _on_continue_operation(self) -> None:
+        if self._write_queue is None:
+            return
+        self._submit_write(
+            f"{self._operation.operation.label} 계속",
+            continue_operation_job(),
+            reload_graph=True,
+        )
+        self._apply_operation_state()  # 제출 즉시 버튼을 잠근다
+
+    def _on_skip_operation(self) -> None:
+        """멈춰 있는 커밋을 버리고 다음으로 넘어간다. 파괴적이라 확인한다."""
+        if self._write_queue is None:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "이 커밋 건너뛰기",
+            "지금 멈춰 있는 커밋을 버리고 다음으로 넘어갑니다.\n\n"
+            "그 커밋의 변경은 결과에 남지 않습니다.\n"
+            "커밋 자체는 `git reflog`에 남아 터미널에서 되찾을 수 있습니다.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Discard:
+            return
+        self._submit_write(
+            f"{self._operation.operation.label} 건너뛰기",
+            skip_operation_job(),
+            reload_graph=True,
+        )
+        self._apply_operation_state()  # 제출 즉시 버튼을 잠근다
+
+    def _on_abort_operation(self) -> None:
+        """진행 중인 연산을 통째로 되돌린다.
+
+        **되돌릴 수 없는 작업이다** — 충돌을 해결하던 내용도, 충돌 없이
+        이미 반영된 변경도 사라진다. 그래서 확인을 받는다.
+        """
+        if self._write_queue is None:
+            return
+        operation = self._operation.operation
+        if not operation.is_active:
+            return
+        answer = QMessageBox.warning(
+            self,
+            f"{operation.label} 중단",
+            f"진행 중인 {operation.label}을(를) 되돌립니다.\n\n"
+            "워킹 트리가 시작 이전 상태로 복구되며, 충돌을 해결하던 내용은 "
+            "사라집니다.\n\n"
+            "이미 만들어진 커밋은 `git reflog`에 남지만, 충돌을 풀며 편집한 "
+            "내용은 커밋 전이라 어디에도 남지 않습니다.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Discard:
+            return
+        self._merge_conflicts = ()
+        self._submit_write(
+            f"{operation.label} 중단", abort_operation_job(), reload_graph=True
+        )
+        # **위젯을 손으로 만지지 않는다.** 예전에는 메뉴 액션만 끄고 배너
+        # 버튼과 충돌 패널은 그대로 뒀는데, 그러면 방금 비운 `_merge_conflicts`와
+        # 화면의 목록이 어긋나 사용자가 유령 행에서 "내 것 사용"을 눌러
+        # 중단 뒤에 해결 작업을 하나 더 큐에 넣을 수 있었다.
+        self._apply_operation_state()
+
+    def _busy_with_history(self) -> bool:
+        """지금 새 히스토리 연산을 시작하면 안 되는가.
+
+        **`_operation`만으로는 부족하다.** 그 값은 `_sync_operation_state()`가
+        돌 때만 갱신되는데, 리베이스를 제출하고 서브프로세스가 도는 동안에는
+        아직 한 번도 돌지 않았다 — 저장소는 이미 리베이스 중인데 화면의
+        기록은 `NONE`이라 메뉴가 cherry-pick을 그대로 내줬다 (리뷰 실측).
+        엔진이 결국 거부하므로 저장소는 안전하지만, 사용자에게는 "메뉴가
+        있어서 눌렀는데 오류"가 된다.
+        """
+        if self._operation.is_active:
+            return True
+        return self._write_queue is not None and self._write_queue.is_busy
+
+    def _commit_menu_entries(self, sha: str) -> list[tuple[str, object]]:
+        """커밋 하나에 붙일 (라벨, 실행) 목록.
+
+        `_ref_menu_entries`와 같은 이유로 표시와 분리한다 — 모달 없이
+        "무엇을 할 수 있는가"를 확인할 수 있어야 테스트가 실제 경로를 본다.
+        """
+        if self._write_queue is None or self._busy_with_history():
+            # 진행 중인 연산 위에 또 다른 연산을 얹으면 git이 거부하거나
+            # (좋은 경우) 시퀀서 상태가 어긋난다. 아예 내주지 않는다.
+            return []
+        return [
+            (f"'{sha[:7]}' 커밋 가져오기 (cherry-pick)",
+             lambda: self._on_cherry_pick(sha)),
+            (f"'{sha[:7]}' 되돌리는 커밋 만들기 (revert)",
+             lambda: self._on_revert(sha)),
+            (f"'{sha[:7]}'(으)로 되돌리기 (reset)...",
+             lambda: self._on_reset(sha)),
+        ]
+
+    def _on_commit_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
+        index = self._commit_view.indexAt(pos)
+        if not index.isValid():
+            return
+        commit = index.data(CommitRole.COMMIT)
+        if commit is None:
+            return
+        sha = commit.sha
+        entries = self._commit_menu_entries(sha)
+        if not entries:
+            return
+        menu = QMenu(self)
+        # **닫히면 스스로 사라지게 한다.** 그러지 않으면 우클릭 한 번마다
+        # QMenu와 QAction이 MainWindow의 자식으로 쌓인다 (실측: 20회 우클릭에
+        # 메뉴 20개, 액션 103개). 커밋 목록은 가장 자주 우클릭하는 곳이다.
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        for label, run in entries:
+            menu.addAction(label).triggered.connect(run)
+        menu.exec(self._commit_view.viewport().mapToGlobal(pos))
