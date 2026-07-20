@@ -363,10 +363,15 @@ class ConflictChoice(Enum):
     """충돌을 해결할 때 어느 쪽을 남길 것인가."""
 
     OURS = "ours"
-    """현재 브랜치의 것."""
+    """인덱스 스테이지 2.
+
+    **"현재 브랜치의 것"이 아니다.** 리베이스에서는 올라탈 곳(upstream)이고
+    사용자 자신의 커밋은 반대쪽이다. 사람이 읽을 이름은 언제나
+    `conflict_labels(operation)`에서 가져올 것 (ADR-68).
+    """
 
     THEIRS = "theirs"
-    """합치려는 쪽의 것."""
+    """인덱스 스테이지 3. OURS와 같은 주의가 필요하다."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,8 +458,41 @@ class ConflictLabels:
     theirs: str
     """스테이지 3. git이 부르는 이름은 언제나 "theirs"다."""
 
+    ours_short: str = ""
+    """좁은 자리(목록 행)용 짧은 이름. 비면 `ours`를 쓴다."""
+
+    theirs_short: str = ""
+
     note: str = ""
     """이 연산에서 방향이 헷갈릴 때 덧붙일 한 줄. 없으면 빈 문자열."""
+
+    def side_summary(self, side: ConflictSide) -> str:
+        """충돌 종류를 **이 연산의 주체 이름으로** 풀어 쓴다.
+
+        한때 이 문장들을 UI에 상수 표로 적어 뒀는데, 병합 기준 주체
+        ("내가 지움 / 상대가 고침")가 리베이스에서 그대로 나와 **사실과
+        정반대인 행**을 만들었다 — upstream이 지운 것을 "내가 지움"이라
+        불렀다. 버튼 라벨만 고치고 목록 라벨을 놓쳤던 것이고, ADR-65의
+        손실 경로가 그대로 재현됐다 (감사에서 실측).
+
+        그래서 종류 이름도 라벨에서 유도한다. 주체가 없는 종류
+        (양쪽이 고침 등)만 고정 문구를 쓴다.
+        """
+        ours = self.ours_short or self.ours
+        theirs = self.theirs_short or self.theirs
+        if side is ConflictSide.DELETED_BY_THEM:
+            return f"{theirs} 쪽이 지움 / {ours} 쪽이 고침"
+        if side is ConflictSide.DELETED_BY_US:
+            return f"{ours} 쪽이 지움 / {theirs} 쪽이 고침"
+        return _NEUTRAL_SIDE_LABELS.get(side, "충돌")
+
+
+#: 주체가 없는 충돌 종류 — 연산과 무관하게 같은 말이다.
+_NEUTRAL_SIDE_LABELS = {
+    ConflictSide.BOTH_MODIFIED: "양쪽이 고침",
+    ConflictSide.BOTH_ADDED: "양쪽이 새로 만듦",
+    ConflictSide.BOTH_DELETED: "양쪽이 지움",
+}
 
 
 # **여기가 유일한 출처다.** 스테이지 번호는 고정이지만(2=ours, 3=theirs) 그
@@ -475,24 +513,34 @@ _CONFLICT_LABELS = {
     RepoOperation.MERGE: ConflictLabels(
         ours="내 것 (현재 브랜치)",
         theirs="상대 것 (합치는 쪽)",
+        ours_short="내가",
+        theirs_short="상대가",
     ),
     RepoOperation.REBASE: ConflictLabels(
         ours="올라탈 곳 (upstream)",
         theirs="재생 중인 내 커밋",
+        ours_short="upstream",
+        theirs_short="내 커밋",
         note="리베이스에서는 방향이 병합과 반대입니다 — "
         "내가 쓴 변경은 오른쪽입니다.",
     ),
     RepoOperation.CHERRY_PICK: ConflictLabels(
         ours="현재 브랜치",
         theirs="가져오는 커밋",
+        ours_short="현재 브랜치",
+        theirs_short="가져오는 커밋",
     ),
     RepoOperation.REVERT: ConflictLabels(
         ours="현재 브랜치",
         theirs="되돌린 결과",
+        ours_short="현재 브랜치",
+        theirs_short="되돌린 결과",
     ),
 }
 
-_DEFAULT_LABELS = ConflictLabels(ours="내 것", theirs="상대 것")
+_DEFAULT_LABELS = ConflictLabels(
+    ours="내 것", theirs="상대 것", ours_short="내가", theirs_short="상대가"
+)
 
 
 def conflict_labels(operation: RepoOperation) -> ConflictLabels:

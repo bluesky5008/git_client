@@ -534,3 +534,187 @@ def test_failed_detail_does_not_leave_the_previous_file_on_screen(
     assert not panel._take_ours.isEnabled()
     assert not panel._take_theirs.isEnabled()
     assert "읽지 못했습니다" in panel._hint.text()
+
+
+def test_list_row_names_the_right_actor(window, repo: Path, qtbot) -> None:
+    """**목록 행의 주체 이름도 연산을 따른다.**
+
+    버튼 라벨만 고치고 목록 라벨을 상수 표에 남겨 뒀을 때, 리베이스에서
+    "upstream이 지운" 파일을 "내가 지움"이라 불렀다 — 사실과 정반대이고,
+    그것을 믿고 고르면 ADR-65와 같은 경로로 사용자 커밋이 사라진다.
+    감사에서 실측으로 재현된 결함이다.
+    """
+    # 삭제/수정 충돌을 만들려면 **공통 조상에 파일이 있어야 한다.**
+    # 그러지 않으면 한쪽의 단순 추가라 충돌이 나지 않는다.
+    root = repo.parent / "delmod"
+    root.mkdir()
+    git("init", "--quiet", "-b", "main", str(root))
+    write(root / "gone.txt", "base\n")
+    commit_all(root, "base")
+    git("checkout", "--quiet", "-b", "topic", cwd=root)
+    write(root / "gone.txt", "내가 고친 내용\n")
+    commit_all(root, "내가 고침")
+    git("checkout", "--quiet", "main", cwd=root)
+    git("rm", "--quiet", "gone.txt", cwd=root)
+    commit_all(root, "upstream이 지움")
+    git("checkout", "--quiet", "topic", cwd=root)
+
+    window.open_repository(str(root))
+    qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
+    LocalGitEngine.open(root).rebase("main")
+    window._sync_operation_state()
+
+    rows = [
+        window._conflict_panel._list.item(i).text()
+        for i in range(window._conflict_panel._list.count())
+    ]
+    gone = next(r for r in rows if "gone.txt" in r)
+
+    assert "upstream 쪽이 지움" in gone, gone
+    assert "내 커밋 쪽이 고침" in gone, gone
+    assert "내가 지움" not in gone, "병합 기준 주체가 리베이스 목록에 남았다"
+
+
+def test_merge_list_rows_keep_merge_actors(window, repo: Path) -> None:
+    """리베이스에 맞춰 전부 뒤집지 않았는지 — 병합 목록은 그대로여야 한다."""
+    start_merge(repo)
+    window._sync_operation_state()
+
+    rows = [
+        window._conflict_panel._list.item(i).text()
+        for i in range(window._conflict_panel._list.count())
+    ]
+    assert rows, "충돌 행이 있어야 한다"
+    assert all("upstream" not in r for r in rows), rows
+
+
+def test_panel_survives_either_call_order(qtbot) -> None:
+    """`set_labels`와 `set_conflicts`의 **순서에 의존하지 않는다.**
+
+    지금 유일한 호출자는 라벨을 먼저 세우지만, 공개 API가 반대 순서를
+    허용하는 한 다음 호출자가 반대로 부를 수 있다. 그때 목록 행만 옛 주체
+    이름으로 남으면 화면 안에서 두 문장이 서로를 반박한다 — H1이 정확히
+    그 모습이었다.
+    """
+    from gitclient.domain.models import (
+        ConflictedFile,
+        ConflictSide,
+        RepoOperation,
+        conflict_labels,
+    )
+    from gitclient.ui.conflict_panel import ConflictPanel
+
+    panel = ConflictPanel()
+    qtbot.addWidget(panel)
+    conflicts = (
+        ConflictedFile(path="x.txt", side=ConflictSide.DELETED_BY_US),
+    )
+
+    # 반대 순서: 목록을 먼저 채우고 라벨을 나중에 바꾼다
+    panel.set_conflicts(conflicts)
+    panel.set_labels(conflict_labels(RepoOperation.REBASE))
+
+    row = panel._list.item(0).text()
+    assert "upstream 쪽이 지움" in row, row
+    assert "내가 지움" not in row, "옛 주체 이름이 목록에 남았다"
+
+
+# ----------------------------------------------------------------------
+# 7. 감사에서 확정된 UI 결함들
+# ----------------------------------------------------------------------
+
+
+def test_broken_upstream_config_does_not_kill_the_app(window, repo: Path) -> None:
+    """**앱이 죽던 경로다.**
+
+    `_upstream()`이 던지면 호출부 넷이 try 밖이라 Qt 슬롯까지 올라가고,
+    이 앱에는 `sys.excepthook`이 없어 프로세스가 그대로 끝난다. 상태바
+    갱신 경로라 새로 고침마다 지나간다 (감사 실측).
+    """
+    from gitclient.domain.errors import EngineError
+
+    def boom():
+        raise EngineError("upstream 조회 실패")
+
+    window._engine.upstream_of_head = boom
+
+    assert window._ahead_behind() is None
+    window._describe_divergence()   # 던지면 여기서 실패한다
+    window._update_remote_actions()
+    window._refresh_status()
+
+
+def test_commit_is_locked_during_a_sequencer(window, repo: Path) -> None:
+    """시퀀서 중 커밋은 막다른 길로 이어진다.
+
+    git은 받아 주지만 이후 '계속'이 "가져올 변경이 없으니 건너뛰라"며
+    방금 만든 커밋을 버리라고 안내한다 (감사 실측, design.md §4.12.4).
+    """
+    panel = window._work_panel
+    start_rebase(repo)
+    window._sync_operation_state()
+
+    assert not panel._commit_allowed, "리베이스 중 커밋이 열려 있다"
+    assert panel._unstaged_list.isEnabled(), "스테이징까지 막으면 해결을 못 한다"
+
+
+def test_commit_stays_open_during_a_merge(window, repo: Path) -> None:
+    """병합은 반대다 — 커밋이 **유일한** 마무리 수단이라 열려 있어야 한다."""
+    start_merge(repo)
+    window._sync_operation_state()
+
+    assert window._work_panel._commit_allowed
+
+
+def test_branch_switch_menu_is_locked_during_a_sequencer(
+    window, repo: Path
+) -> None:
+    """엔진이 거부하는 것을 메뉴가 내주면 "눌렀는데 오류"가 된다."""
+    entries = window._ref_menu_entries("local_branch", "main", False)
+    assert any("전환" in label for label, _ in entries), "평소에는 있어야 한다"
+
+    start_rebase(repo)
+    window._sync_operation_state()
+
+    # 메뉴 항목 자체는 남지만 비활성이어야 한다 — 그 판단은
+    # `_busy_with_history()`가 한다.
+    assert window._busy_with_history()
+
+
+def test_amend_asks_before_replacing_the_commit(
+    window, repo: Path, monkeypatch
+) -> None:
+    """amend는 히스토리 재작성인데 확인창이 없었다 (§5.2 원칙 2).
+
+    체크박스 하나와 버튼 하나, 두 번의 클릭으로 HEAD가 교체됐다.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    shown: list = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        lambda *a, **k: (shown.append(a[2]), QMessageBox.StandardButton.Cancel)[1],
+    )
+    before = git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+    window._on_commit_requested("고친 메시지", True)
+
+    assert shown, "확인창이 뜨지 않았다"
+    assert "reflog" in shown[0], "되찾는 방법을 말해야 한다"
+    assert git("rev-parse", "HEAD", cwd=repo).stdout.strip() == before, (
+        "취소했는데 커밋이 바뀌었다"
+    )
+
+
+def test_plain_commit_is_not_interrupted(window, repo: Path, monkeypatch) -> None:
+    """평범한 커밋까지 물으면 확인창이 소음이 된다."""
+    from PySide6.QtWidgets import QMessageBox
+
+    shown: list = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a))
+    write(repo / "new.txt", "내용\n")
+    LocalGitEngine.open(repo).stage_file("new.txt")
+
+    window._on_commit_requested("새 커밋", False)
+
+    assert shown == []

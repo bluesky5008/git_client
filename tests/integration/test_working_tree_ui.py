@@ -153,8 +153,14 @@ class TestStagingCycle:
         assert window.reported_errors == []
 
     def test_amend_rewrites_head_summary(
-        self, window, qtbot, repo  # noqa: ANN001
+        self, window, qtbot, repo, monkeypatch  # noqa: ANN001
     ) -> None:
+        # amend는 히스토리 재작성이라 확인창을 거친다 (§5.2 원칙 2).
+        # 헤드리스에서 모달을 그대로 두면 `exec()`가 돌아오지 않아 멈춘다 —
+        # 확인 절차 자체는 test_history_ops_ui.py가 따로 본다.
+        monkeypatch.setattr(
+            QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok
+        )
         window._work_panel.commit_requested.emit("고쳐 쓴 첫 커밋", True)
         qtbot.waitUntil(
             lambda: window._commit_model.rowCount() == 1

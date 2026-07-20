@@ -1324,6 +1324,12 @@ class MainWindow(QMainWindow):
         # 거부와 이중 방어다 (리뷰에서 확정된 결함 — 연타 시 중복 커밋).
         if self._write_queue is None or self._write_queue.is_busy:
             return
+        # **amend는 히스토리 재작성이다.** HEAD 커밋이 새 커밋으로 교체되고
+        # 원래 것은 reflog에만 남는다 — 위험 등급이 리베이스와 같은데
+        # 확인창은 리베이스에만 있었다. 기본 화면에서 체크박스 하나와 버튼
+        # 하나, 두 번의 클릭으로 도달한다 (§5.2 원칙 2).
+        if amend and not self._confirm_amend():
+            return
         name = "커밋 수정" if amend else "커밋"
         self._submit_write(
             name,
@@ -1331,6 +1337,28 @@ class MainWindow(QMainWindow):
             reload_graph=True,
             on_success=lambda _sha: self._work_panel.clear_message(),
         )
+
+    def _confirm_amend(self) -> bool:
+        """마지막 커밋을 교체하기 전에 확인받는다.
+
+        무엇이 사라지는지와 되찾는 방법을 함께 말한다 (§5.2 원칙 2).
+        이미 푸시한 커밋을 고치면 다른 사람의 히스토리와 어긋난다는 것이
+        amend에서 가장 자주 겪는 사고다.
+        """
+        head = self._engine.head_message() if self._engine is not None else ""
+        summary = (head or "").splitlines()[0] if head else ""
+        detail = f"\n\n바뀔 커밋: {summary}" if summary else ""
+        answer = QMessageBox.warning(
+            self,
+            "마지막 커밋 수정",
+            "마지막 커밋을 새 커밋으로 **교체**합니다." + detail + "\n\n"
+            "원래 커밋은 `git reflog`에 남지만 목록에서는 사라집니다.\n"
+            "이미 원격에 올린 커밋이라면 다른 사람의 히스토리와 어긋나므로\n"
+            "강제 푸시가 필요해집니다.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Ok
 
     def _on_workdir_diff_requested(self, path: str, staged: bool) -> None:
         if self._repo_path is None:
@@ -1519,6 +1547,7 @@ class MainWindow(QMainWindow):
         """현재 브랜치가 따라가는 (원격 이름, 원격 추적 참조).
 
         규약(`<origin>/<브랜치명>`)으로 **추측하지 않고** 설정을 읽는다.
+
         추측하면 두 가지가 조용히 깨진다:
           - fork 워크플로(origin=내 fork, upstream=원본)에서 엉뚱한 ref를
             대상으로 삼고 "이미 최신"이라 답한다
@@ -1526,8 +1555,21 @@ class MainWindow(QMainWindow):
             `refs/remotes/<remote>/HEAD`가 만들어진다. 이 참조는 모든 clone에
             존재하고 원격 기본 브랜치를 가리키므로, bisect 중인 사용자의
             HEAD가 조용히 그쪽으로 끌려간다.
+
+        **던지지 않는다.** 호출부 다섯 곳 중 넷이 `try` 밖이고, 그중
+        `_describe_divergence()`는 새로 고침마다 도는 상태바 경로다.
+        `branch.<n>.merge`가 깨진 저장소를 열면 Qt 슬롯에서 예외가 터지는데
+        이 앱에는 `sys.excepthook`이 없어 **프로세스가 그대로 죽는다**
+        (감사에서 실측). 조회 실패와 "upstream 없음"은 화면 입장에서 같은
+        일이므로 None으로 접고, 사라진 사실은 로그에 남긴다.
         """
-        return self._engine.upstream_of_head() if self._engine is not None else None
+        if self._engine is None:
+            return None
+        try:
+            return self._engine.upstream_of_head()
+        except GitClientError:
+            logger.warning("upstream 조회 실패 — 없는 것으로 처리한다", exc_info=True)
+            return None
 
     def _upstream_ref(self) -> str | None:
         resolved = self._upstream()
@@ -1904,7 +1946,10 @@ class MainWindow(QMainWindow):
                 self._sync_operation_state()  # 잠가둔 버튼을 되살린다
                 return
 
-        label = "내 것" if choice is ConflictChoice.OURS else "상대 것"
+        # 여기도 라벨에서 유도한다. 손으로 적으면 리베이스에서 버튼은
+        # "올라탈 곳 (upstream) 사용"인데 상태바만 "내 것"이라 말한다.
+        labels = self._operation.labels
+        label = labels.ours if choice is ConflictChoice.OURS else labels.theirs
         self._write_queue.submit(
             f"충돌 해결({label}): {path}",
             resolve_conflict_job(path, choice),
@@ -1962,6 +2007,11 @@ class MainWindow(QMainWindow):
                 conflict_count=len(self._merge_conflicts)
             )
         except GitClientError:
+            # **조용히 넘어가면 "아무 일 없음"을 날조하게 된다.** 인덱스를
+            # 못 읽었을 뿐인데 화면은 충돌 0개·연산 없음으로 단언하고
+            # 중단·계속 버튼을 꺼 버린다 — ADR-75가 막으려던 그 막다른 길이
+            # 낡은 값이 아니라 깨끗해 보이는 값으로 재현된다.
+            logger.warning("진행 중 작업 상태를 읽지 못했다", exc_info=True)
             self._merge_conflicts = ()
             self._operation = OperationState()
         self._apply_operation_state()
@@ -2007,6 +2057,13 @@ class MainWindow(QMainWindow):
 
         # **라벨이 먼저다.** 목록보다 먼저 세워야 사용자가 첫 화면에서부터
         # 올바른 이름을 본다 (ADR-65).
+        # **시퀀서 중에는 커밋으로 마무리하지 않는다.** 병합은 반대로 커밋이
+        # 유일한 마무리 수단이라 반드시 열려 있어야 한다 — 그래서 기준은
+        # `is_active`가 아니라 `can_continue`다. 열어 두었을 때 cherry-pick
+        # 중 커밋이 통과했고, 그 다음 '계속'은 "가져올 변경이 없으니
+        # 건너뛰라"며 방금 만든 커밋을 버리라고 안내했다 (감사 실측).
+        self._work_panel.set_commit_enabled(not state.operation.can_continue)
+
         self._conflict_panel.set_labels(state.labels)
         self._conflict_panel.set_conflicts(self._merge_conflicts)
         self._conflict_box.setVisible(bool(self._merge_conflicts))
@@ -2181,8 +2238,9 @@ class MainWindow(QMainWindow):
     def _describe_transfer(self, stats) -> str:  # noqa: ANN001
         """계측 결과를 사람이 읽을 문장으로.
 
-        전송량을 매번 보여주는 이유는 이 프로젝트의 목적함수가 누적 전송
-        바이트이기 때문이다 — 사용자가 비용을 볼 수 있어야 판단할 수 있다.
+        전송량을 매번 보여주는 이유는 그것이 **방금 기다린 시간의 크기**를
+        설명하기 때문이다. 누적이 아니라 이번 한 번을 보여주고 소요시간을
+        나란히 붙인다 — 누적 총량은 관리 대상이 아니다(ADR-57).
         (performance.md §8.4)
         """
         sending = stats.kind is OperationKind.PUSH
@@ -2279,7 +2337,10 @@ class MainWindow(QMainWindow):
                 return
         for label, run in entries:
             action = menu.addAction(label)
-            if "합치기" in label or "리베이스" in label:
+            # 셋 다 HEAD를 옮기거나 새 연산을 시작한다. 전환을 빼놓았더니
+            # 리베이스 중에 브랜치를 바꿀 수 있었고, 시퀀서가 어긋나 로그에
+            # 커밋이 중복돼 남았다 (감사 실측).
+            if any(k in label for k in ("합치기", "리베이스", "전환")):
                 action.setEnabled(
                     not self._busy_with_history()
                     and self._write_queue is not None

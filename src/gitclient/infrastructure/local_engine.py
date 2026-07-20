@@ -330,7 +330,18 @@ class LocalGitEngine:
                 action="경로가 삭제되었거나 이동했을 수 있습니다. 다른 폴더를 선택해 주세요.",
             )
 
-        discovered = pygit2.discover_repository(str(target))
+        # **탐색도 던진다.** libgit2는 "못 찾음"만 None으로 주고 권한 거부나
+        # I/O 오류는 예외로 올린다. 이 줄이 try 밖에 있으면 raw
+        # `pygit2.GitError`가 이 층 밖으로 새고, UI의 `except GitClientError`가
+        # 잡지 못해 Qt 이벤트 루프까지 올라간다 (§7이 금지한 그것).
+        try:
+            discovered = pygit2.discover_repository(str(target))
+        except pygit2.GitError as exc:
+            raise RepositoryOpenError(
+                f"저장소를 찾는 중 오류가 발생했습니다: {target}",
+                detail=str(exc),
+                action="경로에 접근 권한이 있는지 확인해 주세요.",
+            ) from exc
         if discovered is None:
             raise RepositoryNotFoundError(
                 f"Git 저장소가 아닙니다: {target}",
@@ -1108,8 +1119,27 @@ class LocalGitEngine:
             if checkout:
                 self._repo.checkout(branch)
 
+    def _require_no_sequencer(self) -> None:
+        """시퀀서가 도는 중에 HEAD를 옮기지 못하게 한다.
+
+        `reset`은 이미 막고 있었는데 **브랜치 전환은 열려 있었다** — 같은
+        위험이다. 실측: 리베이스 중 전환하면 시퀀서가 기대하는 HEAD가
+        어긋나 `--continue`가 엉뚱한 충돌을 내고, 되돌린 뒤 로그에 커밋이
+        중복돼 남았다. 병합은 예외다 — git 자신이 병합 중 체크아웃을
+        판단해 막거나 허용하고, 그 판단이 우리 것보다 정확하다.
+        """
+        operation = self.current_operation()
+        if operation in _SEQUENCER_COMMAND:
+            raise EngineError(
+                f"{operation.label}이(가) 진행 중이라 브랜치를 바꿀 수 없습니다.",
+                detail=f"저장소 상태: {self._repo.state()!r}",
+                action="진행 중인 작업을 마치거나 '중단'으로 되돌린 뒤 "
+                "다시 시도해 주세요.",
+            )
+
     def checkout_branch(self, name: str) -> None:
         """브랜치를 전환한다. 충돌하는 로컬 변경이 있으면 실패한다."""
+        self._require_no_sequencer()
         try:
             with _translate("브랜치 전환"):
                 self._repo.checkout(self._repo.branches.local[name])
