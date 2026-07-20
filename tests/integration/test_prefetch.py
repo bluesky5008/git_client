@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from gitclient.domain.instrumentation import OperationKind
+from gitclient.domain.models import OperationState, RepoOperation
 from gitclient.infrastructure.remote_engine import RemoteEngine
 from tests.integration.remote_harness import RemoteFixture, git
 
@@ -164,7 +165,7 @@ class TestPrefetchYieldsToTheUser:
         assert window._prefetch_worker is None
 
     def test_prefetch_skips_during_a_merge(self, window) -> None:  # noqa: ANN001
-        window._merging = True
+        window._operation = OperationState(RepoOperation.MERGE)
 
         window._maybe_prefetch()
 

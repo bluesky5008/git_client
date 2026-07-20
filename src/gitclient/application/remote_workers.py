@@ -586,6 +586,86 @@ def abort_merge_job() -> Callable[[Any], None]:
     return work
 
 
+def rebase_job(upstream_ref: str, branch: str) -> Callable[[Any], Any]:
+    """WriteQueue에 제출할 리베이스 작업.
+
+    `merge_job`과 같은 이유로 충돌을 예외가 아니라 결과로 돌려준다 —
+    충돌은 실패가 아니라 사람이 이어받을 차례다.
+
+    `branch`를 실어 보내는 이유도 같다. 큐에서 실행될 때 사용자가 브랜치를
+    바꿨다면 **엉뚱한 브랜치의 히스토리를 옮겨 심게 된다** — 병합보다 되돌리기
+    어려운 사고다.
+    """
+
+    def work(engine: Any) -> Any:
+        return engine.rebase(upstream_ref, expected_branch=branch)
+
+    return work
+
+
+def cherry_pick_job(sha: str, branch: str | None) -> Callable[[Any], Any]:
+    """커밋 하나를 현재 브랜치 위에 다시 만든다."""
+
+    def work(engine: Any) -> Any:
+        return engine.cherry_pick(sha, expected_branch=branch)
+
+    return work
+
+
+def revert_job(sha: str, branch: str | None) -> Callable[[Any], Any]:
+    """커밋 하나의 변경을 뒤집는 새 커밋을 만든다."""
+
+    def work(engine: Any) -> Any:
+        return engine.revert(sha, expected_branch=branch)
+
+    return work
+
+
+def continue_operation_job() -> Callable[[Any], Any]:
+    """충돌 해결을 마친 연산을 이어서 진행한다."""
+
+    def work(engine: Any) -> Any:
+        return engine.continue_operation()
+
+    return work
+
+
+def skip_operation_job() -> Callable[[Any], Any]:
+    """지금 멈춰 있는 커밋을 버리고 다음으로 넘어간다. 파괴적이다."""
+
+    def work(engine: Any) -> Any:
+        return engine.skip_operation()
+
+    return work
+
+
+def abort_operation_job() -> Callable[[Any], None]:
+    """진행 중인 연산을 통째로 되돌린다. 병합·리베이스 등을 가리지 않는다."""
+
+    def work(engine: Any) -> None:
+        engine.abort_operation()
+
+    return work
+
+
+def reset_job(sha: str, kind: Any, branch: str | None) -> Callable[[Any], None]:
+    """현재 브랜치를 다른 커밋으로 옮긴다.
+
+    `HARD`는 커밋하지 않은 작업을 지운다 — 호출부가 §5.2의 확인 절차를
+    거친 뒤에만 제출해야 한다.
+
+    **브랜치를 실어 보내는 것이 여기서 가장 중요하다.** 큐에 브랜치 전환이
+    먼저 들어 있으면 확인창이 말한 브랜치와 실제로 옮겨지는 브랜치가 달라진다.
+    다른 연산은 reflog로 되찾을 여지라도 있지만 `HARD`가 지운 커밋 안 된
+    작업은 어디에도 남지 않는다.
+    """
+
+    def work(engine: Any) -> None:
+        engine.reset_to(sha, kind, expected_branch=branch)
+
+    return work
+
+
 def fast_forward_job(upstream_ref: str, branch: str) -> Callable[[Any], str]:
     """WriteQueue에 제출할 빨리 감기 작업.
 

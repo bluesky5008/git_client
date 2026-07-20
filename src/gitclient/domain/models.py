@@ -285,6 +285,80 @@ class ConflictedFile:
         )
 
 
+class RepoOperation(Enum):
+    """저장소에 **진행 중인** 히스토리 연산.
+
+    충돌이 났을 때 무엇을 보여주고 무엇을 제안할지가 여기서 갈린다.
+    특히 rebase는 스테이지 2/3의 주체가 병합과 **반대다** — 그 구분을
+    잃으면 "내 것 사용"이 사용자 자신의 커밋을 버린다 (ADR-65).
+    """
+
+    NONE = "none"
+    MERGE = "merge"
+    REBASE = "rebase"
+    CHERRY_PICK = "cherry_pick"
+    REVERT = "revert"
+    OTHER = "other"
+    """bisect 등 우리가 다루지 않는 상태. 손대지 않는다."""
+
+    @property
+    def is_active(self) -> bool:
+        return self is not RepoOperation.NONE
+
+    @property
+    def label(self) -> str:
+        return _OPERATION_LABELS.get(self, "진행 중인 작업")
+
+    @property
+    def can_continue(self) -> bool:
+        """충돌을 다 풀면 이어서 진행할 수 있는 연산인가.
+
+        병합은 예외다 — 이어가는 방법이 `--continue`가 아니라 그냥
+        커밋이므로 기존 커밋 경로를 쓴다.
+        """
+        return self in (
+            RepoOperation.REBASE,
+            RepoOperation.CHERRY_PICK,
+            RepoOperation.REVERT,
+        )
+
+    @property
+    def can_abort(self) -> bool:
+        """앱이 되돌릴 수 있는 연산인가.
+
+        `OTHER`(bisect 등)는 아니다. 엔진은 거부하지만, 그렇다고 버튼을
+        내주면 **누를 때마다 오류만 돌아오는 버튼**이 된다 — 빠져나갈 길처럼
+        보이는데 아닌 것이 길이 아예 없는 것보다 나쁘다.
+        """
+        return self is RepoOperation.MERGE or self.can_continue
+
+
+_OPERATION_LABELS = {
+    RepoOperation.MERGE: "병합",
+    RepoOperation.REBASE: "리베이스",
+    RepoOperation.CHERRY_PICK: "커밋 가져오기(cherry-pick)",
+    RepoOperation.REVERT: "되돌리기(revert)",
+    RepoOperation.OTHER: "진행 중인 작업",
+}
+
+
+class ResetKind(Enum):
+    """reset이 무엇까지 되돌리는가 — 위험도가 다르다."""
+
+    SOFT = "soft"
+    """커밋만 되돌린다. 인덱스와 워킹 트리는 그대로."""
+
+    MIXED = "mixed"
+    """커밋과 인덱스를 되돌린다. 워킹 트리는 그대로 — 변경이 미스테이징으로 남는다."""
+
+    HARD = "hard"
+    """**워킹 트리까지 되돌린다.** 커밋하지 않은 작업이 사라진다."""
+
+    @property
+    def discards_working_tree(self) -> bool:
+        return self is ResetKind.HARD
+
+
 class ConflictChoice(Enum):
     """충돌을 해결할 때 어느 쪽을 남길 것인가."""
 
@@ -358,3 +432,170 @@ class MergeOutcome:
     @property
     def is_conflicted(self) -> bool:
         return bool(self.conflicts)
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictLabels:
+    """충돌한 양쪽을 화면에서 뭐라고 부를 것인가.
+
+    **이름이 틀리면 데이터가 사라진다.** 인덱스의 스테이지 2/3은 연산에
+    상관없이 각각 "ours"/"theirs"지만, 그 자리에 누가 오는지는 연산마다
+    다르다. rebase는 stage 2가 올라탈 곳이고 stage 3이 사용자 자신의
+    커밋이라, 병합 기준 라벨을 그대로 쓰면 "내 것 사용"이 사용자의 커밋을
+    버린다 (ADR-65에서 실측으로 확인).
+
+    그래서 라벨은 UI가 정하지 않는다 — 연산에서 유도한다.
+    """
+
+    ours: str
+    """스테이지 2. git이 부르는 이름은 언제나 "ours"다."""
+
+    theirs: str
+    """스테이지 3. git이 부르는 이름은 언제나 "theirs"다."""
+
+    note: str = ""
+    """이 연산에서 방향이 헷갈릴 때 덧붙일 한 줄. 없으면 빈 문자열."""
+
+
+# **여기가 유일한 출처다.** 스테이지 번호는 고정이지만(2=ours, 3=theirs) 그
+# 자리에 누가 오는지는 연산마다 다르다 — 실측한 값은 다음과 같다.
+#
+#   연산          stage 2            stage 3
+#   ----------    ---------------    ------------------
+#   merge         현재 브랜치        합치는 쪽
+#   rebase        올라탈 곳          재생 중인 내 커밋      ← 유일하게 뒤집힌다
+#   cherry-pick   현재 브랜치        가져오는 커밋
+#   revert        현재 브랜치        되돌린 결과
+#
+# 이 표를 요약한 `swaps_sides` 불리언을 한때 두었는데 **아무도 읽지 않았다** —
+# 변이 검증에서 그 값을 뒤집어도 테스트가 전부 통과했다. 권위 있어 보이는
+# 죽은 코드는 없는 것보다 나쁘다: 다음 사람이 그것을 고치고 아무것도 바뀌지
+# 않았다는 사실을 모른 채 넘어간다. 사실은 그것을 쓰는 자리에만 둔다.
+_CONFLICT_LABELS = {
+    RepoOperation.MERGE: ConflictLabels(
+        ours="내 것 (현재 브랜치)",
+        theirs="상대 것 (합치는 쪽)",
+    ),
+    RepoOperation.REBASE: ConflictLabels(
+        ours="올라탈 곳 (upstream)",
+        theirs="재생 중인 내 커밋",
+        note="리베이스에서는 방향이 병합과 반대입니다 — "
+        "내가 쓴 변경은 오른쪽입니다.",
+    ),
+    RepoOperation.CHERRY_PICK: ConflictLabels(
+        ours="현재 브랜치",
+        theirs="가져오는 커밋",
+    ),
+    RepoOperation.REVERT: ConflictLabels(
+        ours="현재 브랜치",
+        theirs="되돌린 결과",
+    ),
+}
+
+_DEFAULT_LABELS = ConflictLabels(ours="내 것", theirs="상대 것")
+
+
+def conflict_labels(operation: RepoOperation) -> ConflictLabels:
+    """진행 중인 연산에 맞는 충돌 양쪽의 이름.
+
+    모르는 상태(stash pop처럼 `state()`가 NONE인 충돌 포함)에서는 중립적인
+    기본값을 쓴다. 틀린 이름보다 밋밋한 이름이 낫다.
+    """
+    return _CONFLICT_LABELS.get(operation, _DEFAULT_LABELS)
+
+
+@dataclass(frozen=True, slots=True)
+class OperationState:
+    """저장소에 진행 중인 연산의 현재 모습.
+
+    화면 위쪽 배너가 그리는 재료다. 사용자가 "지금 무슨 상태이고 어디서
+    빠져나가는가"에 답할 수 있어야 한다 — 그 답이 없으면 충돌 화면은
+    막다른 길이다.
+    """
+
+    operation: RepoOperation = RepoOperation.NONE
+    step: int | None = None
+    """rebase의 현재 커밋 순번 (1부터). 알 수 없으면 None."""
+
+    total: int | None = None
+    """rebase가 재생할 커밋 총 개수. 알 수 없으면 None."""
+
+    head_branch: str | None = None
+    """연산이 끝나면 돌아갈 브랜치. rebase 중에는 HEAD가 분리돼 있다."""
+
+    conflict_count: int = 0
+
+    @property
+    def is_active(self) -> bool:
+        return self.operation.is_active
+
+    @property
+    def has_conflicts(self) -> bool:
+        return self.conflict_count > 0
+
+    @property
+    def labels(self) -> ConflictLabels:
+        return conflict_labels(self.operation)
+
+    @property
+    def progress_text(self) -> str:
+        """"1/3" 형태. 알 수 없으면 빈 문자열."""
+        if self.step is None or self.total is None or self.total <= 1:
+            return ""
+        return f"{self.step}/{self.total}"
+
+    def summary(self) -> str:
+        """배너 한 줄."""
+        if not self.is_active:
+            return ""
+        parts = [self.operation.label]
+        progress = self.progress_text
+        if progress:
+            parts.append(progress)
+        if self.head_branch:
+            parts.append(f"→ {self.head_branch}")
+        head = " ".join(parts)
+        if self.has_conflicts:
+            return f"{head} · 충돌 {self.conflict_count}개"
+        if not self.operation.can_abort:
+            # 우리가 손댈 수 없는 상태다. "진행 중"만 적으면 사용자는 앱에서
+            # 끝낼 방법을 찾다가 시간을 버린다 — 어디로 가야 하는지 말한다.
+            return f"{head} · 앱에서 다룰 수 없는 상태입니다 (git CLI에서 정리)"
+        return f"{head} · 진행 중"
+
+
+class HistoryOutcomeKind(Enum):
+    """히스토리 연산 하나가 어떻게 끝났는가."""
+
+    COMPLETED = "completed"
+    """끝까지 갔다. 진행 중 상태가 남지 않는다."""
+
+    CONFLICTED = "conflicted"
+    """충돌로 멈췄다. **실패가 아니다** — 사람이 이어받을 차례다.
+
+    충돌 목록이 비어 있는 채로 이 값이 오는 경우는 없다. 남길 변경이 없어
+    멈춘 상태는 엔진이 조치를 실은 오류로 바꾼다 — 화면이 "충돌 0개를
+    해결해야 합니다"라는 말이 안 되는 안내를 띄우지 않도록.
+    """
+
+    # `NOTHING_TO_DO`가 한때 여기 있었다. **아무도 만들지 않았다** —
+    # 빈 결과는 전부 오류 경로로 가고 "이미 최신"은 `MergeKind`가 답한다.
+    # 쓰이지 않는 값은 다음 사람이 "이 경우도 처리했구나"로 잘못 읽는다.
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryOutcome:
+    """rebase·cherry-pick·revert 시도의 결과.
+
+    `MergeOutcome`과 같은 이유로 충돌을 예외가 아니라 값으로 돌려준다.
+    """
+
+    kind: HistoryOutcomeKind
+    operation: RepoOperation = RepoOperation.NONE
+    conflicts: tuple[ConflictedFile, ...] = ()
+    message: str = ""
+    """사용자에게 그대로 보여줄 수 있는 git의 설명. 없으면 빈 문자열."""
+
+    @property
+    def is_conflicted(self) -> bool:
+        return self.kind is HistoryOutcomeKind.CONFLICTED

@@ -7,6 +7,8 @@ Qt를 쓰는 테스트가 디스플레이 없는 환경(CI)에서도 돌도록 o
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -24,11 +26,26 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 프로세스 환경에 심어두면 하네스와 프로덕션 경로가 **함께** 격리된다.
 # 프로덕션 자체는 사용자 설정을 그대로 써야 하므로 코드에는 넣지 않는다.
 os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
-os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 os.environ.pop("GIT_CONFIG", None)
 
-# 전역 설정을 끊으면 작성자 정보도 사라진다. 프로덕션 경로(pygit2/CLI)가
-# 커밋하는 테스트를 위해 프로세스 환경에도 결정적인 값을 심는다.
+# 전역 설정을 끊으면 작성자 정보도 사라진다. 한때 `GIT_CONFIG_GLOBAL=/dev/null`
+# 로 끊고 `GIT_AUTHOR_*` 환경변수로 신원을 심었는데, **그 방법은 두 엔진 중
+# 하나에만 통한다.** 실측: 같은 환경에서 git CLI는 환경변수를 따르고
+# pygit2의 `default_signature`는 무시하고 config만 본다.
+#
+# 그래서 신원만 담은 **진짜 전역 설정 파일**을 만들어 가리킨다. 격리 의도는
+# 그대로다(개발자의 별칭·credential.helper·safe.directory는 여전히 차단된다).
+# 게다가 이것이 실제 사용자의 모양이기도 하다 — 신원은 config에 있다.
+_GITCONFIG = Path(tempfile.gettempdir()) / "gitclient-tests.gitconfig"
+_GITCONFIG.write_text(
+    "[user]\n\tname = 테스터\n\temail = tester@example.com\n",
+    encoding="utf-8",
+)
+os.environ["GIT_CONFIG_GLOBAL"] = str(_GITCONFIG)
+
+# 하네스가 직접 부르는 git에도 같은 값을 준다. 프로덕션 경로는 이 변수들을
+# 걷어내므로(local_engine._HISTORY_ENV_BLOCKLIST) 여기서 심어도 프로덕션의
+# 신원 결정에는 영향이 없다.
 os.environ.setdefault("GIT_AUTHOR_NAME", "테스터")
 os.environ.setdefault("GIT_AUTHOR_EMAIL", "tester@example.com")
 os.environ.setdefault("GIT_COMMITTER_NAME", "테스터")
