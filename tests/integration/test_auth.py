@@ -141,21 +141,18 @@ class TestRejectedCredentials:
 
 
 class TestSecrets:
-    def test_password_is_not_in_the_shim_file(
-        self, remote: AuthenticatedRemote, work: Path, tmp_path: Path
-    ) -> None:
-        """shim 파일에는 비밀번호가 들어가면 안 된다.
+    def test_password_is_not_in_the_helper_command(self) -> None:
+        """helper 명령에는 비밀번호가 들어가면 안 된다 (ADR-29·78).
 
-        디스크에 남으면 프로세스가 죽었을 때 그대로 남는다. 값은 환경변수로만
-        넘긴다.
+        명령줄은 프로세스 목록으로 노출된다. 값은 환경변수로만 넘기고,
+        명령에는 변수 **이름**만 실린다.
         """
-        from gitclient.infrastructure.askpass import write_shim
+        from gitclient.infrastructure.askpass import credential_helper_config
 
-        shim = write_shim(tmp_path)
-        content = shim.read_text(encoding="utf-8")
+        command = " ".join(credential_helper_config())
 
-        assert PASSWORD not in content
-        assert "GITCLIENT_ASKPASS_PASSWORD" in content
+        assert PASSWORD not in command
+        assert "GITCLIENT_ASKPASS_PASSWORD" in command
 
     def test_password_is_not_in_repr(self) -> None:
         """트레이스백·로그에 비밀번호가 실려 나가면 안 된다."""
@@ -178,13 +175,10 @@ class TestStorageDelegation:
 
     def _helper(self, tmp_path: Path) -> tuple[str, Path]:
         log = tmp_path / "helper.log"
-        script = tmp_path / "helper.bat"
-        script.write_text(
-            "@echo off\n"
-            f'@echo %1 >> "{log}"\n'
-            "@exit /b 0\n"
-        )
-        return str(script).replace("\\", "/"), log
+        # `!` helper는 어느 플랫폼에서든 git 동봉 sh로 돈다 — .bat은
+        # macOS·Linux에서 실행되지 않아 이 검증이 통째로 헛돌았다.
+        posix_log = str(log).replace("\\", "/")
+        return '!f() { echo "$1" >> "' + posix_log + '"; }; f', log
 
     def test_approve_is_delegated_to_the_helper(
         self, work: Path, tmp_path: Path
@@ -224,19 +218,12 @@ class TestStoredCredentialsAreReused:
         이것이 설계의 요점이다 — 사용자가 CLI에서 이미 설정해둔 인증을 그대로
         재사용하고, 우리는 없을 때만 묻는다.
         """
-        script = tmp_path / "supplier.bat"
-        script.write_text(
-            "@echo off\n"
-            '@if "%1"=="get" (\n'
-            f"@echo username={USERNAME}\n"
-            f"@echo password={PASSWORD}\n"
-            ")\n"
-            "@exit /b 0\n"
+        supplier = (
+            '!f() { if [ "$1" = get ]; then '
+            f"echo username={USERNAME}; echo password={PASSWORD}; "
+            "fi; }; f"
         )
-        git(
-            "config", "credential.helper",
-            str(script).replace("\\", "/"), cwd=work,
-        )
+        git("config", "credential.helper", supplier, cwd=work)
         remote.add_remote_commit()
 
         # credentials 없이 — helper가 공급해야 한다

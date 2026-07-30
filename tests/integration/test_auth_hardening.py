@@ -20,9 +20,9 @@ import pytest
 
 from gitclient.domain.errors import AuthenticationRequired
 from gitclient.infrastructure.askpass import (
+    CREDENTIAL_HELPER,
     Credentials,
-    shim_environment,
-    write_shim,
+    credential_environment,
 )
 from gitclient.infrastructure.remote_engine import RemoteEngine, _without_userinfo
 from tests.integration.auth_harness import (
@@ -63,66 +63,76 @@ HOSTILE = [
 ]
 
 
-def ask_shim(tmp_path: Path, secret: str, prompt: str, *, user: str = "alice") -> str:
-    """shim을 git이 부르는 방식 그대로 실행하고 stdout을 돌려준다."""
-    shim = write_shim(tmp_path)
+def ask_helper(
+    tmp_path: Path, secret: str, request: str = "get", *, user: str = "alice"
+) -> dict[str, str]:
+    """helper를 git이 부르는 방식 그대로 sh로 실행하고 응답을 파싱한다.
+
+    git은 `!cmd` helper를 `sh -c 'cmd "$@"' cmd <요청>`으로 실행한다 —
+    Windows에서도 git 동봉 sh다. 그 호출 형태를 그대로 재현한다.
+    """
+    body = CREDENTIAL_HELPER.removeprefix("!")
     env = dict(os.environ)
-    env.update(shim_environment(shim, Credentials(username=user, password=secret)))
+    env.update(credential_environment(Credentials(username=user, password=secret)))
     result = subprocess.run(
-        [str(shim), prompt],
+        ["sh", "-c", f'{body} "$@"', "gitclient-credential", request],
         capture_output=True,
         text=True,
         env=env,
         cwd=str(tmp_path),
     )
-    return result.stdout.rstrip("\r\n")
+    parsed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            parsed[key] = value
+    return parsed
 
 
-class TestShimHandlesHostileSecrets:
+class TestHelperHandlesHostileSecrets:
     """비밀번호에 셸 메타문자가 들어와도 안전해야 한다 (확정 critical).
 
-    Windows 셸은 `%VAR%`를 특수문자 파싱 **앞** 단계에서 확장하고 결과를 다시
-    파싱한다. 실측에서 비밀번호 `a>b-secret`이 사용자 워킹 트리에 `b-secret`
-    파일을 만들고 그 안에 `a`를 남겼다 — 비밀번호가 파일로 흘렀고, `&` 형태로는
-    임의 명령까지 실행됐다.
+    askpass shim 시절 Windows 셸의 `%VAR%` 확장이 비밀번호를 재해석해
+    파일 유출·명령 실행까지 갔다 (ADR-31 실측). helper는 플랫폼과 무관하게
+    git 동봉 sh로 돌지만(ADR-78), **같은 적대적 입력 목록으로 계속
+    검증한다** — 통과하는 입력만 검증하면 통과하는 것만 알게 된다.
     """
 
     @pytest.mark.parametrize("secret", HOSTILE)
     def test_password_survives_the_shell_intact(
         self, tmp_path: Path, secret: str
     ) -> None:
-        answer = ask_shim(tmp_path, secret, "Password for 'https://x': ")
-        assert answer == secret, f"셸이 비밀번호를 변형했다: {answer!r}"
+        answer = ask_helper(tmp_path, secret)
+        assert answer.get("password") == secret, (
+            f"셸이 비밀번호를 변형했다: {answer!r}"
+        )
 
     @pytest.mark.parametrize("secret", HOSTILE)
     def test_nothing_is_written_to_disk(self, tmp_path: Path, secret: str) -> None:
         """리다이렉션이 살아 있으면 비밀번호 조각이 파일로 떨어진다."""
         before = set(tmp_path.iterdir())
 
-        ask_shim(tmp_path, secret, "Password for 'https://x': ")
+        ask_helper(tmp_path, secret)
 
         created = {p.name for p in tmp_path.iterdir()} - {p.name for p in before}
-        # shim 파일 자체는 생긴다 — 그 외에는 아무것도 생기면 안 된다.
-        assert not (created - {"gitclient-askpass.bat", "gitclient-askpass.sh"}), (
-            f"셸이 파일을 만들었다: {created}"
-        )
+        # 이제는 shim 파일조차 없다 — 아무것도 생기면 안 된다.
+        assert not created, f"셸이 파일을 만들었다: {created}"
 
     def test_command_injection_does_not_execute(self, tmp_path: Path) -> None:
         marker = tmp_path / "PWNED.txt"
 
-        ask_shim(
-            tmp_path,
-            'tok&echo owned>"' + str(marker) + '"',
-            "Password for 'https://x': ",
-        )
+        ask_helper(tmp_path, 'tok&echo owned>"' + str(marker) + '"')
 
         assert not marker.exists(), "비밀번호 안의 명령이 실행됐다"
 
-    def test_username_prompt_is_equally_safe(self, tmp_path: Path) -> None:
-        answer = ask_shim(
-            tmp_path, "whatever", "Username for 'https://x': ", user="al&ice"
-        )
-        assert answer == "al&ice"
+    def test_username_is_equally_safe(self, tmp_path: Path) -> None:
+        answer = ask_helper(tmp_path, "whatever", user="al&ice")
+        assert answer.get("username") == "al&ice"
+
+    def test_non_get_requests_return_nothing(self, tmp_path: Path) -> None:
+        """store/erase에는 침묵한다 — 저장 위임은 approve가 명시적으로 한다."""
+        assert ask_helper(tmp_path, "secret", "store") == {}
+        assert ask_helper(tmp_path, "secret", "erase") == {}
 
     def test_hostile_password_authenticates_for_real(self, tmp_path: Path) -> None:
         """끝까지 확인한다 — 메타문자가 든 비밀번호로 실제 인증이 통과하는가.
@@ -160,12 +170,13 @@ class TestRememberIsHonoured:
 
     def _logging_helper(self, work: Path, tmp_path: Path) -> Path:
         log = tmp_path / "store.log"
-        script = tmp_path / "logger.bat"
-        script.write_text('@echo off\n@echo %1 >> "' + str(log) + '"\n@exit /b 0\n')
+        # `!` helper는 어느 플랫폼에서든 git 동봉 sh로 돈다 — .bat 스크립트는
+        # macOS·Linux에서 실행조차 안 돼 이 테스트가 검증을 헛돌았다.
+        posix_log = str(log).replace("\\", "/")
         git(
             "config",
             "credential.helper",
-            str(script).replace("\\", "/"),
+            '!f() { echo "$1" >> "' + posix_log + '"; }; f',
             cwd=work,
         )
         return log
@@ -245,27 +256,15 @@ class TestDialogTargetIsTrusted:
         assert excinfo.value.url == configured
 
 
-class TestPosixShim:
-    """POSIX 분기도 검증한다 — Windows에서 돌아도 생성 결과는 확인할 수 있다."""
+class TestHelperCommand:
+    """helper 명령 문자열 자체의 안전 속성 — 플랫폼 분기가 없다 (ADR-78)."""
 
-    def test_posix_shim_quotes_the_variables(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:  # noqa: ANN001
-        import gitclient.infrastructure.askpass as module
-
-        monkeypatch.setattr(module.os, "name", "posix")
-        monkeypatch.setattr(
-            module.Path, "chmod", lambda self, mode: None, raising=False
-        )
-
-        shim = module.write_shim(tmp_path)
-        content = shim.read_text(encoding="utf-8")
-
-        assert shim.suffix == ".sh"
+    def test_variables_are_quoted_and_no_secret_inlined(self) -> None:
         # 따옴표 없이 확장하면 공백·글로브가 든 비밀번호가 깨진다.
-        assert '"$GITCLIENT_ASKPASS_PASSWORD"' in content
-        assert '"$GITCLIENT_ASKPASS_USERNAME"' in content
-        assert PASSWORD not in content
+        assert '"$GITCLIENT_ASKPASS_PASSWORD"' in CREDENTIAL_HELPER
+        assert '"$GITCLIENT_ASKPASS_USERNAME"' in CREDENTIAL_HELPER
+        assert PASSWORD not in CREDENTIAL_HELPER
+        assert CREDENTIAL_HELPER.startswith("!"), "셸 helper 형식이어야 sh로 돈다"
 
 
 class TestRetryStateIsRevalidated:

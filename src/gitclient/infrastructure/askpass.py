@@ -1,29 +1,26 @@
-"""git에 자격증명을 공급하는 askpass shim.
+"""git에 자격증명을 공급하는 일회성 credential helper (DCR-003, ADR-78).
 
-**왜 shim 파일인가.** git은 `GIT_ASKPASS`를 **실행 파일 경로 하나**로만 받는다.
-인자를 붙인 문자열을 주면 조용히 무시하고 호출조차 하지 않는다(실측 확인).
-따라서 우리가 모아둔 값을 돌려주려면 작은 스크립트를 그때그때 써야 한다.
+**왜 askpass가 아니라 credential helper인가.** 원래는 `GIT_ASKPASS`로 작은
+shim 파일을 그때그때 써서 값을 돌려줬다. 그런데 최신 git(2.50 실측)은
+`credential.interactive=false`가 **askpass 호출까지 차단한다** — 우리가
+프롬프트를 대신하려고 세운 설정이 우리 공급 경로를 죽였다. helper의
+`get`은 그 설정 아래에서도 동작한다(구·신 git 모두 실측) — 그 설정이
+막으려는 것은 "묻기"이고 helper의 get은 "돌려주기"이기 때문이다.
 
-**왜 값을 파일에 쓰지 않는가.** 비밀번호가 디스크에 남으면 우리가 지우기
-전에 프로세스가 죽었을 때 그대로 남는다. 값은 자식 프로세스의 **환경변수**로
-넘기고 shim은 그것을 읽기만 한다 — 파일에는 비밀번호가 들어가지 않는다.
-(같은 사용자의 다른 프로세스가 환경을 들여다볼 수 있다는 한계는 남지만,
-그건 자격증명 자체와 같은 신뢰 경계다.)
+**왜 값을 파일에 쓰지 않는가** (ADR-29, 유지). 비밀번호가 디스크에 남으면
+프로세스가 죽었을 때 그대로 남는다. helper 명령에는 환경변수 **이름**만
+들어가고 값은 자식 프로세스의 환경으로만 흐른다. (같은 사용자의 다른
+프로세스가 환경을 볼 수 있다는 한계는 자격증명 자체와 같은 신뢰 경계다.)
 
-git은 사용자 이름과 비밀번호를 **따로** 묻는다:
-
-    Username for 'https://example.com':
-    Password for 'https://alice@example.com':
-
-프롬프트 문구로 어느 쪽인지 가른다.
+**셸 경로가 하나다.** `!`로 시작하는 helper는 Windows에서도 git 동봉 sh로
+실행된다 — cmd.exe의 퍼센트 확장이 비밀번호의 메타문자를 재해석하던 위험
+(ADR-31이 막던 것)은 지킬 대상 자체가 사라졌다. `printf '%s' "$VAR"`는
+값을 문자 그대로 내보낸다 (적대적 비밀번호 실측).
 """
 
 from __future__ import annotations
 
-import os
-import stat
 from dataclasses import dataclass
-from pathlib import Path
 
 USERNAME_ENV = "GITCLIENT_ASKPASS_USERNAME"
 PASSWORD_ENV = "GITCLIENT_ASKPASS_PASSWORD"
@@ -47,68 +44,29 @@ class Credentials:
         return f"Credentials(username={self.username!r}, password=***)"
 
 
-# **`%VAR%`가 아니라 `!VAR!`인 이유** (확정된 결함의 재발 방지):
-# cmd.exe는 퍼센트 확장을 특수문자 파싱 **앞** 단계에서 하고, 확장된 결과를
-# 다시 파싱한다. 그래서 비밀번호에 `& | < > ^ ( )`가 들어 있으면 그 문자들이
-# 셸 문법으로 재해석된다. 실측: 비밀번호 `a>b-secret`이 사용자의 워킹 트리에
-# `b-secret`이라는 파일을 만들고 그 안에 `a`를 남겼다 — 즉 **비밀번호가
-# 파일로 흘렀고**, `& echo ...` 형태로는 임의 명령까지 실행됐다.
-#
-# 지연 확장(`!VAR!`)은 특수문자 파싱 **뒤** 단계에서 치환되고 결과를 다시
-# 파싱하지 않으므로 값이 문자 그대로 전달된다.
-#
-# `echo(`는 `echo `와 달리 값이 비어도 "ECHO is on."을 출력하지 않는다.
-_WINDOWS_SHIM = """@echo off
-setlocal EnableDelayedExpansion
-echo %* | findstr /C:"Username" >nul
-if %errorlevel%==0 (
-  echo(!{username_env}!
-) else (
-  echo(!{password_env}!
+# get 요청에만 응답한다. store/erase는 조용히 무시한다 — 저장 위임은
+# 우리가 `git credential approve`로 명시적으로 한다 (ADR-32·33).
+CREDENTIAL_HELPER = (
+    "!f() { "
+    'if [ "$1" = get ]; then '
+    "printf 'username=%s\\npassword=%s\\n' "
+    f'"${USERNAME_ENV}" "${PASSWORD_ENV}"; '
+    "fi; }; f"
 )
-"""
-
-_POSIX_SHIM = """#!/bin/sh
-case "$*" in
-  *Username*) printf '%s\\n' "${username_env}" ;;
-  *)          printf '%s\\n' "${password_env}" ;;
-esac
-"""
 
 
-def write_shim(directory: Path) -> Path:
-    """askpass shim을 만들고 경로를 돌려준다.
+def credential_helper_config() -> list[str]:
+    """이 명령에 한해 우리 helper를 체인에 더하는 `-c` 인자.
 
-    내용에는 비밀번호가 들어가지 않는다 — 환경변수 이름만 들어간다.
+    호출자가 "저장 안 함" 재설정(`credential.helper=`) **뒤에** 붙여야
+    한다 — 설정은 명령줄 순서대로 쌓이고, 빈 값이 체인을 재설정한다.
     """
-    if os.name == "nt":
-        path = directory / "gitclient-askpass.bat"
-        path.write_text(
-            _WINDOWS_SHIM.format(
-                username_env=USERNAME_ENV, password_env=PASSWORD_ENV
-            ),
-            encoding="utf-8",
-        )
-    else:
-        path = directory / "gitclient-askpass.sh"
-        path.write_text(
-            _POSIX_SHIM.format(
-                username_env=USERNAME_ENV, password_env=PASSWORD_ENV
-            ),
-            encoding="utf-8",
-        )
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
+    return ["-c", f"credential.helper={CREDENTIAL_HELPER}"]
 
 
-def shim_environment(path: Path, credentials: Credentials) -> dict[str, str]:
-    """shim을 쓰기 위한 환경변수.
-
-    `GIT_ASKPASS`를 우리 shim으로 덮으므로, 비대화형 강제(§4.6.2)에서
-    빈 값으로 막아두었던 경로가 이 작업에 한해 열린다.
-    """
+def credential_environment(credentials: Credentials) -> dict[str, str]:
+    """helper가 읽을 환경변수. 값은 여기로만 흐른다."""
     return {
-        "GIT_ASKPASS": str(path),
         USERNAME_ENV: credentials.username,
         PASSWORD_ENV: credentials.password,
     }

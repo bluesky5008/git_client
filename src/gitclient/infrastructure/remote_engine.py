@@ -34,8 +34,8 @@ from gitclient.domain.errors import (
 )
 from gitclient.infrastructure.askpass import (
     Credentials,
-    shim_environment,
-    write_shim,
+    credential_environment,
+    credential_helper_config,
 )
 from gitclient.domain.instrumentation import (
     OperationKind,
@@ -763,7 +763,15 @@ class RemoteEngine:
                 result = self._run(
                     args,
                     stall_timeout_s=stall_timeout_s,
-                    extra_env={"GIT_TRACE2_EVENT": str(trace_path)},
+                    # NESTING을 올리지 않으면 최신 git(2.50 실측)에서
+                    # `negotiation_v2/total_rounds`가 기본 한도(2) 밖에
+                    # 있어 협상 왕복이 **항상 미기록**이다 — 측정 성공처럼
+                    # 보이는 무기록이라 집계표로 탐지되지 않는다 (ADR-26
+                    # 부류, backlog §3.11).
+                    extra_env={
+                        "GIT_TRACE2_EVENT": str(trace_path),
+                        "GIT_TRACE2_EVENT_NESTING": "10",
+                    },
                 )
             except GitClientError as exc:
                 # **실패해도 바이트는 이미 회선에 실렸다.** push는 호출 단위가
@@ -924,6 +932,16 @@ class RemoteEngine:
         if self._credentials is not None and not self._credentials.remember:
             command.extend(["-c", "credential.helper="])
 
+        # 사용자가 방금 입력한 값은 **일회성 helper의 get**으로 공급한다
+        # (ADR-78, DCR-003). askpass가 아니다 — 최신 git은
+        # `credential.interactive=false`가 askpass 호출까지 차단한다(2.50
+        # 실측). helper의 get은 그 설정 아래에서도 동작하므로, 외부 helper의
+        # 자체 UI 차단(ADR-28)과 우리 공급이 같이 성립한다. 재설정(`위의
+        # credential.helper=`) **뒤에** 와야 한다 — 설정은 명령줄 순서대로
+        # 쌓인다.
+        if self._credentials is not None:
+            command.extend(credential_helper_config())
+
         command.extend(args)
 
         env = {
@@ -952,18 +970,10 @@ class RemoteEngine:
         # 아니다. 모르는 호스트에서는 매달리지 말고 실패하는 편이 낫다.
         env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
 
-        # 사용자가 방금 입력한 값이 있으면 그것만 shim으로 공급한다. 이때도
-        # `credential.interactive=false`는 그대로 둔다 — helper는 **저장된**
-        # 자격증명을 돌려주는 역할만 하고, 물어보는 것은 우리 몫이다.
-        # (실측: interactive=false 여도 helper의 get은 정상 동작한다)
-        shim_dir: tempfile.TemporaryDirectory[str] | None = None
+        # helper가 읽을 값은 환경으로만 흐른다 (ADR-29). 명령줄과 디스크에는
+        # 변수 이름만 있다.
         if self._credentials is not None:
-            shim_dir = tempfile.TemporaryDirectory(prefix="gitclient-ask-")
-            env.update(
-                shim_environment(
-                    write_shim(Path(shim_dir.name)), self._credentials
-                )
-            )
+            env.update(credential_environment(self._credentials))
 
         if extra_env:
             env.update(extra_env)
@@ -985,8 +995,6 @@ class RemoteEngine:
                 start_new_session=(os.name != "nt"),
             )
         except FileNotFoundError as exc:
-            if shim_dir is not None:
-                shim_dir.cleanup()
             raise EngineError(
                 "git을 찾을 수 없습니다.",
                 detail=str(exc),
@@ -1012,15 +1020,6 @@ class RemoteEngine:
         finally:
             with self._lock:
                 self._proc = None
-            if shim_dir is not None:
-                # shim에는 비밀번호가 없지만(환경변수 이름만) 남겨둘 이유도 없다.
-                # 타임아웃으로 트리를 끊은 직후엔 Windows가 핸들을 늦게 놓을 수
-                # 있으므로 정리 실패는 삼킨다 — 임시 파일 정리가 원격 작업을
-                # 실패시키면 안 된다.
-                try:
-                    shim_dir.cleanup()
-                except OSError:
-                    logger.debug("askpass shim 정리 실패", exc_info=True)
 
         if self._aborted:
             # 취소로 죽은 프로세스의 0 아닌 종료코드를 사용자 오류로 번역하지
@@ -1160,6 +1159,10 @@ class RemoteEngine:
             or "could not read password" in lowered
             or "terminal prompts disabled" in lowered
             or "authentication failed" in lowered
+            # 최신 git(2.50 실측)은 `credential.interactive=false` 아래에서
+            # 자격증명을 얻지 못하면 이 문구를 낸다 — URL도 싣지 않으므로
+            # 주소는 아래에서 설정으로 복원된다 (그쪽이 원래 우선이다).
+            or "unable to get password from user" in lowered
         )
         if needs_credentials:
             rejected = "authentication failed" in lowered

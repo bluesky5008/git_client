@@ -13,8 +13,8 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 🚧 증분 1~3 완료 (merge · 충돌 해결 · 히스토리 재작성) |
 | 5 | 다듬기 — 테마, 단축키, 다국어 | 대기 |
 
-테스트 **754개** — macOS·git 2.50 실측 726 통과, 4 skip, 24 실패(전부 최신
-git 비호환으로 확정 — [doc/backlog.md](doc/backlog.md) §3.10~3.12, Windows
+테스트 **755개** — macOS·git 2.50 실측 748 통과, 4 skip, 3 실패(진행 표시
+테스트의 타이밍 의존 — [doc/backlog.md](doc/backlog.md) §3.12. Windows
 기준선은 742 통과였다). 커밋 10만 개 저장소에서 첫 행 표시까지 **493ms**
 (macOS 재실측 599ms, 목표 1,500ms).
 
