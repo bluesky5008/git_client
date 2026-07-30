@@ -229,9 +229,26 @@ def _looks_empty(result: subprocess.CompletedProcess[str]) -> bool:
     문구로 판정하는 것은 취약하지만 종료 코드가 이 경우를 구분해 주지
     않는다(실측: rc=1, 상태 유지 — 진짜 오류와 같다). 놓치면 일반 오류로
     보여주게 되는데, 그때도 안내가 없을 뿐 데이터는 안전하다.
+
+    `--empty=stop`의 멈춤(실측: "nothing to commit ... git rebase
+    --continue")도 여기서 잡는다 — 판정 자체는 충돌 0개 + 진행 중이라는
+    저장소 상태가 하고(ADR-69), 이 문구는 진짜 오류와의 마지막 구분선이다.
     """
     text = _message_of(result).lower()
-    return "empty" in text and "skip" in text
+    return ("empty" in text and "skip" in text) or "nothing to commit" in text
+
+
+# git이 이미 upstream에 있는 커밋을 정당하게 생략할 때의 경고 (실측,
+# LC_ALL=C 고정이라 문구가 안정적이다). 이 생략은 손실이 아니지만 —
+# 같은 변경이 결과에 이미 있다 — 조용히 지나가면 사용자가 "커밋이
+# 사라졌다"와 구분할 수 없다 (ADR-76).
+_SKIPPED_APPLIED = re.compile(
+    r"skipped previously applied commit ([0-9a-f]{7,40})"
+)
+
+
+def _skipped_commits_of(result: subprocess.CompletedProcess[str]) -> tuple[str, ...]:
+    return tuple(_SKIPPED_APPLIED.findall(result.stderr or ""))
 
 _STATUS_MAP = {
     "A": ChangeStatus.ADDED,
@@ -1283,7 +1300,10 @@ class LocalGitEngine:
                 )
             self._repo.merge(target)
 
-        conflicts = self.merge_conflicts()
+        # 병합은 WriteQueue 워커에서 돈다 — 마커 분류(blob 로드)를 여기서
+        # 끝내야 UI의 안내문("N개에는 마커가 없습니다")이 UI 스레드에서
+        # blob을 읽지 않는다 (ADR-77).
+        conflicts = self.merge_conflicts(classify=True)
         if conflicts:
             # 저장소는 병합 진행 중으로 남는다. 워킹 트리에는 충돌 마커가
             # 들어 있고, 충돌하지 않은 변경은 이미 반영돼 있다.
@@ -1355,11 +1375,16 @@ class LocalGitEngine:
         맡는다. 그래서 다시 상태를 가리지 않는다. **이 함수를 상태로 거르는
         방향으로 되돌리려는 사람에게**: 감추는 것은 해결이 아니었다.
         사용자는 마커가 든 파일을 아무 안내 없이 마주할 뿐이었다.
+
+        UI 스레드에서 불리므로 마커 분류는 하지 않는다 — `has_markers`는
+        삭제 계열만 즉시 채워지고 나머지는 None이다 (ADR-77).
         """
         with _translate("충돌 목록 조회"):
             return self._collect_conflicts()
 
-    def merge_conflicts(self) -> tuple[ConflictedFile, ...]:
+    def merge_conflicts(
+        self, *, classify: bool = False
+    ) -> tuple[ConflictedFile, ...]:
         """지금 병합 중이라면 해결되지 않은 파일들.
 
         인덱스의 충돌은 rebase·cherry-pick 중에도 생긴다. 상태를 함께
@@ -1369,10 +1394,23 @@ class LocalGitEngine:
         with _translate("충돌 목록 조회"):
             if self._repo.state() != pygit2.enums.RepositoryState.MERGE:
                 return ()
-            return self._collect_conflicts()
+            return self._collect_conflicts(classify=classify)
 
-    def _collect_conflicts(self) -> tuple[ConflictedFile, ...]:
-        """인덱스의 충돌을 도메인 객체로 옮긴다."""
+    def _collect_conflicts(
+        self, *, classify: bool = False
+    ) -> tuple[ConflictedFile, ...]:
+        """인덱스의 충돌을 도메인 객체로 옮긴다.
+
+        **열거와 분류를 나눈다** (ADR-77, ADR-47 대체). 열거는 인덱스만
+        읽어 파일 크기와 무관하고(실측: 충돌 1,000개 5.9ms — G4 예산 안),
+        마커 분류는 blob 내용을 로드해 크기에 비례한다(실측: 최대 2,957ms —
+        예산의 59배). 그래서 분류는 `classify=True`를 준 호출자, 즉 워커
+        스레드에서만 한다. UI 스레드 호출자(저장소 열기·쓰기 큐 idle)는
+        분류 없이 열거만 받는다 — 그쪽이 실제로 쓰는 것은 경로와 개수뿐이다.
+
+        삭제 계열의 `has_markers=False`는 분류가 아니라 종류에서 나오므로
+        (합칠 상대가 없으면 마커도 없다) 언제나 즉시 채워진다.
+        """
         conflicts = self._fresh_index().conflicts
         if conflicts is None:
             return ()
@@ -1382,27 +1420,33 @@ class LocalGitEngine:
             if entry is None:  # pragma: no cover - 방어적
                 continue
             side = _conflict_side(ancestor, ours, theirs)
+            if side is not ConflictSide.BOTH_MODIFIED and side is not ConflictSide.BOTH_ADDED:
+                has_markers: bool | None = False
+            elif classify:
+                has_markers = self._text_pair_has_markers(ours, theirs)
+            else:
+                has_markers = None  # 미분류 — 읽는 쪽이 필요하면 워커에서 채운다
             found.append(
                 ConflictedFile(
                     path=entry.path,
                     side=side,
-                    has_markers=self._has_conflict_markers(side, ours, theirs),
+                    has_markers=has_markers,
                 )
             )
         return tuple(sorted(found, key=lambda c: c.path))
 
-    def _has_conflict_markers(self, side: ConflictSide, ours, theirs) -> bool:  # noqa: ANN001
-        """워킹 트리 파일에 충돌 마커가 들어가는가.
+    def _text_pair_has_markers(self, ours, theirs) -> bool:  # noqa: ANN001
+        """양쪽이 있는 충돌의 워킹 트리 파일에 마커가 들어가는가.
 
-        **blob에게 묻는다 — 워킹 트리 파일을 읽지 않는다.** 마커가 없는 경우는
-        정확히 "libgit2가 3-way 텍스트 병합을 포기했을 때"이고, 그 판단 기준이
-        곧 blob의 바이너리 여부다. 파일 내용을 훑어 `<<<<<<<`를 찾는 방법도
-        되지만, 이 함수는 저장소를 열 때마다 UI 스레드에서 도는 경로에 있다
-        (§3.3 G4: 단일 블로킹 구간 50ms). 충돌 파일이 수백 개인 대형 병합에서
-        파일마다 수십~수백 KB를 읽으면 그 예산을 통째로 넘긴다.
+        **blob에게 묻는다 — 워킹 트리 파일을 읽지 않는다.** 마커가 없는
+        경우는 정확히 "libgit2가 3-way 텍스트 병합을 포기했을 때"이고,
+        그 판단 기준이 곧 blob의 바이너리 여부다.
+
+        **`repo.get(id)`은 blob 내용을 ODB에서 로드한다** — 그래서 이
+        판정은 파일 크기에 비례하고, UI 스레드에서 부르면 G4를 넘긴다
+        (감사 실측, DCR-002). 워커 문맥(`_collect_conflicts(classify=True)`)
+        에서만 부를 것.
         """
-        if side is not ConflictSide.BOTH_MODIFIED and side is not ConflictSide.BOTH_ADDED:
-            return False  # 삭제 계열은 합칠 상대가 없어 마커도 없다
         for entry in (ours, theirs):
             if entry is None:
                 return False
@@ -1864,8 +1908,12 @@ class LocalGitEngine:
         """
         self._require_quiet_repository()
         self._require_expected_branch(self._head_branch(), expected_branch)
+        # `--empty=stop`: 적용 시점에 비게 되는 커밋을 git이 조용히 버리는
+        # 대신 멈춰 세운다 (ADR-76). 이미 upstream에 그대로 있는 커밋의
+        # 생략(clean cherry-pick)은 이 옵션과 무관하게 계속 일어나며,
+        # 그쪽은 경고 파싱(`skipped_already_applied`)으로 안내한다.
         return self._sequencer(
-            ["rebase", "--", upstream_ref],
+            ["rebase", "--empty=stop", "--", upstream_ref],
             context="리베이스",
             expected=RepoOperation.REBASE,
         )
@@ -1906,6 +1954,14 @@ class LocalGitEngine:
         **먼저 남은 충돌을 확인한다.** git도 거부하긴 하지만 그 메시지는
         영어 한 줄이고, 우리는 몇 개가 남았는지 알고 있다. 사용자가
         "계속"을 눌렀는데 아무 일도 일어나지 않는 것이 최악이다.
+
+        **그다음, 이대로 진행하면 커밋이 사라지는지 확인한다** (ADR-76).
+        충돌을 전부 한쪽으로 해결해 스테이징 트리가 HEAD와 같아졌다면,
+        `git rebase --continue`는 그 커밋을 **조용히 버리고 성공을 보고한다**
+        (실측 — `--empty=stop`도 이 경로는 못 막는다. cherry-pick은 같은
+        상황에서 스스로 거부하는데 rebase만 버린다). 트리 비교는 정의상
+        참인 판정이라 거짓 경고가 없다: 스테이징된 트리가 HEAD와 같다는
+        것이 곧 "재생될 커밋에 남는 변경이 없다"는 뜻이다.
         """
         operation = self._require_continuable()
         remaining = self._collect_conflicts()
@@ -1915,12 +1971,80 @@ class LocalGitEngine:
                 detail=", ".join(c.path for c in remaining[:5]),
                 action="충돌 목록에서 각 파일을 해결한 뒤 다시 시도해 주세요.",
             )
+        if self._staged_tree_equals_head():
+            return HistoryOutcome(
+                kind=HistoryOutcomeKind.WOULD_BE_EMPTY,
+                operation=operation,
+                message=self._stalled_commit_summary(),
+            )
         return self._sequencer(
             [_SEQUENCER_COMMAND[operation], "--continue"],
             context=f"{operation.label} 계속",
             expected=operation,
-            empty_hint=True,
         )
+
+    def keep_empty_operation(self) -> HistoryOutcome:
+        """비게 된 커밋을 **빈 커밋으로 남기고** 연산을 이어간다 (ADR-76).
+
+        `git commit --allow-empty --no-edit`가 시퀀서가 둔 메시지를 그대로
+        집어 커밋을 만든다 (실측 — rebase·cherry-pick·revert 모두).
+        cherry-pick·revert는 그 커밋이 연산을 끝내고, rebase는 남은 커밋을
+        `--continue`로 이어간다.
+        """
+        operation = self._require_continuable()
+        remaining = self._collect_conflicts()
+        if remaining:
+            raise EngineError(
+                f"아직 해결되지 않은 충돌이 {len(remaining)}개 있습니다.",
+                detail=", ".join(c.path for c in remaining[:5]),
+                action="충돌 목록에서 각 파일을 해결한 뒤 다시 시도해 주세요.",
+            )
+        if not self._staged_tree_equals_head():
+            # 남길 변경이 있다면 이 함수가 아니라 '계속'의 일이다. 여기서
+            # 커밋을 만들면 같은 변경이 두 커밋으로 갈라진다.
+            raise EngineError(
+                "이 커밋에는 남길 변경이 있습니다.",
+                action="'계속'으로 이어가 주세요.",
+            )
+        result = self._run_git(
+            ["commit", "--allow-empty", "--no-edit"],
+            context=f"{operation.label} 빈 커밋 유지",
+            check=False,
+        )
+        if result.returncode != 0:
+            raise EngineError(
+                "빈 커밋을 만들지 못했습니다.",
+                detail=_message_of(result) or f"exit {result.returncode}",
+                action="위 내용을 확인한 뒤 다시 시도해 주세요.",
+            )
+        if not self.current_operation().is_active:
+            # cherry-pick·revert는 커밋이 곧 마무리다 (실측: CHERRY_PICK_HEAD가
+            # 커밋과 함께 사라진다). `--continue`를 또 부르면 "진행 중인
+            # 작업이 없다"는 오류만 돌아온다.
+            return HistoryOutcome(
+                kind=HistoryOutcomeKind.COMPLETED,
+                operation=operation,
+                message=_message_of(result),
+            )
+        return self._sequencer(
+            [_SEQUENCER_COMMAND[operation], "--continue"],
+            context=f"{operation.label} 계속",
+            expected=operation,
+        )
+
+    def _staged_tree_equals_head(self) -> bool:
+        """스테이징된 트리가 HEAD의 트리와 같은가 — 커밋하면 빈 커밋인가.
+
+        인덱스 크기에 비례하는 로컬 계산이다(밀리초 수준). 워커 스레드
+        (WriteQueue)에서만 불린다.
+        """
+        with _translate("스테이징 상태 확인"):
+            index = self._fresh_index()
+            if index.conflicts is not None:
+                return False  # 충돌이 남은 인덱스는 write_tree가 실패한다
+            staged = index.write_tree(self._repo)
+            head = self._repo.head.peel(pygit2.Commit).tree_id
+            return staged == head
 
     def skip_operation(self) -> HistoryOutcome:
         """지금 멈춰 있는 커밋을 **버리고** 다음으로 넘어간다.
@@ -2012,7 +2136,6 @@ class LocalGitEngine:
         *,
         context: str,
         expected: RepoOperation,
-        empty_hint: bool = False,
     ) -> HistoryOutcome:
         """시퀀서 명령 하나를 돌리고 **저장소 상태로** 결과를 판정한다.
 
@@ -2025,27 +2148,28 @@ class LocalGitEngine:
         state = self.current_operation()
 
         if state.is_active:
-            conflicts = self._collect_conflicts()
+            # 여기는 워커 스레드다(§3.3 규칙 3) — 마커 분류(blob 로드)를
+            # 지금 끝내야 UI가 목록을 받았을 때 읽을 것이 없다 (ADR-77).
+            conflicts = self._collect_conflicts(classify=True)
             if not conflicts and _looks_empty(result):
-                # 충돌 0개인데 멈춰 있다 = 남길 변경이 없다는 뜻이다.
-                # 이것을 CONFLICTED로 돌려주면 화면이 "충돌 0개를 해결해야
-                # 합니다"라는 말이 안 되는 안내를 띄우고, 충돌 패널은 목록이
-                # 비어 있어 나타나지도 않는다 — 사용자가 할 수 있는 일이 없다.
-                raise EngineError(
-                    "가져올 변경이 남아 있지 않습니다.",
-                    detail=_message_of(result),
-                    action=(
-                        "이 커밋을 버리려면 '건너뛰기'를 선택해 주세요."
-                        if empty_hint
-                        else "이 커밋의 변경은 이미 반영되어 있습니다. "
-                        "'중단'으로 정리해 주세요."
-                    ),
+                # 충돌 0개인데 멈춰 있다 = 이 커밋에 남길 변경이 없다는
+                # 뜻이다. 오류가 아니다 — 버릴지, 빈 커밋으로 남길지,
+                # 중단할지는 사용자가 고른다 (ADR-76). 예전에는 여기서
+                # 오류를 던져 '건너뛰기'를 안내했는데, 그 길뿐이라면
+                # 선택이 아니라 통보다.
+                return HistoryOutcome(
+                    kind=HistoryOutcomeKind.WOULD_BE_EMPTY,
+                    operation=state,
+                    message=self._stalled_commit_summary()
+                    or _message_of(result),
+                    skipped_already_applied=_skipped_commits_of(result),
                 )
             return HistoryOutcome(
                 kind=HistoryOutcomeKind.CONFLICTED,
                 operation=state,
                 conflicts=conflicts,
                 message=_message_of(result),
+                skipped_already_applied=_skipped_commits_of(result),
             )
 
         if result.returncode != 0:
@@ -2058,7 +2182,22 @@ class LocalGitEngine:
             kind=HistoryOutcomeKind.COMPLETED,
             operation=expected,
             message=_message_of(result),
+            skipped_already_applied=_skipped_commits_of(result),
         )
+
+    def _stalled_commit_summary(self) -> str:
+        """지금 멈춰 있는 커밋의 메시지 첫 줄. 못 읽으면 빈 문자열.
+
+        "어느 커밋이 비게 되는가"에 답하기 위한 것이다 — rebase는
+        `.git/rebase-merge/message`에, cherry-pick·revert는 `.git/MERGE_MSG`에
+        재생 중인 커밋의 메시지를 둔다 (실측).
+        """
+        base = Path(self._repo.path)
+        for name in ("rebase-merge/message", "MERGE_MSG"):
+            text = _read_state_file(base, name)
+            if text:
+                return text.splitlines()[0]
+        return ""
 
     def _run_git(
         self, args: list[str], *, context: str, check: bool = True

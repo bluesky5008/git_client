@@ -481,6 +481,12 @@ class TestExecutableBitSurvives:
         (root / "run.sh").write_text("base\n", encoding="utf-8")
         commit_all(root, "base")
         git("update-index", "--chmod=+x", "run.sh", cwd=root)
+        # POSIX에서는 디스크 모드도 함께 바꾼다 — `core.filemode=true`라
+        # `add -A`가 디스크의 644를 다시 스테이징해 update-index를 되돌리고,
+        # "exec" 커밋이 빈 커밋이 되어 셋업부터 실패한다 (macOS 실측).
+        # Windows에서는 chmod가 실행 비트에 아무 일도 하지 않아 기존
+        # 동작(끊긴 비트를 인덱스가 복원하는가)이 그대로 검증된다.
+        (root / "run.sh").chmod(0o755)
         commit_all(root, "exec")
         git("checkout", "--quiet", "-b", "feature", cwd=root)
         (root / "run.sh").write_text("theirs\n", encoding="utf-8")

@@ -233,11 +233,13 @@ def test_continue_refuses_while_conflicts_remain(diverged: Path) -> None:
     assert engine.current_operation() is RepoOperation.REBASE
 
 
-def test_continue_reports_an_empty_result_with_a_way_out(diverged: Path) -> None:
+def test_continue_reports_an_empty_result_as_a_choice(diverged: Path) -> None:
     """해결 결과가 이미 있는 내용과 같으면 커밋할 것이 없다.
 
-    git은 rc=1에 상태를 유지해 진짜 오류와 구분되지 않는다. 안내가 없으면
-    사용자는 "계속"과 오류 사이를 무한히 오간다.
+    한때 이것을 오류로 던져 '건너뛰기'를 안내했다 — 길이 하나뿐이라면
+    선택이 아니라 통보다. 지금은 `WOULD_BE_EMPTY`로 돌려주고 버리기·
+    빈 커밋 유지·중단을 사용자가 고른다 (ADR-76). git에게 그냥 맡기면
+    rebase는 커밋을 **조용히 버리고 성공을 보고한다** (실측, DCR-001).
     """
     git("checkout", "--quiet", "main", cwd=diverged)
     engine = LocalGitEngine.open(diverged)
@@ -245,10 +247,11 @@ def test_continue_reports_an_empty_result_with_a_way_out(diverged: Path) -> None
     engine.cherry_pick(topic)
 
     engine.resolve_conflict("f.txt", ConflictChoice.OURS)  # 현재 브랜치 그대로
-    with pytest.raises(EngineError) as caught:
-        engine.continue_operation()
+    outcome = engine.continue_operation()
 
-    assert "건너뛰기" in (caught.value.action or "")
+    assert outcome.kind is HistoryOutcomeKind.WOULD_BE_EMPTY
+    # 연산은 멈춘 채로 남는다 — 아무것도 잃지 않았고, 선택지가 살아 있다.
+    assert engine.current_operation() is RepoOperation.CHERRY_PICK
 
 
 def test_continue_has_nothing_to_do_outside_a_sequencer(diverged: Path) -> None:

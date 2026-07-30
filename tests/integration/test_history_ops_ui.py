@@ -132,6 +132,8 @@ def test_labelled_button_takes_the_content_it_names(window, repo: Path, qtbot) -
 
     window._on_conflict_selected("f.txt")
     qtbot.waitUntil(lambda: panel._current_path == "f.txt", timeout=TIMEOUT)
+    # 상세는 워커가 읽어 온다 (ADR-77) — 도착 전까지 버튼이 잠겨 있다.
+    qtbot.waitUntil(mine_button.isEnabled, timeout=TIMEOUT)
     mine_button.click()
     settle(window, qtbot)
 
@@ -185,6 +187,9 @@ def test_continue_is_blocked_until_conflicts_are_resolved(
     window._on_conflict_selected("f.txt")
     qtbot.waitUntil(
         lambda: window._conflict_panel._current_path == "f.txt", timeout=TIMEOUT
+    )
+    qtbot.waitUntil(
+        window._conflict_panel._take_theirs.isEnabled, timeout=TIMEOUT
     )
     window._conflict_panel._take_theirs.click()
     settle(window, qtbot)
@@ -262,6 +267,9 @@ def test_continue_finishes_the_rebase(window, repo: Path, qtbot) -> None:
     qtbot.waitUntil(
         lambda: window._conflict_panel._current_path == "f.txt", timeout=TIMEOUT
     )
+    qtbot.waitUntil(
+        window._conflict_panel._take_theirs.isEnabled, timeout=TIMEOUT
+    )
     window._conflict_panel._take_theirs.click()
     settle(window, qtbot)
 
@@ -335,6 +343,9 @@ def test_banner_buttons_unlock_after_the_write_finishes(
     window._on_conflict_selected("f.txt")
     qtbot.waitUntil(
         lambda: window._conflict_panel._current_path == "f.txt", timeout=TIMEOUT
+    )
+    qtbot.waitUntil(
+        window._conflict_panel._take_theirs.isEnabled, timeout=TIMEOUT
     )
 
     window._conflict_panel._take_theirs.click()
@@ -472,6 +483,9 @@ def test_banner_clears_without_a_manual_sync(window, repo: Path, qtbot) -> None:
     qtbot.waitUntil(
         lambda: window._conflict_panel._current_path == "f.txt", timeout=TIMEOUT
     )
+    qtbot.waitUntil(
+        window._conflict_panel._take_theirs.isEnabled, timeout=TIMEOUT
+    )
     window._conflict_panel._take_theirs.click()
     settle(window, qtbot)
 
@@ -506,34 +520,41 @@ def test_banner_appears_without_a_manual_sync(
 
 
 def test_failed_detail_does_not_leave_the_previous_file_on_screen(
-    window, repo: Path, qtbot
+    window, repo: Path, qtbot, monkeypatch
 ) -> None:
     """내용을 못 읽으면 그 사실을 말한다 — 이전 파일을 남기지 않는다.
 
     조용히 넘어가면 선택은 B인데 화면은 A의 내용·A의 안내·A 기준으로 켜진
     버튼을 유지한다. 사용자는 A용 설명을 읽고 **B를** 해결한다.
+
+    상세는 ConflictLoader가 **자기 엔진 핸들로** 읽으므로(ADR-77) 실패
+    주입도 인스턴스가 아니라 클래스에 한다 — 인스턴스에 심으면 워커의
+    새 핸들은 멀쩡해서 이 테스트가 검증하려는 경로를 지나가지 않는다.
     """
     from gitclient.domain.errors import EngineError
+    from gitclient.infrastructure.local_engine import LocalGitEngine
 
     start_rebase(repo)
     window._sync_operation_state()
     window._on_conflict_selected("f.txt")
-    qtbot.waitUntil(
-        lambda: window._conflict_panel._current_path == "f.txt", timeout=TIMEOUT
-    )
     panel = window._conflict_panel
-    assert panel._ours.toPlainText(), "먼저 내용이 채워져 있어야 한다"
+    qtbot.waitUntil(lambda: panel._current_path == "f.txt", timeout=TIMEOUT)
+    qtbot.waitUntil(
+        lambda: bool(panel._ours.toPlainText()), timeout=TIMEOUT
+    )
 
-    def boom(_path):
+    def boom(self, _path):  # noqa: ANN001
         raise EngineError("읽기 실패")
 
-    window._engine.conflict_detail = boom
+    monkeypatch.setattr(LocalGitEngine, "conflict_detail", boom)
     window._on_conflict_selected("f.txt")
 
+    qtbot.waitUntil(
+        lambda: "읽지 못했습니다" in panel._hint.text(), timeout=TIMEOUT
+    )
     assert panel._ours.toPlainText() == "", "이전 내용이 남았다"
     assert not panel._take_ours.isEnabled()
     assert not panel._take_theirs.isEnabled()
-    assert "읽지 못했습니다" in panel._hint.text()
 
 
 def test_list_row_names_the_right_actor(window, repo: Path, qtbot) -> None:

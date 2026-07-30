@@ -248,7 +248,13 @@ class ConflictPanel(QWidget):
             self._show_empty()
             return
         self._current_path = current.data(Qt.ItemDataRole.UserRole)
-        # 내용은 저장소를 읽어야 나온다 — 그 일은 UI 스레드 밖에서.
+        # 내용은 저장소를 읽어야 나온다 — 그 일은 UI 스레드 밖에서(ADR-77,
+        # ConflictLoader). 도착 전까지 버튼을 잠근다: 이전 파일 기준으로
+        # 켜진 버튼을 누르면 A의 설명을 읽으며 B를 해결하게 되고, 해결
+        # 경로가 재사용하는 원본(`_working_copy_edited`)도 아직 없다.
+        self._take_ours.setEnabled(False)
+        self._take_theirs.setEnabled(False)
+        self._hint.setText(f"'{self._current_path}'의 내용을 읽는 중...")
         self.detail_requested.emit(self._current_path)
 
     def _request(self, choice: ConflictChoice) -> None:

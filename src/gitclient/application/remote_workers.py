@@ -639,6 +639,15 @@ def skip_operation_job() -> Callable[[Any], Any]:
     return work
 
 
+def keep_empty_operation_job() -> Callable[[Any], Any]:
+    """비게 된 커밋을 빈 커밋으로 남기고 연산을 이어간다 (ADR-76)."""
+
+    def work(engine: Any) -> Any:
+        return engine.keep_empty_operation()
+
+    return work
+
+
 def abort_operation_job() -> Callable[[Any], None]:
     """진행 중인 연산을 통째로 되돌린다. 병합·리베이스 등을 가리지 않는다."""
 

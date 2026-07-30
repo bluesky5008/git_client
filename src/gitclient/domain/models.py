@@ -262,12 +262,18 @@ class ConflictedFile:
 
     path: str
     side: ConflictSide
-    has_markers: bool = True
-    """워킹 트리 파일에 충돌 마커가 들어 있는가.
+    has_markers: bool | None = True
+    """워킹 트리 파일에 충돌 마커가 들어 있는가. **None은 "아직 모름"이다.**
 
     바이너리 충돌과 삭제 계열 충돌에는 마커가 없다. 이때 워킹 트리에는
     우리 것만 남아 있어서, "마커를 정리하고 커밋하라"는 안내를 그대로
     따르면 **상대 변경이 조용히 버려진** 머지 커밋이 만들어진다.
+
+    판정에는 blob 로드가 필요해 파일 크기에 비례한다 — 그래서 UI 스레드의
+    열거(`index_conflicts`)는 분류하지 않고 None으로 두고, 워커에서 만들어진
+    결과(`MergeOutcome`·`HistoryOutcome`의 conflicts)만 채워져 온다 (ADR-77).
+    None을 False("마커 없음")로 읽으면 안 된다 — 그 구분이 이 필드가
+    존재하는 이유다.
     """
 
     @property
@@ -622,8 +628,18 @@ class HistoryOutcomeKind(Enum):
     """충돌로 멈췄다. **실패가 아니다** — 사람이 이어받을 차례다.
 
     충돌 목록이 비어 있는 채로 이 값이 오는 경우는 없다. 남길 변경이 없어
-    멈춘 상태는 엔진이 조치를 실은 오류로 바꾼다 — 화면이 "충돌 0개를
+    멈춘 상태는 `WOULD_BE_EMPTY`로 온다 — 화면이 "충돌 0개를
     해결해야 합니다"라는 말이 안 되는 안내를 띄우지 않도록.
+    """
+
+    WOULD_BE_EMPTY = "would_be_empty"
+    """이대로 진행하면 지금 커밋이 결과에 남지 않는다. **실패도, 충돌도 아니다.**
+
+    두 경로로 온다 (ADR-76): `--empty=stop`이 적용 시점에 비게 된 커밋을
+    세웠거나, 충돌을 한쪽으로 해결해 스테이징 트리가 HEAD와 같아졌다.
+    git은 이 상태에서 `--continue`를 부르면 **커밋을 조용히 버리고 성공을
+    보고한다** (실측 — DCR-001). 버릴지, 빈 커밋으로 남길지, 중단할지는
+    사용자가 고른다.
     """
 
     # `NOTHING_TO_DO`가 한때 여기 있었다. **아무도 만들지 않았다** —
@@ -644,6 +660,16 @@ class HistoryOutcome:
     message: str = ""
     """사용자에게 그대로 보여줄 수 있는 git의 설명. 없으면 빈 문자열."""
 
+    skipped_already_applied: tuple[str, ...] = ()
+    """이미 upstream에 있어 git이 생략한 커밋들의 sha. **손실이 아니다** —
+    같은 변경이 결과에 이미 들어 있다. 다만 조용히 지나가면 사용자는
+    "커밋이 사라졌다"와 구분할 수 없으므로 완료 보고에 싣는다 (ADR-76).
+    """
+
     @property
     def is_conflicted(self) -> bool:
         return self.kind is HistoryOutcomeKind.CONFLICTED
+
+    @property
+    def is_would_be_empty(self) -> bool:
+        return self.kind is HistoryOutcomeKind.WOULD_BE_EMPTY

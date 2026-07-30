@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from gitclient.application.commit_loader import CommitLoader
+from gitclient.application.conflict_loader import ConflictLoader
 from gitclient.application.diff_loader import DiffLoader, WorkdirDiffLoader
 from gitclient.application.remote_workers import (
     PrefetchWorker,
@@ -66,6 +67,7 @@ from gitclient.application.remote_workers import (
     continue_operation_job,
     resolve_conflict_job,
     fast_forward_job,
+    keep_empty_operation_job,
     rebase_job,
     reset_job,
     revert_job,
@@ -205,6 +207,13 @@ class MainWindow(QMainWindow):
         self._diff_debounce.setSingleShot(True)
         self._diff_debounce.setInterval(50)
         self._diff_debounce.timeout.connect(self._dispatch_pending_diff)
+
+        # 충돌 상세 비동기 상태 (ADR-77 — diff와 같은 세대 토큰 방식).
+        # 최근 도착한 상세는 해결 버튼 경로(`_working_copy_edited`)가
+        # 재사용한다 — 클릭 시점에 blob을 UI 스레드에서 다시 읽지 않도록.
+        self._conflict_generation = 0
+        self._conflict_loaders: dict[int, ConflictLoader] = {}
+        self._loaded_conflict_detail = None
 
         self._commit_model = CommitGraphModel(self)
         self._diff_model = DiffModel(self)
@@ -1180,6 +1189,81 @@ class MainWindow(QMainWindow):
             return  # 교체된 저장소의 늦은 결과
         if isinstance(result, (MergeOutcome, HistoryOutcome)) and result.is_conflicted:
             self._enter_conflict_mode(result)
+            return
+        if isinstance(result, HistoryOutcome) and result.is_would_be_empty:
+            self._enter_would_be_empty(result)
+            return
+        if isinstance(result, HistoryOutcome) and result.skipped_already_applied:
+            # 정당한 생략이지만 조용히 지나가면 "커밋이 사라졌다"와 구분되지
+            # 않는다 (ADR-76). 오류 채널이 아니다 — 잃은 것이 없다.
+            shas = ", ".join(s[:7] for s in result.skipped_already_applied[:5])
+            self._notify(
+                "이미 반영된 커밋 생략",
+                f"커밋 {len(result.skipped_already_applied)}개는 이미 "
+                "upstream에 같은 변경이 있어 생략했습니다.",
+                detail=f"생략된 커밋: {shas}",
+                action="같은 변경이 결과에 이미 들어 있습니다 — 잃은 것은 없습니다.",
+            )
+
+    def _enter_would_be_empty(self, outcome: HistoryOutcome) -> None:
+        """이대로 진행하면 지금 커밋이 결과에 남지 않는다 — 사용자가 고른다.
+
+        git은 이 상태에서 `--continue`를 부르면 커밋을 조용히 버리고 성공을
+        보고한다 (실측, ADR-76). 그 조용함을 선택으로 바꾸는 것이 이 화면의
+        존재 이유다. 여기서 아무것도 고르지 않아도 안전하다 — 연산은 멈춘
+        채로 남고, 배너의 계속·건너뛰기·중단이 그대로 있다.
+        """
+        # 배너·메뉴를 먼저 세운다 (_enter_conflict_mode와 같은 이유 — 상태는
+        # 저장소에 있고, 화면이 그것을 모르면 빠져나갈 버튼이 없다).
+        if self._engine is not None:
+            try:
+                self._operation = self._engine.operation_state(conflict_count=0)
+            except GitClientError:
+                self._operation = OperationState(operation=outcome.operation)
+        self._merge_conflicts = ()
+        self._apply_operation_state()
+
+        label = self._operation.operation.label or outcome.operation.label
+        subject = f"'{outcome.message}'" if outcome.message else "지금 멈춰 있는 커밋"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("이 커밋에 남길 변경이 없습니다")
+        box.setText(
+            f"{subject}의 변경이 이미 반영되어 있어, 이대로 진행하면 "
+            "이 커밋은 결과에 남지 않습니다."
+        )
+        box.setInformativeText(
+            "버리면 커밋이 히스토리에서 사라집니다 (git reflog로만 복구).\n"
+            "빈 커밋으로 남기면 메시지는 유지되고 변경 없는 커밋이 됩니다."
+        )
+        skip = box.addButton("이 커밋 버리기", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("빈 커밋으로 남기기", QMessageBox.ButtonRole.AcceptRole)
+        abort = box.addButton(f"{label} 중단...", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("나중에", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is skip:
+            # 이 다이얼로그가 결과("사라집니다")를 이미 말했다 — 같은 확인을
+            # 또 받으면 ADR-73이 지적한 이중 통과다. 바로 제출하고 잠근다.
+            if self._write_queue is not None:
+                self._submit_write(
+                    f"{label} 건너뛰기", skip_operation_job(), reload_graph=True
+                )
+                self._apply_operation_state()
+        elif clicked is keep:
+            if self._write_queue is not None:
+                self._submit_write(
+                    f"{label} 빈 커밋 유지",
+                    keep_empty_operation_job(),
+                    reload_graph=True,
+                )
+                self._apply_operation_state()
+        elif clicked is abort:
+            # 중단은 이 커밋이 아니라 **연산 전체**를 되돌린다 — 범위가
+            # 다르므로 기존 확인 절차를 그대로 거친다.
+            self._on_abort_operation()
 
     def _enter_conflict_mode(self, outcome) -> None:  # noqa: ANN001
         """충돌 상태를 화면에 드러낸다.
@@ -1217,7 +1301,10 @@ class MainWindow(QMainWindow):
         # 사용자는 있지도 않은 것을 찾는다. 그대로 커밋하면 워킹 트리에 남은
         # 우리 것만 들어가 **상대 변경이 조용히 버려진다** — 그 파일들은
         # 어느 쪽을 남길지 직접 골라야 한다.
-        markerless = [c.path for c in outcome.conflicts if not c.has_markers]
+        # `is False`가 중요하다 — 워커가 만든 outcome은 항상 분류돼 오지만
+        # (ADR-77), None(미분류)을 "마커 없음"으로 읽으면 텍스트 충돌에
+        # "상대 변경이 버려진다"는 겁나는 안내가 잘못 붙는다.
+        markerless = [c.path for c in outcome.conflicts if c.has_markers is False]
         detail = f"충돌한 파일: {summary}"
         if len(markerless) < len(outcome.conflicts):
             detail += (
@@ -1905,20 +1992,43 @@ class MainWindow(QMainWindow):
         self._graph_reload_pending = True
 
     def _on_conflict_selected(self, path: str) -> None:
-        """고른 파일의 양쪽 내용을 채운다.
+        """고른 파일의 양쪽 내용을 워커에게 부탁한다 (ADR-77).
 
-        인덱스 스테이지를 읽는 짧은 작업이라 UI 스레드에서 한다 —
-        상한이 파일 하나 크기로 알려져 있다 (§3.3).
+        한때 "상한이 파일 하나 크기"라며 UI 스레드에서 동기 실행했지만,
+        파일 하나의 크기는 알려진 상한이 아니다 — 감사 실측 37.8MB 파일
+        313ms (backlog §3.3). §3.3이 허용하는 것은 핸들 열기(~20ms)처럼
+        상한이 실제로 정해진 호출뿐이다.
         """
-        if self._engine is None:
+        if self._engine is None or self._repo_path is None:
             return
-        try:
-            self._conflict_panel.show_detail(self._engine.conflict_detail(path))
-        except GitClientError:
-            # 그 사이 해결됐거나 저장소가 바뀌었다. **조용히 넘어가지 않는다** —
-            # 그러면 이전 파일의 내용과 안내가 그대로 남아, 사용자가 A의
-            # 설명을 읽으며 B를 해결하게 된다 (ADR-65와 같은 부류의 오도).
-            self._conflict_panel.show_unavailable(path)
+        self._loaded_conflict_detail = None
+        for stale in self._conflict_loaders.values():
+            stale.cancel()
+        self._conflict_loaders.clear()
+
+        self._conflict_generation += 1
+        token = self._conflict_generation
+        loader = ConflictLoader(self._repo_path, path, token)
+        loader.signals.ready.connect(self._on_conflict_detail_ready)
+        loader.signals.failed.connect(self._on_conflict_detail_failed)
+        self._conflict_loaders[token] = loader
+        self._pool.start(loader)
+
+    def _on_conflict_detail_ready(self, token: int, path: str, detail) -> None:  # noqa: ANN001
+        self._conflict_loaders.pop(token, None)
+        if token != self._conflict_generation:
+            return  # 늦게 도착한 이전 세대의 결과
+        self._loaded_conflict_detail = detail
+        self._conflict_panel.show_detail(detail)
+
+    def _on_conflict_detail_failed(self, token: int, path: str, _error) -> None:  # noqa: ANN001
+        self._conflict_loaders.pop(token, None)
+        if token != self._conflict_generation:
+            return
+        # 그 사이 해결됐거나 저장소가 바뀌었다. **조용히 넘어가지 않는다** —
+        # 그러면 이전 파일의 내용과 안내가 그대로 남아, 사용자가 A의
+        # 설명을 읽으며 B를 해결하게 된다 (ADR-65와 같은 부류의 오도).
+        self._conflict_panel.show_unavailable(path)
 
     def _on_resolve_conflict(self, path: str, choice) -> None:  # noqa: ANN001
         """한쪽을 골라 충돌을 해결한다.
@@ -1965,6 +2075,12 @@ class MainWindow(QMainWindow):
         그래서 두 가지를 함께 본다: 마커가 남아 있으면 손대지 않은 것이고,
         마커가 없더라도 내용이 양쪽 원본 중 하나와 같으면 git이 써둔 그대로다.
         둘 다 아닐 때만 사용자가 손을 댄 것으로 본다.
+
+        양쪽 원본은 워커가 이미 읽어둔 것을 재사용한다 (ADR-77) — 해결
+        버튼은 상세가 도착해야 켜지므로 그 시점에는 항상 있다. blob을
+        여기서 다시 읽으면 클릭 한 번이 파일 크기의 3배를 UI 스레드에서
+        쓴다 (backlog §3.3). 워킹 파일 1회 읽기는 남는다 — 편집은 상세
+        도착 이후에도 일어날 수 있어 클릭 시점의 내용이어야 한다.
         """
         if self._repo_path is None or self._engine is None:
             return False
@@ -1977,10 +2093,9 @@ class MainWindow(QMainWindow):
             return False
         if b"<<<<<<<" in data and b">>>>>>>" in data:
             return False  # 아직 마커가 그대로다
-        try:
-            detail = self._engine.conflict_detail(path)
-        except GitClientError:
-            return False
+        detail = self._loaded_conflict_detail
+        if detail is None or detail.path != path:
+            return False  # 상세가 없으면 비교할 원본도 없다 — 확인창을 띄울 근거 부족
         return data not in (detail.ours.data, detail.theirs.data)
 
     def _sync_operation_state(self) -> None:
