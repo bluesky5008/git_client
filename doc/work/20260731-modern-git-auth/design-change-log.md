@@ -2,4 +2,4 @@
 
 | 변경 요청 | 날짜 | 변경 요약 | 관련 ADR | 이전 기준선 | 새 기준선 | 승인자 | 상태 |
 |---|---|---|---|---|---|---|---|
-| DCR-003 | 2026-07-31 | 자격증명 공급을 askpass shim에서 일회성 credential helper의 get으로 (최신 git의 askpass 차단 대응). shim 파일 소멸로 §4.8.7 일부 🔶 해소 | ADR-78 (신규, ADR-31 대체) | design.md v2.4 | v2.5 | (사후 승인 대기) | 제안 — 구현·검증됨 |
+| DCR-003 | 2026-07-31 | 자격증명 공급을 askpass shim에서 일회성 credential helper의 get으로 (최신 git의 askpass 차단 대응). shim 파일 소멸로 §4.8.7 일부 🔶 해소 | ADR-78 (신규, ADR-31 대체) | design.md v2.4 | v2.5 | 사용자 | 반영 완료 (2026-07-31 사후 승인) |
