@@ -1059,6 +1059,16 @@ class RemoteEngine:
                 # 프로세스가 끝나도 파이프에 남은 것이 있다. 끝까지 읽어야
                 # 계측이 마지막 진행률 줄을 놓치지 않는다.
                 _release_pipes(proc, pump.join(DRAIN_TIMEOUT_S))
+                # **마지막 상태를 반드시 한 번 보고한다** (ADR-79). 폴링은
+                # 0.2초 격자라 완료 직전 구간을 구조적으로 놓친다 — 빠른
+                # 전송은 보고가 0회가 되고, 느린 전송도 표시가 100% 아닌
+                # 값에서 끝난다. 계측은 이미 마지막 줄을 읽는데 화면만
+                # 못 받는 비대칭이었다. 취소된 작업은 내지 않는다 —
+                # 취소한 사용자에게 진행률이 이어지면 안 된다.
+                with self._lock:
+                    aborted = self._aborted
+                if not aborted:
+                    self._report_progress(pump.tail())
                 return pump.collected()
 
             # 폴링 주기(0.2초)마다 한 번만 알린다. git은 그보다 자주
