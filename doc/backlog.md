@@ -37,9 +37,15 @@
 
 | 순위 | 항목 | 왜 이 순서인가 |
 |------|------|---------------|
-| 1 | **첫 CI 실행 결과 확인** (Windows·Linux) ⚪ | 2026-07-31에 3-OS CI를 넣었다 — 첫 push의 결과가 ADR-78 등 크로스플랫폼 가정의 실측이다 |
-| 2 | 인터랙티브 rebase 🟢 | Phase 4의 마지막 조각 |
-| 3 | 다국어 🟢 | Phase 5의 마지막 조각 (전용 카탈로그 회차) |
+| 1 | 인터랙티브 rebase 🟢 | Phase 4의 마지막 조각 |
+| 2 | 다국어 🟢 | Phase 5의 마지막 조각 (전용 카탈로그 회차) |
+
+**3-OS CI가 초록이다** (2026-07-31, 7차 실행에서 확정): Windows·macOS·
+Linux 전체 스위트 + 2-OS 패키징 통과. ADR-78(credential helper의 sh
+실행)이 Windows에서 실측 확정됐다. 안정화 과정의 여섯 왕복이 남긴
+크로스플랫폼 지식은 픽스처·테스트 주석에 있다 — git 2.54+는 fetch 후
+자동 유지보수가 팩을 합치고(제품은 maintenance.auto=false로 이미 방어),
+Windows는 mmap된 옛 팩의 삭제를 다음 기회로 미룬다.
 
 **직전에 끝난 것** (2026-07-31): LICENSE(MIT)·제3자 고지·PyInstaller
 onedir 스펙(로컬 빌드 106MB, `--version` 스모크 통과)·3-OS CI + 패키징
