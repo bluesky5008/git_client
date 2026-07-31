@@ -24,43 +24,55 @@ def pack_files(repo: Path) -> list[Path]:
     return sorted(pack_dir.glob("*.pack")) if pack_dir.exists() else []
 
 
+def _fast_import(root: Path, index: int, *, first: bool) -> None:
+    """커밋 하나를 fast-import로 넣는다 — **호출마다 팩이 하나 생긴다.**
+
+    repack 반복도, pack-objects도, unpackLimit fetch도 git 버전마다 다르게
+    끝났다 (1~5차 CI 실측: 2.50/2.54/2.55/윈도우가 제각각). fast-import는
+    팩을 직접 쓰는 도구라 그 어떤 전송·정리 휴리스틱도 끼어들지 않는다 —
+    벤치 픽스처(tests/benchmarks/fixtures.py)가 전 플랫폼에서 이미 검증한
+    방식이다.
+    """
+    import subprocess
+
+    content = (("x" * 64 + "\n") * 200 + f"{index}\n").encode()
+    message = f"c{index}\n".encode()
+    parts = [
+        b"blob\n",
+        b"mark :1\n",
+        b"data %d\n" % len(content),
+        content,
+        b"\n",
+        b"commit refs/heads/main\n",
+        b"author t <t@t> %d +0000\n" % (1_700_000_000 + index),
+        b"committer t <t@t> %d +0000\n" % (1_700_000_000 + index),
+        b"data %d\n" % len(message),
+        message,
+    ]
+    if not first:
+        parts.append(b"from refs/heads/main^0\n")
+    parts.append(b"M 100644 :1 f.txt\n\n")
+    result = subprocess.run(
+        # fastimport.unpackLimit(기본 100): 이보다 작은 팩은 fast-import가
+        # 끝에서 풀어 느슨한 오브젝트로 바꿔버린다 — 벤치(10만 커밋)는 안
+        # 걸리고 이 픽스처(3 오브젝트)만 걸리는 함정. 1로 고정해 팩을 남긴다.
+        ["git", "-C", str(root), "-c", "fastimport.unpackLimit=1",
+         "fast-import", "--quiet"],
+        input=b"".join(parts),
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
 @pytest.fixture
 def multipack(tmp_path: Path) -> Path:
-    """팩이 여러 개 쌓인 저장소 — unpackLimit=1 환경의 일상.
-
-    팩을 손으로 만드는 두 시도(`repack -q` 반복, `pack-objects` 직접 호출)는
-    git 버전마다 다르게 끝났다 (1~3차 CI 실측: Windows는 한 개로 합쳐지고,
-    2.54+는 세 번 중 두 개만 남았다). **제품이 실제로 팩을 쌓는 메커니즘
-    그대로 만든다**: `transfer.unpackLimit=1` fetch는 받은 팩을 풀지 않고
-    보관한다 — BASE_CONFIG(ADR-16)가 보증하는, 버전과 무관하게 우리가
-    이미 기대고 있는 동작이다.
-    """
-    origin = tmp_path / "origin"
-    origin.mkdir()
-    git("init", "--quiet", "-b", "main", str(origin))
-    (origin / "f.txt").write_text("base\n", encoding="utf-8")
-    git("add", "-A", cwd=origin)
-    git(*AUTHOR_ENV, "commit", "--quiet", "-m", "base", cwd=origin)
-
+    """팩이 여러 개 쌓인 저장소 — unpackLimit=1 환경의 일상을 결정적으로."""
     root = tmp_path / "work"
-    git("clone", "--quiet", "--no-local", str(origin), str(root))
+    root.mkdir()
+    git("init", "--quiet", "-b", "main", str(root))
     for index in range(3):
-        (origin / "f.txt").write_text(
-            ("x" * 64 + "\n") * 200 + f"{index}\n", encoding="utf-8"
-        )
-        git("add", "-A", cwd=origin)
-        git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=origin)
-        # 제품의 BASE_CONFIG와 같은 조합이어야 한다 — unpackLimit만 주면
-        # git 2.54+의 fetch 후 자동 유지보수가 팩을 도로 합쳐버린다
-        # (4차 CI 실측: 3회 fetch에 팩 2개). 제품은 maintenance.auto=false로
-        # 그 정리를 우리 손(유휴 repack)에 맡긴다 — 픽스처도 같아야 한다.
-        git(
-            "-c", "transfer.unpackLimit=1",
-            "-c", "maintenance.auto=false",
-            "-c", "gc.auto=0",
-            "fetch", "--quiet", cwd=root,
-        )
-    git("merge", "--ff-only", "--quiet", "origin/main", cwd=root)
+        _fast_import(root, index, first=index == 0)
+    git("checkout", "--quiet", "-f", "main", cwd=root)
 
     packs = pack_files(root)
     version = git("--version", cwd=root).stdout.strip()
