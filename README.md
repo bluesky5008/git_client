@@ -129,9 +129,10 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 
 **아직 없는 것** (전체 목록: [doc/backlog.md](doc/backlog.md))
 
-- 코드서명·공증 (dmg·Windows 인스톨러는 CI가 매 push마다 만든다 —
-  서명만 인증서를 가진 사람의 몫이다)
-- Linux 패키징(AppImage·deb) — 수요 확인 후
+- 코드서명·공증 — **하지 않기로 결정** (2026-07-31). 배선은 남아 있어
+  인증서를 꽂으면 명령 하나로 켜진다(doc/release.md §4). 그때까지
+  첫 실행에서 OS 경고를 한 번 넘긴다 (macOS: 우클릭→열기)
+- Linux 패키징(AppImage·deb) — 하지 않기로 결정 (2026-07-31)
 
 ---
 
