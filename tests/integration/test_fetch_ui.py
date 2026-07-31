@@ -498,14 +498,23 @@ class TestDivergenceIndicator:
         remote.diverge()
         window._on_fetch()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
-        message = window.statusBar().currentMessage()
-        assert "↑1" in message and "↓1" in message, message
+        # 벌어진 정도는 RefsLoader가 계산해 온다 (ADR-89) — 값은 참조
+        # 목록과 함께 **비동기로** 도착하므로, 도착 시점을 기다리지 않고
+        # 단정하면 이전 값("동기화됨")을 읽는다 (Windows CI 실측).
+        def diverged() -> bool:
+            message = window.statusBar().currentMessage()
+            return "↑1" in message and "↓1" in message
+
+        qtbot.waitUntil(diverged, timeout=TIMEOUT)
 
     def test_in_sync_says_so(self, window, qtbot) -> None:  # noqa: ANN001
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
-        assert "원격과 동기화됨" in window.statusBar().currentMessage()
+        # 같은 이유로 도착을 기다린다 — 위 테스트와 달리 아직 안 터진
+        # 것은 창을 연 직후라 경합의 창이 좁았을 뿐이다.
+        qtbot.waitUntil(
+            lambda: "원격과 동기화됨" in window.statusBar().currentMessage(),
+            timeout=TIMEOUT,
+        )
 
 
 class TestFormatBytes:
