@@ -359,7 +359,11 @@ class TestCloseDoesNotWaitForTheAsyncKill:
             window.close()
             elapsed_ms = (time.perf_counter() - start) * 1000
 
-            assert elapsed_ms < 150, (
+            # 이 검사가 잡으려는 실패는 "멈춘 워커를 기다리며 초 단위로
+            # 막히는 것"이다. 150ms 상한은 로컬 성능 수치였고 공유 CI
+            # 러너에서는 소음에 걸렸다(실측 161ms). 의미를 지키는 상한은
+            # 1초다 — 워커 대기라면 stall 타임아웃(초 단위)만큼 막힌다.
+            assert elapsed_ms < 1000, (
                 f"창 닫기가 {elapsed_ms:.0f}ms 막았다 — 남은 워커를 기다리고 있다"
             )
         finally:

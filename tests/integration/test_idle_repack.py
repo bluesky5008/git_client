@@ -50,7 +50,16 @@ def multipack(tmp_path: Path) -> Path:
         )
         git("add", "-A", cwd=origin)
         git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=origin)
-        git("-c", "transfer.unpackLimit=1", "fetch", "--quiet", cwd=root)
+        # 제품의 BASE_CONFIG와 같은 조합이어야 한다 — unpackLimit만 주면
+        # git 2.54+의 fetch 후 자동 유지보수가 팩을 도로 합쳐버린다
+        # (4차 CI 실측: 3회 fetch에 팩 2개). 제품은 maintenance.auto=false로
+        # 그 정리를 우리 손(유휴 repack)에 맡긴다 — 픽스처도 같아야 한다.
+        git(
+            "-c", "transfer.unpackLimit=1",
+            "-c", "maintenance.auto=false",
+            "-c", "gc.auto=0",
+            "fetch", "--quiet", cwd=root,
+        )
     git("merge", "--ff-only", "--quiet", "origin/main", cwd=root)
 
     packs = pack_files(root)
