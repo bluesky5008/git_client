@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from gitclient.i18n import trf
+
 import os
 import threading
 from pathlib import Path
@@ -221,7 +223,7 @@ class RemoteWorker(QRunnable):
             if not self._cancelled:
                 self.signals.failed.emit(
                     GitClientError(
-                        f"{self.label} 중 예상치 못한 오류가 발생했습니다.",
+                        trf("{self_label} 중 예상치 못한 오류가 발생했습니다.", self_label=self.label),
                         detail=f"{type(exc).__name__}: {exc}",
                     )
                 )

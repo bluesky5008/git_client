@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gitclient.i18n import trf
 from gitclient.domain.conflict_text import (
     CHOICE_BOTH,
     CHOICE_OURS,
@@ -41,7 +42,7 @@ class ConflictLinesDialog(QDialog):
 
     def __init__(self, path: str, hunks, labels, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
-        self.setWindowTitle(f"줄 단위로 고르기 — {path}")
+        self.setWindowTitle(trf("줄 단위로 고르기 — {path}", path=path))
         self.resize(760, 560)
         self._groups: list[QButtonGroup] = []
 
@@ -50,7 +51,7 @@ class ConflictLinesDialog(QDialog):
         fixed = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
 
         for number, hunk in enumerate(hunks, start=1):
-            box = QGroupBox(f"구획 {number}")
+            box = QGroupBox(trf("구획 {number}", number=number))
             box_layout = QVBoxLayout(box)
 
             panes = QHBoxLayout()

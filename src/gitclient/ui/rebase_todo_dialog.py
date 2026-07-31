@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from gitclient.i18n import trf
 from gitclient.domain.models import RebaseAction, RebaseStep
 
 _ACTION_LABELS: tuple[tuple[RebaseAction, str], ...] = (
@@ -41,7 +42,7 @@ class RebaseTodoDialog(QDialog):
 
     def __init__(self, upstream: str, steps, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
-        self.setWindowTitle(f"'{upstream}' 위로 리베이스 — 계획")
+        self.setWindowTitle(trf("'{upstream}' 위로 리베이스 — 계획", upstream=upstream))
         self.resize(760, 480)
 
         self._tree = QTreeWidget()

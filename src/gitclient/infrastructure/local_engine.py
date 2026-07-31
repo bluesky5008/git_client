@@ -37,6 +37,7 @@ from pygit2.enums import (
     SortMode,
 )
 
+from gitclient.i18n import trf
 from gitclient.domain.errors import (
     EngineError,
     GitClientError,
@@ -141,7 +142,7 @@ def _translate(context: str, *, partial_hint: bool = False):
                 ),
             ) from exc
         raise EngineError(
-            f"{context} 중 Git 엔진 오류가 발생했습니다.",
+            trf("{context} 중 Git 엔진 오류가 발생했습니다.", context=context),
             detail=f"{type(exc).__name__}: {exc}",
         ) from exc
 
@@ -821,7 +822,7 @@ class LocalGitEngine:
                     continue
                 return self._to_file_patch(patch)
         raise EngineError(
-            f"변경 내용을 찾을 수 없습니다: {path}",
+            trf("변경 내용을 찾을 수 없습니다: {path}", path=path),
             action="파일이 외부에서 바뀌었을 수 있습니다. 새로 고침(F5) 후 다시 시도해 주세요.",
         )
 
@@ -939,8 +940,8 @@ class LocalGitEngine:
             except pygit2.GitError as exc:
                 # 합성이 틀리면 libgit2가 여기서 거부한다. 인덱스는 그대로다.
                 raise EngineError(
-                    f"부분 {action}에 실패했습니다.",
-                    detail=f"{exc}\n\n--- 생성된 패치 ---\n{patch_text}",
+                    trf("부분 {action}에 실패했습니다.", action=action),
+                    detail=trf("{exc}\n\n--- 생성된 패치 ---\n{patch_text}", exc=exc, patch_text=patch_text),
                     action="파일이 그 사이 변경되었을 수 있습니다. "
                     "새로 고침(F5) 후 다시 시도해 주세요.",
                 ) from exc
@@ -1045,7 +1046,7 @@ class LocalGitEngine:
                 # 확인 다이얼로그가 약속한 것과 다른 일이 벌어진다.
                 # git도 같은 이유로 거부한다(path '...' is unmerged).
                 raise EngineError(
-                    f"'{path}'은(는) 충돌 해결 중이라 변경을 버릴 수 없습니다.",
+                    trf("'{path}'은(는) 충돌 해결 중이라 변경을 버릴 수 없습니다.", path=path),
                     action="충돌 마커를 정리한 뒤 스테이징해 해결하거나, "
                     "'저장소 > 병합 중단'으로 병합 전체를 되돌려 주세요.",
                 )
@@ -1079,8 +1080,8 @@ class LocalGitEngine:
             if len(unresolved) > 3:
                 paths += f" 외 {len(unresolved) - 3}개"
             raise EngineError(
-                f"해결되지 않은 충돌 {len(unresolved)}개가 남아 커밋할 수 없습니다.",
-                detail=f"충돌한 파일: {paths}",
+                trf("해결되지 않은 충돌 {len_unresolved}개가 남아 커밋할 수 없습니다.", len_unresolved=len(unresolved)),
+                detail=trf("충돌한 파일: {paths}", paths=paths),
                 action="충돌한 파일을 정리한 뒤 스테이징하면 커밋할 수 "
                 "있습니다. 되돌리려면 '저장소 > 병합 중단'을 선택해 주세요.",
             )
@@ -1182,7 +1183,7 @@ class LocalGitEngine:
                 )
             if name in self._repo.branches.local:
                 raise EngineError(
-                    f"브랜치가 이미 있습니다: {name}",
+                    trf("브랜치가 이미 있습니다: {name}", name=name),
                     action="다른 이름을 사용해 주세요.",
                 )
             if sha is None:
@@ -1241,7 +1242,7 @@ class LocalGitEngine:
                 )
             if any(r.name == name for r in self._repo.remotes):
                 raise EngineError(
-                    f"원격이 이미 있습니다: {name}",
+                    trf("원격이 이미 있습니다: {name}", name=name),
                     action="다른 이름을 쓰거나 기존 원격의 주소를 바꿔 주세요.",
                 )
             self._repo.remotes.create(name, url)
@@ -1252,7 +1253,7 @@ class LocalGitEngine:
         with _translate("원격 삭제"):
             if not any(r.name == name for r in self._repo.remotes):
                 raise EngineError(
-                    f"원격이 없습니다: {name}",
+                    trf("원격이 없습니다: {name}", name=name),
                     action="목록을 새로 고친 뒤 다시 시도해 주세요.",
                 )
             self._repo.remotes.delete(name)
@@ -1264,7 +1265,7 @@ class LocalGitEngine:
                 raise EngineError("원격 주소를 입력해 주세요.")
             if not any(r.name == name for r in self._repo.remotes):
                 raise EngineError(
-                    f"원격이 없습니다: {name}",
+                    trf("원격이 없습니다: {name}", name=name),
                     action="목록을 새로 고친 뒤 다시 시도해 주세요.",
                 )
             self._repo.remotes.set_url(name, url)
@@ -1348,8 +1349,8 @@ class LocalGitEngine:
         operation = self.current_operation()
         if operation in _SEQUENCER_COMMAND:
             raise EngineError(
-                f"{operation.label}이(가) 진행 중이라 브랜치를 바꿀 수 없습니다.",
-                detail=f"저장소 상태: {self._repo.state()!r}",
+                trf("{operation_label}이(가) 진행 중이라 브랜치를 바꿀 수 없습니다.", operation_label=operation.label),
+                detail=trf("저장소 상태: {self__repo_state!r}", self__repo_state=self._repo.state()),
                 action="진행 중인 작업을 마치거나 '중단'으로 되돌린 뒤 "
                 "다시 시도해 주세요.",
             )
@@ -1363,7 +1364,7 @@ class LocalGitEngine:
         except EngineError as exc:
             if "conflict" in (exc.detail or "").lower():
                 raise EngineError(
-                    f"로컬 변경과 충돌해 '{name}' 브랜치로 전환할 수 없습니다.",
+                    trf("로컬 변경과 충돌해 '{name}' 브랜치로 전환할 수 없습니다.", name=name),
                     detail=exc.detail,
                     action="변경 사항을 커밋하거나 stash에 보관한 뒤 다시 시도해 주세요.",
                 ) from exc
@@ -1374,7 +1375,7 @@ class LocalGitEngine:
         with _translate("브랜치 삭제"):
             branch = self._repo.branches.local.get(name)
             if branch is None:
-                raise EngineError(f"브랜치를 찾을 수 없습니다: {name}")
+                raise EngineError(trf("브랜치를 찾을 수 없습니다: {name}", name=name))
             if branch.is_head():
                 raise EngineError(
                     "현재 작업 중인 브랜치는 삭제할 수 없습니다.",
@@ -1446,7 +1447,7 @@ class LocalGitEngine:
             reference = self._repo.references.get(upstream_ref)
             if reference is None:
                 raise EngineError(
-                    f"원격 추적 참조를 찾을 수 없습니다: {upstream_ref}",
+                    trf("원격 추적 참조를 찾을 수 없습니다: {upstream_ref}", upstream_ref=upstream_ref),
                     action="먼저 가져오기(Fetch)를 실행해 주세요.",
                 )
             target = _peel_to_commit_id(reference)
@@ -1667,7 +1668,7 @@ class LocalGitEngine:
             except KeyError:
                 pass
         raise EngineError(
-            f"'{path}'은(는) 충돌 상태가 아닙니다.",
+            trf("'{path}'은(는) 충돌 상태가 아닙니다.", path=path),
             action="목록을 새로 고친 뒤 다시 시도해 주세요.",
         )
 
@@ -1761,7 +1762,7 @@ class LocalGitEngine:
                 raw = target.read_bytes()
             except OSError as exc:
                 raise EngineError(
-                    f"'{path}'을(를) 읽지 못했습니다.", detail=str(exc)
+                    trf("'{path}'을(를) 읽지 못했습니다.", path=path), detail=str(exc)
                 ) from exc
             try:
                 segments = parse_conflicted(
@@ -1770,7 +1771,7 @@ class LocalGitEngine:
                 composed = compose(segments, choices)
             except ValueError as exc:
                 raise EngineError(
-                    f"'{path}'의 충돌 마커를 읽을 수 없습니다.",
+                    trf("'{path}'의 충돌 마커를 읽을 수 없습니다.", path=path),
                     detail=str(exc),
                     action="파일을 이미 편집하셨다면 편집기에서 마커를 정리한 뒤 "
                     "스테이징해 주세요.",
@@ -1798,13 +1799,13 @@ class LocalGitEngine:
         mode = entry.mode
         if mode == 0o120000:
             raise EngineError(
-                f"'{path}'은(는) 심볼릭 링크라 여기서 해결할 수 없습니다.",
+                trf("'{path}'은(는) 심볼릭 링크라 여기서 해결할 수 없습니다.", path=path),
                 action="git CLI에서 `git checkout --ours/--theirs -- <경로>`로 "
                 "해결해 주세요.",
             )
         if mode == 0o160000:
             raise EngineError(
-                f"'{path}'은(는) 서브모듈이라 여기서 해결할 수 없습니다.",
+                trf("'{path}'은(는) 서브모듈이라 여기서 해결할 수 없습니다.", path=path),
                 action="서브모듈 디렉터리에서 원하는 커밋을 체크아웃한 뒤 "
                 "상위 저장소에서 스테이징해 주세요.",
             )
@@ -1834,7 +1835,7 @@ class LocalGitEngine:
                 # no-op은 그 자체로 또 다른 실패다.
                 raise EngineError(
                     "진행 중인 작업이 병합이 아니어서 중단할 수 없습니다.",
-                    detail=f"저장소 상태: {state!r}",
+                    detail=trf("저장소 상태: {state!r}", state=state),
                     action="rebase나 cherry-pick은 git CLI에서 "
                     "`git rebase --abort` 등으로 정리해 주세요.",
                 )
@@ -1894,7 +1895,7 @@ class LocalGitEngine:
         if state != pygit2.enums.RepositoryState.NONE:
             raise EngineError(
                 "이미 진행 중인 작업이 있습니다.",
-                detail=f"저장소 상태: {state!r}",
+                detail=trf("저장소 상태: {state!r}", state=state),
                 action="진행 중인 병합이나 rebase를 마무리하거나 취소한 뒤 "
                 "다시 시도해 주세요.",
             )
@@ -1914,12 +1915,12 @@ class LocalGitEngine:
         if head_branch is None:
             raise EngineError(
                 "현재 브랜치가 아닌 곳(분리된 HEAD)에서는 할 수 없는 작업입니다.",
-                detail=f"기대한 브랜치: {expected}",
+                detail=trf("기대한 브랜치: {expected}", expected=expected),
                 action="브랜치를 체크아웃한 뒤 다시 시도해 주세요.",
             )
         raise EngineError(
-            f"'{expected}'에서 시작한 작업인데 현재 브랜치가 바뀌었습니다.",
-            detail=f"현재 브랜치: {head_branch}",
+            trf("'{expected}'에서 시작한 작업인데 현재 브랜치가 바뀌었습니다.", expected=expected),
+            detail=trf("현재 브랜치: {head_branch}", head_branch=head_branch),
             action="브랜치를 확인한 뒤 다시 시도해 주세요.",
         )
 
@@ -1946,7 +1947,7 @@ class LocalGitEngine:
         if state != pygit2.enums.RepositoryState.NONE:
             raise EngineError(
                 "진행 중인 작업이 끝나지 않아 빨리 감을 수 없습니다.",
-                detail=f"저장소 상태: {state!r}",
+                detail=trf("저장소 상태: {state!r}", state=state),
                 action="병합이나 rebase를 마무리하거나 취소한 뒤 "
                 "다시 시도해 주세요.",
             )
@@ -1965,7 +1966,7 @@ class LocalGitEngine:
         # 사이의 경합이라 UI 쪽 가드로는 막을 수 없다.
         if expected_branch is not None and head_branch != f"refs/heads/{expected_branch}":
             raise EngineError(
-                f"'{expected_branch}'에 합치려 했지만 현재 브랜치가 바뀌었습니다.",
+                trf("'{expected_branch}'에 합치려 했지만 현재 브랜치가 바뀌었습니다.", expected_branch=expected_branch),
                 detail=f"HEAD={head_branch}",
                 action="브랜치를 확인한 뒤 다시 가져와 합치기를 실행해 주세요.",
             )
@@ -2062,13 +2063,13 @@ class LocalGitEngine:
             # 초안은 RepositoryOpenError를 던졌으나 이는 오라벨이다 —
             # 저장소는 열려 있고 특정 오브젝트 조회가 실패한 것이므로 EngineError.
             raise EngineError(
-                f"커밋을 찾을 수 없습니다: {sha[:12]}",
+                trf("커밋을 찾을 수 없습니다: {sha__12}", sha__12=sha[:12]),
                 detail=str(exc),
                 action="저장소가 외부에서 변경되었을 수 있습니다. 새로 고침(F5) 해보세요.",
             ) from exc
 
         if not isinstance(obj, pygit2.Commit):
-            raise EngineError(f"커밋이 아닙니다: {sha[:12]}")
+            raise EngineError(trf("커밋이 아닙니다: {sha__12}", sha__12=sha[:12]))
         return obj
 
     # ------------------------------------------------------------------
@@ -2295,7 +2296,7 @@ class LocalGitEngine:
         remaining = self._collect_conflicts()
         if remaining:
             raise EngineError(
-                f"아직 해결되지 않은 충돌이 {len(remaining)}개 있습니다.",
+                trf("아직 해결되지 않은 충돌이 {len_remaining}개 있습니다.", len_remaining=len(remaining)),
                 detail=", ".join(c.path for c in remaining[:5]),
                 action="충돌 목록에서 각 파일을 해결한 뒤 다시 시도해 주세요.",
             )
@@ -2323,7 +2324,7 @@ class LocalGitEngine:
         remaining = self._collect_conflicts()
         if remaining:
             raise EngineError(
-                f"아직 해결되지 않은 충돌이 {len(remaining)}개 있습니다.",
+                trf("아직 해결되지 않은 충돌이 {len_remaining}개 있습니다.", len_remaining=len(remaining)),
                 detail=", ".join(c.path for c in remaining[:5]),
                 action="충돌 목록에서 각 파일을 해결한 뒤 다시 시도해 주세요.",
             )
@@ -2403,7 +2404,7 @@ class LocalGitEngine:
         if operation not in _SEQUENCER_COMMAND:
             raise EngineError(
                 "이 작업은 앱에서 중단할 수 없습니다.",
-                detail=f"저장소 상태: {self._repo.state()!r}",
+                detail=trf("저장소 상태: {self__repo_state!r}", self__repo_state=self._repo.state()),
                 action="git CLI에서 정리해 주세요.",
             )
         result = self._run_git(
@@ -2416,11 +2417,9 @@ class LocalGitEngine:
             # 그렇게 말한다). 그 탈출구가 막혔을 때 조치를 주지 않으면
             # 사용자는 앱 안에서 갈 곳이 없다.
             raise EngineError(
-                f"{operation.label} 중단에 실패했습니다.",
+                trf("{operation_label} 중단에 실패했습니다.", operation_label=operation.label),
                 detail=_message_of(result) or f"exit {result.returncode}",
-                action="다른 git 프로세스가 저장소를 쓰고 있을 수 있습니다. "
-                "잠시 후 다시 시도하거나, 계속 실패하면 터미널에서 "
-                f"`git {_SEQUENCER_COMMAND[operation]} --abort`로 정리해 주세요.",
+                action=trf("다른 git 프로세스가 저장소를 쓰고 있을 수 있습니다. 잠시 후 다시 시도하거나, 계속 실패하면 터미널에서 `git {sequencer_command_op} --abort`로 정리해 주세요.", sequencer_command_op=_SEQUENCER_COMMAND[operation]),
             )
 
     def reset_to(
@@ -2453,7 +2452,7 @@ class LocalGitEngine:
         if operation not in _SEQUENCER_COMMAND:
             raise EngineError(
                 "이어서 진행할 작업이 없습니다.",
-                detail=f"저장소 상태: {self._repo.state()!r}",
+                detail=trf("저장소 상태: {self__repo_state!r}", self__repo_state=self._repo.state()),
                 action="병합은 '계속'이 아니라 커밋으로 마무리합니다.",
             )
         return operation
@@ -2505,7 +2504,7 @@ class LocalGitEngine:
 
         if result.returncode != 0:
             raise EngineError(
-                f"{context}에 실패했습니다.",
+                trf("{context}에 실패했습니다.", context=context),
                 detail=_message_of(result) or f"exit {result.returncode}",
                 action="위 내용을 확인한 뒤 다시 시도해 주세요.",
             )
@@ -2606,7 +2605,7 @@ class LocalGitEngine:
             # git은 상태 파일을 원자적으로 쓰므로 죽여도 저장소는 일관적이다.
             # 다만 연산이 진행 중으로 남을 수 있어 빠져나갈 길을 알려준다.
             raise EngineError(
-                f"{context}이(가) {_HISTORY_TIMEOUT_S}초 안에 끝나지 않았습니다.",
+                trf("{context}이(가) {_HISTORY_TIMEOUT_S}초 안에 끝나지 않았습니다.", context=context, _HISTORY_TIMEOUT_S=_HISTORY_TIMEOUT_S),
                 detail=str(exc),
                 action="작업이 진행 중으로 남아 있다면 '중단'으로 되돌릴 수 있습니다.",
             ) from exc
@@ -2619,7 +2618,7 @@ class LocalGitEngine:
 
         if check and result.returncode != 0:
             raise EngineError(
-                f"{context}에 실패했습니다.",
+                trf("{context}에 실패했습니다.", context=context),
                 detail=_message_of(result) or f"exit {result.returncode}",
             )
         return result

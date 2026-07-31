@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
+from gitclient.i18n import trf
 from gitclient.domain.errors import (
     AuthenticationRequired,
     EngineError,
@@ -393,9 +394,8 @@ def _stalled_error(idle_s: float, stall_timeout_s: int) -> EngineError:
     조치를 고른다 — 느린 회선은 기다리면 되지만, 멈춘 연결은 기다려도 안 된다.
     """
     return EngineError(
-        f"원격에서 {int(idle_s)}초 동안 아무 응답이 없어 중단했습니다.",
-        detail=f"진행 없음 기준: {stall_timeout_s}초. "
-        "전송이 느린 것은 중단 사유가 아니며, 진행이 멈춘 경우에만 끊습니다.",
+        trf("원격에서 {int_idle_s}초 동안 아무 응답이 없어 중단했습니다.", int_idle_s=int(idle_s)),
+        detail=trf("진행 없음 기준: {stall_timeout_s}초. 전송이 느린 것은 중단 사유가 아니며, 진행이 멈춘 경우에만 끊습니다.", stall_timeout_s=stall_timeout_s),
         action="네트워크 연결과 원격 서버 상태를 확인한 뒤 다시 시도해 주세요. "
         "받다 만 팩은 보존되지 않아 재시도는 처음부터 다시 받으므로, "
         "회선이 안정된 뒤 시도하는 편이 낫습니다.",
@@ -926,7 +926,7 @@ class RemoteEngine:
             raise EngineError("git 실행에 실패했습니다.", detail=str(exc)) from exc
         if result.returncode != 0:
             raise EngineError(
-                f"git {args[0]} 실패 (exit {result.returncode}).",
+                trf("git {args_0} 실패 (exit {result_returncode}).", args_0=args[0], result_returncode=result.returncode),
                 detail=(result.stderr or "").strip(),
             )
 
@@ -1125,7 +1125,7 @@ class RemoteEngine:
                 raise _with_stderr(
                     EngineError(
                         "원격 작업이 비정상적으로 오래 걸려 중단했습니다.",
-                        detail=f"절대 상한 {ABSOLUTE_TIMEOUT_S}초를 넘겼습니다.",
+                        detail=trf("절대 상한 {ABSOLUTE_TIMEOUT_S}초를 넘겼습니다.", ABSOLUTE_TIMEOUT_S=ABSOLUTE_TIMEOUT_S),
                         action="원격 서버 상태를 확인해 주세요.",
                     ),
                     stderr,
@@ -1256,6 +1256,6 @@ class RemoteEngine:
             )
 
         return EngineError(
-            f"원격 작업에 실패했습니다 (exit {result.returncode}).",
+            trf("원격 작업에 실패했습니다 (exit {result_returncode}).", result_returncode=result.returncode),
             detail=stderr or "(출력 없음)",
         )

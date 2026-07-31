@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from gitclient.i18n import trf
+
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -62,7 +64,7 @@ class _JobRunnable(QRunnable):
                 job.job_id,
                 job.name,
                 GitClientError(
-                    f"{job.name} 중 예상치 못한 오류가 발생했습니다.",
+                    trf("{job_name} 중 예상치 못한 오류가 발생했습니다.", job_name=job.name),
                     detail=f"{type(exc).__name__}: {exc}",
                 ),
             )

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gitclient.i18n import trf
 from gitclient.domain.models import (
     ConflictChoice,
     RepoOperation,
@@ -135,8 +136,8 @@ class ConflictPanel(QWidget):
         self._labels = labels
         self._ours_title.setText(labels.ours)
         self._theirs_title.setText(labels.theirs)
-        self._take_ours.setText(f"{labels.ours} 사용")
-        self._take_theirs.setText(f"{labels.theirs} 사용")
+        self._take_ours.setText(trf("{side} 사용", side=labels.ours))
+        self._take_theirs.setText(trf("{side} 사용", side=labels.theirs))
         self._note.setText(labels.note)
         self._note.setVisible(bool(labels.note))
         # 목록 행에도 주체 이름이 들어가므로 함께 다시 그린다. 라벨만 바꾸고
@@ -203,13 +204,11 @@ class ConflictPanel(QWidget):
             )
         elif not detail.theirs.exists:
             self._hint.setText(
-                f"'{self._labels.theirs}' 쪽에는 이 파일이 없습니다. "
-                f"'{self._labels.theirs} 사용'을 고르면 파일이 삭제됩니다."
+                trf("'{side}' 쪽에는 이 파일이 없습니다. '{side} 사용'을 고르면 파일이 삭제됩니다.", side=self._labels.theirs)
             )
         elif not detail.ours.exists:
             self._hint.setText(
-                f"'{self._labels.ours}' 쪽에는 이 파일이 없습니다. "
-                f"'{self._labels.ours} 사용'을 고르면 파일이 삭제됩니다."
+                trf("'{side}' 쪽에는 이 파일이 없습니다. '{side} 사용'을 고르면 파일이 삭제됩니다.", side=self._labels.ours)
             )
         else:
             self._hint.setText(
@@ -248,7 +247,7 @@ class ConflictPanel(QWidget):
         self._take_ours.setEnabled(False)
         self._take_theirs.setEnabled(False)
         self._hint.setText(
-            f"'{path}'의 내용을 읽지 못했습니다. 목록을 새로 고쳐 주세요."
+            trf("'{path}'의 내용을 읽지 못했습니다. 목록을 새로 고쳐 주세요.", path=path)
         )
         self._ours.setPlainText("")
         self._theirs.setPlainText("")
@@ -269,7 +268,7 @@ class ConflictPanel(QWidget):
         self._take_ours.setEnabled(False)
         self._take_theirs.setEnabled(False)
         self._pick_lines.setEnabled(False)
-        self._hint.setText(f"'{self._current_path}'의 내용을 읽는 중...")
+        self._hint.setText(trf("'{path}'의 내용을 읽는 중...", path=self._current_path))
         self.detail_requested.emit(self._current_path)
 
     def _request(self, choice: ConflictChoice) -> None:

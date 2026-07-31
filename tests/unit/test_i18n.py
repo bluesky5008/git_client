@@ -88,6 +88,27 @@ def error_strings() -> set[str]:
     return _literals(sorted(SRC.rglob("*.py")), ERROR_CTORS)
 
 
+def templates() -> set[str]:
+    """`trf()`의 첫 인자 — 값이 끼어드는 문구의 키."""
+    found: set[str] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(
+                func, "id", None
+            )
+            if name != "trf":
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                if _korean(first.value):
+                    found.add(first.value)
+    return found
+
+
 @pytest.fixture(autouse=True)
 def _restore_language():  # noqa: ANN202
     before = current_language()
@@ -135,9 +156,36 @@ class TestCatalogHonesty:
             + "\n".join(f"  {s!r}" for s in missing)
         )
 
+    def test_every_template_is_translated(self) -> None:
+        missing = sorted(templates() - set(CATALOG))
+        assert not missing, (
+            "값이 끼어드는 문구의 템플릿이 카탈로그에 없다:\n"
+            + "\n".join(f"  {s!r}" for s in missing)
+        )
+
+    def test_translated_templates_keep_their_placeholders(self) -> None:
+        """자리표시자가 빠지면 실행 시점에 KeyError로 터진다 — 번역 오류가
+        기능 오류가 되는 유일한 자리라 여기서 막는다."""
+        import string
+
+        broken = []
+        for source, translated in CATALOG.items():
+            if "{" not in source:
+                continue
+            names = {
+                name for _t, name, _s, _c in string.Formatter().parse(source) if name
+            }
+            got = {
+                name for _t, name, _s, _c in string.Formatter().parse(translated)
+                if name
+            }
+            if names != got:
+                broken.append((source, sorted(names), sorted(got)))
+        assert not broken, f"자리표시자가 어긋난 번역: {broken}"
+
     def test_no_stale_entries(self) -> None:
         """지워진 문구의 번역이 남아 있으면 다음 사람이 근거로 삼는다."""
-        used = chrome_strings() | error_strings()
+        used = chrome_strings() | error_strings() | templates()
         stale = sorted(set(CATALOG) - used)
         assert not stale, (
             "코드에 없는 문구의 번역이 남아 있다:\n"
@@ -150,15 +198,15 @@ class TestCatalogHonesty:
 
 
 class TestKnownGap:
-    """**값이 끼어드는 문구는 아직 번역되지 않는다** (backlog §5).
+    """**값이 끼어드는 문구는 f-string으로 쓰지 않는다** (2026-07-31 해소).
 
-    `f"충돌 {n}개를 해결해야 합니다."`처럼 값을 품은 문구는 원문 키가
-    실행 시점에 정해져 카탈로그로 찾을 수 없다. 템플릿으로 바꾸는 회차가
-    따로 필요하다 — 그때까지 **공백의 크기를 숫자로 고정해** 조용히
-    커지지 못하게 한다.
+    `f"충돌 {n}개"`는 키가 실행 시점에 정해져 카탈로그로 찾을 수 없다 —
+    한때 62곳이 그랬고, 그 공백의 크기를 여기서 상한으로 고정해 두었다.
+    전부 `trf(템플릿, **값)`으로 옮긴 지금 상한은 0이다: 새로 f-string을
+    쓰면 이 테스트가 바로 붉어진다.
     """
 
-    LIMIT = 70
+    LIMIT = 0
 
     def test_interpolated_strings_do_not_grow(self) -> None:
         count = 0
@@ -182,8 +230,8 @@ class TestKnownGap:
                     ):
                         count += 1
         assert count <= self.LIMIT, (
-            f"번역되지 않는 보간 문구가 {count}개로 늘었다 (상한 {self.LIMIT}) — "
-            "새 문구는 템플릿+포맷으로 쓰거나 이 상한과 함께 근거를 갱신할 것"
+            f"번역되지 않는 f-string 문구가 {count}개 있다 (상한 {self.LIMIT}) — "
+            "값이 끼어드는 문구는 trf(\"...{값}...\", 값=...)로 쓴다"
         )
 
 

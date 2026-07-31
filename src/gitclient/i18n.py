@@ -137,3 +137,15 @@ def install(app) -> None:  # noqa: ANN001 - QApplication
     translator = _ShowTranslator(app)
     app.installEventFilter(translator)
     app._gitclient_translator = translator  # 수명 유지
+
+
+def trf(template: str, **values: object) -> str:
+    """값이 끼어드는 문구 — **템플릿이 키다** (FR-15 잔여 해소).
+
+    `f"충돌 {n}개"`는 키가 실행 시점에 정해져 카탈로그로 찾을 수 없다.
+    자리표시자를 남긴 템플릿을 키로 쓰면 번역할 수 있고, 언어마다 값의
+    위치가 달라져도 포맷이 알아서 맞춘다.
+
+    번역이 없으면 원문 템플릿으로 포맷한다 — 한국어가 원본 언어다.
+    """
+    return tr(template).format(**values)

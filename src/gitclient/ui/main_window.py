@@ -84,7 +84,7 @@ from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
-from gitclient.i18n import tr
+from gitclient.i18n import tr, trf
 from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
     HistoryOutcome,
@@ -1545,9 +1545,8 @@ class MainWindow(QMainWindow):
             shas = ", ".join(s[:7] for s in result.skipped_already_applied[:5])
             self._notify(
                 "이미 반영된 커밋 생략",
-                f"커밋 {len(result.skipped_already_applied)}개는 이미 "
-                "upstream에 같은 변경이 있어 생략했습니다.",
-                detail=f"생략된 커밋: {shas}",
+                trf("커밋 {len_result_skipped_a}개는 이미 upstream에 같은 변경이 있어 생략했습니다.", len_result_skipped_a=len(result.skipped_already_applied)),
+                detail=trf("생략된 커밋: {shas}", shas=shas),
                 action="같은 변경이 결과에 이미 들어 있습니다 — 잃은 것은 없습니다.",
             )
 
@@ -1575,8 +1574,7 @@ class MainWindow(QMainWindow):
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle("이 커밋에 남길 변경이 없습니다")
         box.setText(
-            f"{subject}의 변경이 이미 반영되어 있어, 이대로 진행하면 "
-            "이 커밋은 결과에 남지 않습니다."
+            trf("{subject}의 변경이 이미 반영되어 있어, 이대로 진행하면 이 커밋은 결과에 남지 않습니다.", subject=subject)
         )
         box.setInformativeText(
             "버리면 커밋이 히스토리에서 사라집니다 (git reflog로만 복구).\n"
@@ -1679,9 +1677,9 @@ class MainWindow(QMainWindow):
             finish = "파일을 정리한 뒤 스테이징하고 커밋하면 병합이 완료됩니다."
         self._notify(
             "충돌 해결 필요",
-            f"충돌 {len(outcome.conflicts)}개를 해결해야 합니다.",
+            trf("충돌 {len_outcome_conflict}개를 해결해야 합니다.", len_outcome_conflict=len(outcome.conflicts)),
             detail=detail,
-            action=f"{finish} 되돌리려면 위쪽 '중단'을 눌러 주세요.",
+            action=trf("{finish} 되돌리려면 위쪽 '중단'을 눌러 주세요.", finish=finish),
         )
 
     def _drain_writes(self, *, deadline_ms: int) -> None:
@@ -1862,8 +1860,8 @@ class MainWindow(QMainWindow):
 
         staged = source[1]
         verb = "내리기" if staged else "올리기"
-        self._stage_hunk_button.setText(f"헝크 {verb}")
-        self._stage_lines_button.setText(f"선택 줄 {verb}")
+        self._stage_hunk_button.setText(trf("헝크 {verb}", verb=verb))
+        self._stage_lines_button.setText(trf("선택 줄 {verb}", verb=verb))
 
         selected = self._selected_positions()
         self._stage_hunk_button.setEnabled(bool(self._current_hunk_positions()))
@@ -2687,7 +2685,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self._notify(
                 "줄 단위 선택 불가",
-                f"'{path}'의 충돌 마커를 읽을 수 없습니다.",
+                trf("'{path}'의 충돌 마커를 읽을 수 없습니다.", path=path),
                 detail=str(exc),
                 action="파일을 이미 편집하셨다면 편집기에서 마커를 정리한 뒤 "
                 "스테이징해 주세요.",
@@ -2698,7 +2696,7 @@ class MainWindow(QMainWindow):
         if not hunks:
             self._notify(
                 "고를 구획이 없습니다",
-                f"'{path}'에는 충돌 마커가 남아 있지 않습니다.",
+                trf("'{path}'에는 충돌 마커가 남아 있지 않습니다.", path=path),
                 action="이미 정리된 파일이면 스테이징만 하면 됩니다.",
             )
             self._sync_operation_state()
@@ -3269,7 +3267,7 @@ class MainWindow(QMainWindow):
         if not steps:
             self._notify(
                 "옮길 커밋이 없습니다",
-                f"'{branch}'에 '{upstream}'보다 새로운 커밋이 없습니다.",
+                trf("'{branch}'에 '{upstream}'보다 새로운 커밋이 없습니다.", branch=branch, upstream=upstream),
                 action="이미 그 위에 있거나 뒤처져 있습니다 — 가져오기(Pull)를 "
                 "생각해 보세요.",
             )
