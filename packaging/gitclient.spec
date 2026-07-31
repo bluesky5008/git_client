@@ -10,8 +10,17 @@
 # 빌드:  pyinstaller packaging/gitclient.spec
 # 검증:  dist/gitclient/gitclient --version
 
+import os
+
 from PySide6 import __file__ as pyside_file  # noqa: F401 - 존재 확인
 from PyInstaller.utils.hooks import copy_metadata
+
+# 서명 신원 — 환경변수로만 받는다 (doc/release.md §4). 인증서는 이
+# 저장소가 가질 수 없는 자원이라 스펙에 이름을 박아둘 수 없고, 비워두면
+# PyInstaller가 arm64 필수인 ad-hoc 서명을 스스로 한다. 값을 주면
+# 수집된 모든 Mach-O에 그 신원으로 서명한다 — dmg를 만들기 전에
+# 바이너리가 먼저 서명돼 있어야 공증이 통과하기 때문에 여기가 그 자리다.
+_sign_identity = os.environ.get("GITCLIENT_SIGN_IDENTITY") or None
 
 a = Analysis(
     ["../src/gitclient/__main__.py"],
@@ -48,6 +57,7 @@ exe = EXE(
     exclude_binaries=True,
     name="gitclient",
     console=False,
+    codesign_identity=_sign_identity,
 )
 coll = COLLECT(
     exe,

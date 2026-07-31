@@ -8,10 +8,13 @@
 ; 환경을 위해 설치 마지막에 확인하고 안내만 한다: 우리가 GPLv2 바이너리를
 ; 재배포하지 않으면서도 사용자가 막히지 않는 선이다.
 ;
-; 서명은 여기서 하지 않는다 (인증서가 이 저장소의 자원이 아니다):
-;   signtool sign /fd sha256 /tr <타임스탬프URL> /td sha256 /a <출력.exe>
+; 서명은 **인증서가 있을 때만** — /DSIGN 없이 빌드하면 서명 단계 자체가
+; 스크립트에서 사라져, 없는 환경에서도 같은 파일이 끝까지 돈다
+; (인증서 취득 절차는 doc/release.md §4):
 ;
-; 빌드:  iscc packaging\gitclient.iss
+;   iscc /DSIGN "/Ssigntool=signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a $f" packaging\gitclient.iss
+;
+; 빌드(서명 없이):  iscc packaging\gitclient.iss
 
 #define AppName "Git Client"
 #define AppExe "gitclient.exe"
@@ -36,9 +39,22 @@ LicenseFile=..\LICENSE
 InfoAfterFile=..\THIRD-PARTY-NOTICES.md
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+#ifdef SIGN
+SignTool=signtool
+SignedUninstaller=yes
+#endif
 
 [Files]
+#ifdef SIGN
+; 앱 실행 파일은 sign 플래그로 함께 서명한다 — 인스톨러만 서명하면
+; SmartScreen은 조용한데 설치된 앱이 실행될 때 다시 경고를 띄운다.
+; (Qt DLL 수백 개까지 서명하는 것은 시간 대비 이득이 없다 — 경고를
+; 내는 주체는 실행 파일이다.)
+Source: "..\dist\gitclient\gitclient.exe"; DestDir: "{app}"; Flags: ignoreversion sign
+Source: "..\dist\gitclient\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "gitclient.exe"
+#else
 Source: "..\dist\gitclient\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+#endif
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

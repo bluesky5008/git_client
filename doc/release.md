@@ -137,3 +137,62 @@ cp <임시폴더>/gitclient-setup.exe release/0.1.0/gitclient-0.1.0-windows-x64-
 # 4. (선택) 공개 — GitHub Releases
 # gh release create v0.1.0 release/0.1.0/* --title "0.1.0"
 ```
+
+## 4. 서명 — 인증서를 꽂으면 명령 하나로 (2026-07-31 배선 완료)
+
+서명 자체는 인증서가 있어야 하지만, **절차는 미리 코드에 넣어 두었다** —
+인증서가 생기는 날 스크립트를 다시 돌리면 끝나도록. 배선은 환경변수·
+전처리 플래그로만 켜져서, 없는 환경에서는 같은 파일이 서명 없이 끝까지
+돈다.
+
+### 4.1 macOS
+
+**취득**: [Apple Developer Program](https://developer.apple.com/programs/)
+가입(연 $99·개인 가능) → Certificates에서 **Developer ID Application**
+인증서 발급 → 키체인에 설치 → `security find-identity -v -p codesigning`
+으로 신원 문자열 확인. 공증용으로
+`xcrun notarytool store-credentials <프로필이름>`(Apple ID + 앱 암호)을
+한 번 저장한다.
+
+**실행** (빌드부터 다시 — 공증은 dmg 속 바이너리의 서명을 본다):
+
+```sh
+export GITCLIENT_SIGN_IDENTITY="Developer ID Application: <이름> (<팀ID>)"
+export GITCLIENT_NOTARY_PROFILE=<프로필이름>
+uv pip install -e . --no-deps --python .venv/bin/python
+.venv/bin/pyinstaller -y --distpath dist --workpath build packaging/gitclient.spec
+sh packaging/make_dmg.sh          # 서명 → 공증 → 스테이플까지 이어서 한다
+```
+
+**배선이 실제로 확인된 범위** (2026-07-31, ad-hoc 신원 `-`로 실측):
+신원이 수집된 모든 Mach-O에 전파되고 hardened runtime이 붙는 것까지
+확인했다 — 공증이 요구하는 형태다. ad-hoc으로는 **실행이 안 되는데**
+(hardened runtime의 라이브러리 검증이 Team ID 일치를 요구하고 ad-hoc에는
+Team ID가 없다), 실인증서는 모든 바이너리가 같은 Team ID를 가지므로
+이 문제가 없다. 즉 끝단 확인(실행·공증 통과)만 실인증서의 몫이다.
+
+### 4.2 Windows
+
+**취득**: 둘 중 하나 —
+- **Azure Trusted Signing** (월 ~$10, 개인은 3년 이상 된 신원 필요):
+  signtool과 연동되는 클라우드 서명. 2023년 이후 신생 OV 인증서보다
+  SmartScreen 평판 축적이 빠른 편이다.
+- **OV 코드서명 인증서** (연 $70~$200, Sectigo/Certum 등): 2023-06부터
+  하드웨어 토큰(HSM) 의무라 우편으로 토큰을 받는다.
+
+**실행** (인증서가 서명 저장소에 있는 상태에서):
+
+```bat
+iscc /DSIGN "/Ssigntool=signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /a $f" packaging\gitclient.iss
+```
+
+`/DSIGN`이 없으면 서명 단계가 스크립트에서 통째로 사라진다(전처리) —
+CI의 무서명 빌드가 그대로 도는 이유다. 서명 대상은 인스톨러·언인스톨러·
+`gitclient.exe` 석 점이다: 인스톨러만 서명하면 SmartScreen은 조용한데
+설치된 앱이 실행될 때 다시 경고를 띄우고, 반대로 Qt DLL 수백 장까지
+서명하는 것은 시간 대비 이득이 없다(경고를 내는 주체는 실행 파일이다).
+
+### 4.3 서명하면 SHA256SUMS를 다시 만든다
+
+서명은 파일 내용을 바꾼다 — §2.1의 준비대에 서명본을 다시 담고
+체크섬도 다시 기록해야 한다. 서명 전 체크섬은 서명본과 일치하지 않는다.
