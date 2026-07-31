@@ -93,3 +93,63 @@ def badge_text_color(background: QColor) -> QColor:
     ):
         return _BADGE_TEXT_DARK
     return _BADGE_TEXT_LIGHT
+
+
+# ----------------------------------------------------------------------
+# 테마 (U4, §5.3)
+# ----------------------------------------------------------------------
+#
+# 위의 의미 색상(레인·diff·배지)은 중간 명도라 라이트/다크 어느 배경에서도
+# 성립하고, 반투명 오버레이(diff 배경)는 바탕색에 자연히 섞인다. 그래서
+# 테마 전환은 위젯 팔레트만 바꾼다 — 의미 색상의 명암 분기는 CVD 정량화
+# (§5.3의 남은 과제)와 함께 다룰 일이다.
+
+THEME_MODES = ("system", "light", "dark")
+
+
+def apply_theme(app, mode: str) -> None:  # noqa: ANN001 - QApplication
+    """앱 전체에 테마를 적용한다.
+
+    `system`은 플랫폼 스타일을 그대로 둔다 — macOS·Windows의 기본
+    스타일은 OS 다크 모드를 스스로 따라간다(§5.3의 "OS 설정 자동 추종"이
+    이 갈래다). `light`/`dark`는 OS와 무관하게 고정하고 싶은 사용자를
+    위한 것이라 플랫폼 룩을 포기하고 Fusion + 명시적 팔레트로 강제한다 —
+    플랫폼 스타일 위에 팔레트만 얹으면 위젯마다 반쯤 섞인 배색이 나온다.
+    """
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QStyleFactory
+
+    if mode not in THEME_MODES:
+        mode = "system"
+    if mode == "system":
+        return  # 시작 시 팔레트를 건드리지 않았다면 되돌릴 것도 없다
+
+    app.setStyle(QStyleFactory.create("Fusion"))
+    palette = QPalette()
+    if mode == "dark":
+        base = QColor("#1e2126")
+        panel = QColor("#2a2e35")
+        text = QColor("#e8eaed")
+        disabled = QColor("#787d85")
+        highlight = QColor("#3d6fa5")
+        palette.setColor(QPalette.ColorRole.Window, panel)
+        palette.setColor(QPalette.ColorRole.WindowText, text)
+        palette.setColor(QPalette.ColorRole.Base, base)
+        palette.setColor(QPalette.ColorRole.AlternateBase, panel)
+        palette.setColor(QPalette.ColorRole.Text, text)
+        palette.setColor(QPalette.ColorRole.Button, panel)
+        palette.setColor(QPalette.ColorRole.ButtonText, text)
+        palette.setColor(QPalette.ColorRole.ToolTipBase, panel)
+        palette.setColor(QPalette.ColorRole.ToolTipText, text)
+        palette.setColor(QPalette.ColorRole.Highlight, highlight)
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, disabled)
+        for role in (
+            QPalette.ColorRole.Text,
+            QPalette.ColorRole.WindowText,
+            QPalette.ColorRole.ButtonText,
+        ):
+            palette.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+    # light는 Fusion의 기본 팔레트가 이미 라이트다 — 명시 팔레트를 만들지
+    # 않는 이유는 Fusion 기본이 플랫폼별 미세 조정을 담고 있어서다.
+    app.setPalette(palette)

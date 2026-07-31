@@ -28,6 +28,14 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(args)
     app.setApplicationName("Git Client")
 
+    # 테마는 앱 전역이라 창을 만들기 전에 입힌다 (U4, §5.3). "system"은
+    # 플랫폼 스타일이 OS 다크 모드를 스스로 따라가므로 손대지 않는다.
+    from PySide6.QtCore import QSettings
+
+    from gitclient.ui.theme import apply_theme
+
+    apply_theme(app, str(QSettings("gitclient", "gitclient").value("theme", "system")))
+
     window = MainWindow()
     if len(args) > 1:
         window.open_repository(args[1])

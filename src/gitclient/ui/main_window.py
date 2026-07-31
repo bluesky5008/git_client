@@ -29,16 +29,19 @@ from PySide6.QtCore import (
     Qt,
     QThreadPool,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QProgressBar,
     QLabel,
+    QLineEdit,
     QListView,
     QListWidget,
     QListWidgetItem,
@@ -49,6 +52,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTableView,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -108,6 +112,75 @@ from gitclient.viewmodel.diff_model import DiffModel, DiffRole
 
 ROW_HEIGHT = 24
 GRAPH_COLUMN_PADDING = 12
+
+_REF_MIME = "application/x-gitclient-ref"
+
+
+class _RefList(QListWidget):
+    """참조 목록 — 브랜치를 그래프로 끌 수 있다 (U5, §5.2 원칙 1).
+
+    표준 항목 mime은 디코딩이 번거로워, 끄는 참조의 정체를 자체 mime으로
+    함께 싣는다. 헤더 행은 NoItemFlags라 애초에 끌리지 않는다.
+    """
+
+    def mimeData(self, items):  # noqa: ANN001 - Qt 시그니처
+        import json
+
+        data = super().mimeData(items)
+        if items:
+            shorthand = items[0].data(Qt.ItemDataRole.UserRole + 2)
+            if shorthand:
+                payload = {
+                    "shorthand": shorthand,
+                    "kind": items[0].data(Qt.ItemDataRole.UserRole + 1),
+                    "is_head": bool(items[0].data(Qt.ItemDataRole.UserRole + 3)),
+                }
+                data.setData(_REF_MIME, json.dumps(payload).encode("utf-8"))
+        return data
+
+
+class _GraphView(QTableView):
+    """커밋 그래프 — 참조 드롭을 받는다 (U5).
+
+    드롭이 뜻하는 대상은 떨어진 좌표의 행이 아니라 **현재 브랜치**다 —
+    merge도 rebase도 HEAD에 하는 일이기 때문이다. 그래서 좌표는 메뉴를
+    띄울 위치로만 쓴다.
+    """
+
+    ref_dropped = Signal(object, object)
+    """(참조 정보 dict, 화면 좌표 QPoint)."""
+
+    def __init__(self, parent=None) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: ANN001
+        if event.mimeData().hasFormat(_REF_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: ANN001
+        if event.mimeData().hasFormat(_REF_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: ANN001
+        import json
+
+        if not event.mimeData().hasFormat(_REF_MIME):
+            super().dropEvent(event)
+            return
+        try:
+            payload = json.loads(
+                bytes(event.mimeData().data(_REF_MIME)).decode("utf-8")
+            )
+        except (ValueError, UnicodeDecodeError):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.ref_dropped.emit(payload, event.position().toPoint())
 
 
 def _format_bytes(count: int) -> str:
@@ -244,9 +317,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        self._ref_list = QListWidget()
+        self._ref_list = _RefList()
         self._ref_list.setAlternatingRowColors(False)
         self._ref_list.setMinimumWidth(180)
+        self._ref_list.setDragEnabled(True)
+        self._ref_list.setDragDropMode(
+            QAbstractItemView.DragDropMode.DragOnly
+        )
         self._ref_list.itemActivated.connect(self._on_ref_activated)
         self._ref_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._ref_list.customContextMenuRequested.connect(self._on_ref_context_menu)
@@ -269,8 +346,19 @@ class MainWindow(QMainWindow):
         detail_splitter.setStretchFactor(0, 1)
         detail_splitter.setStretchFactor(1, 3)
 
+        # 커밋 검색 (U3, FR-13) — 필터가 아니라 **점프**다. 그래프 레인은
+        # 전체 맥락이 있어야 읽히므로 행을 숨기는 필터는 그래프를 부순다.
+        self._search_bar = self._build_search_bar()
+        self._search_bar.hide()
+        graph_box = QWidget()
+        graph_layout = QVBoxLayout(graph_box)
+        graph_layout.setContentsMargins(0, 0, 0, 0)
+        graph_layout.setSpacing(0)
+        graph_layout.addWidget(self._search_bar)
+        graph_layout.addWidget(self._commit_view, 1)
+
         right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.addWidget(self._commit_view)
+        right_splitter.addWidget(graph_box)
         right_splitter.addWidget(detail_splitter)
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 2)
@@ -375,8 +463,89 @@ class MainWindow(QMainWindow):
         layout.addWidget(widget)
         return container
 
+    def _build_search_bar(self) -> QWidget:
+        """커밋 검색줄 (U3). Enter 다음, Shift+Enter 이전, Esc 닫기."""
+        from PySide6.QtGui import QShortcut
+
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(4, 2, 4, 2)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("메시지 · sha · 작성자 검색")
+        self._search_edit.returnPressed.connect(
+            lambda: self._find_commit(backwards=False)
+        )
+        prev_button = QPushButton("이전")
+        prev_button.clicked.connect(lambda: self._find_commit(backwards=True))
+        next_button = QPushButton("다음")
+        next_button.clicked.connect(lambda: self._find_commit(backwards=False))
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(self._hide_search)
+        layout.addWidget(self._search_edit, 1)
+        layout.addWidget(prev_button)
+        layout.addWidget(next_button)
+        layout.addWidget(close_button)
+
+        QShortcut(
+            QKeySequence("Shift+Return"),
+            self._search_edit,
+            activated=lambda: self._find_commit(backwards=True),
+        )
+        QShortcut(
+            QKeySequence("Escape"),
+            bar,
+            activated=self._hide_search,
+            context=Qt.ShortcutContext.WidgetWithChildrenShortcut,
+        )
+        return bar
+
+    def _show_search(self) -> None:
+        self._search_bar.show()
+        self._search_edit.setFocus()
+        self._search_edit.selectAll()
+
+    def _hide_search(self) -> None:
+        self._search_bar.hide()
+        self._commit_view.setFocus()
+
+    def _find_commit(self, *, backwards: bool = False) -> bool:
+        """현재 선택에서 다음/이전 일치 커밋으로 **점프**한다 (순환).
+
+        키 입력마다가 아니라 요청(Enter·버튼)마다 한 번 훑는다 — 로드된
+        전체를 훑는 최악이 10만 행이지만 요청당 1회라 G4가 지켜진다.
+        일치 판정은 메시지·sha·작성자 이름/메일의 부분 문자열이다.
+        """
+        query = self._search_edit.text().strip().lower()
+        if not query:
+            return False
+        model = self._commit_model
+        total = model.rowCount()
+        if total == 0:
+            self.statusBar().showMessage("검색할 커밋이 없습니다")
+            return False
+        start = self._commit_view.currentIndex().row()
+        step = -1 if backwards else 1
+        for offset in range(1, total + 1):
+            row = (start + step * offset) % total
+            commit = model.index(row, 0).data(CommitRole.COMMIT)
+            if commit is None:
+                continue
+            if (
+                query in commit.sha.lower()
+                or query in commit.message.lower()
+                or query in commit.author.name.lower()
+                or query in commit.author.email.lower()
+            ):
+                self._commit_view.selectRow(row)
+                self._commit_view.scrollTo(model.index(row, Column.GRAPH))
+                self.statusBar().showMessage(f"일치: {commit.sha[:7]}")
+                return True
+        self.statusBar().showMessage(f"'{query}'와 일치하는 커밋이 없습니다")
+        return False
+
     def _build_commit_view(self) -> QTableView:
-        view = QTableView()
+        view = _GraphView()
+        view.ref_dropped.connect(self._on_ref_dropped)
         view.setModel(self._commit_model)
         view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -464,9 +633,15 @@ class MainWindow(QMainWindow):
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
 
+        settings_action = QAction("설정...", self)
+        settings_action.setShortcut(QKeySequence.StandardKey.Preferences)
+        settings_action.triggered.connect(self._on_show_settings)
+
         menu = self.menuBar().addMenu("파일")
         menu.addAction(open_action)
         menu.addAction(reload_action)
+        menu.addSeparator()
+        menu.addAction(settings_action)
         menu.addSeparator()
         menu.addAction(quit_action)
 
@@ -478,7 +653,10 @@ class MainWindow(QMainWindow):
         self.addDockWidget(
             Qt.DockWidgetArea.BottomDockWidgetArea, self._command_log_dock
         )
+        self._search_action = QAction("커밋 검색...", self)
+        self._search_action.triggered.connect(self._show_search)
         view_menu = self.menuBar().addMenu("보기")
+        view_menu.addAction(self._search_action)
         view_menu.addAction(self._command_log_dock.toggleViewAction())
 
         self._fetch_action = QAction("가져오기 (Fetch)", self)
@@ -556,6 +734,18 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._push_action)
         toolbar.addSeparator()
         toolbar.addAction(self._branch_action)
+        toolbar.addSeparator()
+        # 최근 저장소 전환 (U3). activated는 **사용자 조작에만** 발화한다 —
+        # 코드가 currentIndex를 바꿀 때 재진입하지 않도록 이 시그널을 쓴다.
+        self._recent_combo = QComboBox()
+        self._recent_combo.setMinimumWidth(220)
+        self._recent_combo.setToolTip("최근에 연 저장소로 전환")
+        self._recent_combo.activated.connect(self._on_recent_selected)
+        toolbar.addWidget(self._recent_combo)
+        self._refresh_recent_combo()
+        # 단축키는 설정으로 덮어쓸 수 있다 (U5) — 액션이 전부 만들어진
+        # 지금 한 번 적용하고, 설정이 바뀔 때마다 다시 적용한다.
+        self._apply_shortcuts()
         toolbar.addAction(self._stash_action)
         toolbar.addAction(self._stash_pop_action)
 
@@ -614,6 +804,7 @@ class MainWindow(QMainWindow):
         self._info = info
         self._repo_path = str(path)
         self._settings.setValue("last_repository", str(path))
+        self._remember_repository(str(path))
 
         self._commit_model.reset([])
         self._ref_list.clear()
@@ -1910,6 +2101,77 @@ class MainWindow(QMainWindow):
             self._prefetch_timer.stop()
             self._cancel_prefetch()
 
+    # -- 설정 · 최근 저장소 · 단축키 (U3~U5) ---------------------------
+
+    def _apply_shortcuts(self) -> None:
+        """QSettings의 단축키(없으면 기본값)를 액션에 입힌다 (U5)."""
+        from gitclient.ui.settings_dialog import shortcut_for
+
+        targets = {
+            "search": self._search_action,
+            "fetch": self._fetch_action,
+            "pull": self._pull_action,
+            "push": self._push_action,
+            "branch": self._branch_action,
+            "reflog": self._reflog_action,
+        }
+        for name, action in targets.items():
+            action.setShortcut(shortcut_for(self._settings, name))
+
+    def _on_show_settings(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        from gitclient.ui.settings_dialog import SettingsDialog
+        from gitclient.ui.theme import apply_theme
+
+        dialog = SettingsDialog(self._settings, self)
+        if not dialog.exec():
+            return
+        # 다이얼로그는 저장만 했다 — 적용은 여기서 한 갈래로 한다.
+        apply_theme(
+            QApplication.instance(), str(self._settings.value("theme", "system"))
+        )
+        self._apply_shortcuts()
+        # 체크 상태를 동기화하면 toggled 시그널이 타이머 시작/정지까지
+        # 처리한다 (_set_prefetch_enabled).
+        self._prefetch_action.setChecked(
+            self._settings.value("prefetch_enabled", True, type=bool)
+        )
+
+    def _refresh_recent_combo(self) -> None:
+        recents = self._recent_repositories()
+        self._recent_combo.blockSignals(True)
+        self._recent_combo.clear()
+        for path in recents:
+            self._recent_combo.addItem(Path(path).name, path)
+            self._recent_combo.setItemData(
+                self._recent_combo.count() - 1, path, Qt.ItemDataRole.ToolTipRole
+            )
+        if self._repo_path is not None:
+            for index in range(self._recent_combo.count()):
+                if self._recent_combo.itemData(index) == self._repo_path:
+                    self._recent_combo.setCurrentIndex(index)
+                    break
+        self._recent_combo.blockSignals(False)
+        self._recent_combo.setEnabled(self._recent_combo.count() > 0)
+
+    def _recent_repositories(self) -> list[str]:
+        stored = self._settings.value("recent_repositories", [])
+        if isinstance(stored, str):  # QSettings는 원소 1개 목록을 str로 돌려준다
+            stored = [stored]
+        return [str(p) for p in (stored or [])]
+
+    def _remember_repository(self, path: str) -> None:
+        recents = [p for p in self._recent_repositories() if p != path]
+        recents.insert(0, path)
+        self._settings.setValue("recent_repositories", recents[:10])
+        self._refresh_recent_combo()
+
+    def _on_recent_selected(self, index: int) -> None:
+        path = self._recent_combo.itemData(index)
+        if path and path != self._repo_path:
+            self.open_repository(path)
+
     def _touch_user_activity(self) -> None:
         """사용자 작업이 왔다 — 유휴 시계를 되감고 배경 repack을 물린다.
 
@@ -2604,6 +2866,44 @@ class MainWindow(QMainWindow):
                 lambda: self._confirm_delete_branch(shorthand),
             ))
         return entries
+
+    def _dnd_entries(self, payload: dict) -> list[tuple[str, object]]:
+        """드롭된 참조로 할 수 있는 일 (U5). 컨텍스트 메뉴의 부분집합이다 —
+        드롭의 의미는 '가져와 섞기'이므로 전환·삭제는 내주지 않는다."""
+        kind = payload.get("kind")
+        shorthand = payload.get("shorthand")
+        if not shorthand or payload.get("is_head"):
+            return []
+        is_local = kind == RefKind.LOCAL_BRANCH.value
+        is_remote = kind == RefKind.REMOTE_BRANCH.value
+        if not (is_local or is_remote):
+            return []  # 태그는 합칠 대상이 아니라 시점이다
+        return [
+            (
+                f"'{shorthand}'을(를) 현재 브랜치에 합치기",
+                lambda: self._start_merge(shorthand, is_local),
+            ),
+            (
+                f"'{shorthand}' 위로 현재 브랜치 리베이스...",
+                lambda: self._start_rebase(shorthand, is_local),
+            ),
+        ]
+
+    def _on_ref_dropped(self, payload: dict, pos) -> None:  # noqa: ANN001
+        entries = self._dnd_entries(payload)
+        if not entries:
+            return
+        menu = QMenu(self)
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        for label, run in entries:
+            action = menu.addAction(label)
+            # 컨텍스트 메뉴와 같은 잠금 — 진행 중인 연산 위에 병합을 얹으면
+            # 시퀀서가 어긋난다 (감사 실측과 같은 부류).
+            action.setEnabled(
+                not self._busy_with_history() and self._write_queue is not None
+            )
+            action.triggered.connect(run)
+        menu.exec(self._commit_view.viewport().mapToGlobal(pos))
 
     def _on_ref_context_menu(self, pos) -> None:  # noqa: ANN001 - Qt 시그니처
         item = self._ref_list.itemAt(pos)
