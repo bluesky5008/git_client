@@ -14,6 +14,7 @@ Phase 1은 읽기 전용이다. 저장소를 열고, 커밋 그래프를 탐색�
 
 from __future__ import annotations
 
+import functools
 import gc
 import logging
 import threading
@@ -198,6 +199,29 @@ def _format_bytes(count: int) -> str:
 # 워커는 시그널이 끊겨 있어 이 위젯을 건드릴 수 없으므로 길게 잡을 이유가
 # 없다. G4(50ms) 안에 들어가도록 짧게 둔다.
 logger = logging.getLogger(__name__)
+
+
+def _drops_late_deliveries(handler):  # noqa: ANN001, ANN201
+    """C++ 쪽 창이 먼저 파괴된 뒤 도착한 워커 배달을 버린다.
+
+    `_detach_loaders()`의 disconnect로도 부족했다 — 이미 이벤트 루프에
+    **실린** 배달은 disconnect 뒤에도 도착한다. 수신자인 signals 객체는
+    파이썬이 붙들고 있어 살아 있고, 슬롯이 만지는 위젯·모델만 먼저
+    죽는다 (Windows CI 실측: `CommitGraphModel already deleted` — 이전
+    테스트의 창이 지워진 뒤 그 창의 커밋 배치가 배달됐다). 배달의 표적이
+    이미 없다면 버리는 것 말고 옳은 처리가 없다.
+    """
+
+    @functools.wraps(handler)
+    def guarded(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        import shiboken6
+
+        if not shiboken6.isValid(self):
+            return None
+        return handler(self, *args, **kwargs)
+
+    return guarded
+
 
 _CLOSE_DRAIN_MS = 20
 
@@ -1076,6 +1100,7 @@ class MainWindow(QMainWindow):
         self._status_loader = status_loader
         self._pool.start(status_loader)
 
+    @_drops_late_deliveries
     def _on_status_ready(
         self, loader: StatusLoader, status, head_message  # noqa: ANN001
     ) -> None:
@@ -1083,6 +1108,7 @@ class MainWindow(QMainWindow):
             return
         self._work_panel.show_status(status, head_message)
 
+    @_drops_late_deliveries
     def _on_status_failed(self, loader: StatusLoader, error: GitClientError) -> None:
         if loader is not self._status_loader:
             return
@@ -1102,6 +1128,7 @@ class MainWindow(QMainWindow):
             diff_loader.cancel()
         self._loading = False
 
+    @_drops_late_deliveries
     def _on_batch_ready(self, loader: CommitLoader, commits: list) -> None:
         if loader is not self._loader:
             return  # 이전 저장소의 늦은 묶음
@@ -1118,6 +1145,7 @@ class MainWindow(QMainWindow):
             f"커밋을 읽는 중... {self._commit_model.rowCount()}개"
         )
 
+    @_drops_late_deliveries
     def _on_loading_finished(self, loader: CommitLoader, _total: int) -> None:
         self._restore_gc()
         if loader is not self._loader:
@@ -1132,6 +1160,7 @@ class MainWindow(QMainWindow):
             self._diff_model.clear()
             self._show_placeholder()
 
+    @_drops_late_deliveries
     def _on_loading_failed(self, loader: CommitLoader, error: GitClientError) -> None:
         self._restore_gc()
         if loader is not self._loader:
@@ -1139,6 +1168,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._report(error)
 
+    @_drops_late_deliveries
     def _on_refs_ready(self, loader: RefsLoader, refs: list, divergence) -> None:  # noqa: ANN001
         if loader is not self._refs_loader:
             return  # 이전 저장소의 늦은 결과
@@ -1149,6 +1179,7 @@ class MainWindow(QMainWindow):
         self._commit_model.set_refs(refs)
         self._update_status(self._info)
 
+    @_drops_late_deliveries
     def _on_refs_failed(self, loader: RefsLoader, error: GitClientError) -> None:
         if loader is not self._refs_loader:
             return
@@ -1364,6 +1395,7 @@ class MainWindow(QMainWindow):
         self._diff_loaders[token] = loader
         self._pool.start(loader)
 
+    @_drops_late_deliveries
     def _on_diff_ready(self, token: int, detail, lines) -> None:  # noqa: ANN001
         self._diff_loaders.pop(token, None)
         if token != self._diff_generation:
@@ -1382,6 +1414,7 @@ class MainWindow(QMainWindow):
         self._diff_model.set_lines(lines, positions, patch)
         self._update_partial_actions()
 
+    @_drops_late_deliveries
     def _on_diff_failed(self, token: int, error: GitClientError) -> None:
         self._diff_loaders.pop(token, None)
         if token != self._diff_generation:
@@ -2629,6 +2662,7 @@ class MainWindow(QMainWindow):
         self._conflict_loaders[token] = loader
         self._pool.start(loader)
 
+    @_drops_late_deliveries
     def _on_conflict_detail_ready(  # noqa: ANN001
         self, token: int, path: str, detail, fingerprint
     ) -> None:
@@ -2639,6 +2673,7 @@ class MainWindow(QMainWindow):
         self._conflict_fingerprint = fingerprint
         self._conflict_panel.show_detail(detail)
 
+    @_drops_late_deliveries
     def _on_conflict_detail_failed(self, token: int, path: str, _error) -> None:  # noqa: ANN001
         self._conflict_loaders.pop(token, None)
         if token != self._conflict_generation:

@@ -303,7 +303,13 @@ class TestConflictPanelIsPersistent:
 
         window._on_conflict_selected("f.bin")
 
-        assert window._conflict_panel._take_ours.isEnabled()
+        # 상세는 워커가 읽어 온다 (ADR-77) — 버튼은 도착해야 켜진다.
+        # 이 대기 없이 통과해 온 것은 저장소를 열 때 자동 선택된 충돌의
+        # 상세가 그 사이 도착해 준 우연이었고, 로더가 편집 지문까지
+        # 계산하게 되자(ADR-89) 가장 빠른 러너에서 우연이 끝났다.
+        qtbot.waitUntil(
+            window._conflict_panel._take_ours.isEnabled, timeout=self.TIMEOUT
+        )
         assert window._conflict_panel._take_theirs.isEnabled()
         assert "바이너리" in window._conflict_panel._hint.text()
 
