@@ -122,6 +122,13 @@ class RemoteWorker(QRunnable):
     def remote(self) -> str:
         return self._remote
 
+    @property
+    def is_cancelled(self) -> bool:
+        """취소가 접수됐는가. 승격 판정(ADR-83)이 본다 — 이미 멈추라고 한
+        전송을 이어받으면 '이어받는 중' 표시 뒤에 아무것도 오지 않는다."""
+        with self._lock:
+            return self._cancelled
+
     def cancel(self) -> None:
         """결과를 버리고 진행 중인 git 프로세스를 끊는다.
 

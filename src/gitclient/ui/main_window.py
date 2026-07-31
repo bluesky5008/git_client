@@ -188,6 +188,9 @@ class MainWindow(QMainWindow):
         # 배경 prefetch. 사용자 작업 슬롯(_fetch_worker)과 **분리한다** —
         # 같이 쓰면 배경 작업이 도는 동안 사용자의 버튼이 잠긴다.
         self._prefetch_worker = None
+        # 승격(ADR-83)으로 prefetch 완료를 기다리는 사용자 작업.
+        # (워커, 상태바 문구, 재시도 함수) — prefetch가 은퇴하면 시작된다.
+        self._pending_remote: tuple | None = None
         self._prefetch_timer = QTimer(self)
         self._prefetch_timer.timeout.connect(self._maybe_prefetch)
         self._merge_conflicts: tuple = ()
@@ -456,6 +459,17 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(quit_action)
 
+        # 보기 — GUI가 뒤에서 무엇을 하는지 드러내는 창구들 (§5.2 원칙 3).
+        from gitclient.ui.command_log_panel import CommandLogDock
+
+        self._command_log_dock = CommandLogDock(self)
+        self._command_log_dock.hide()
+        self.addDockWidget(
+            Qt.DockWidgetArea.BottomDockWidgetArea, self._command_log_dock
+        )
+        view_menu = self.menuBar().addMenu("보기")
+        view_menu.addAction(self._command_log_dock.toggleViewAction())
+
         self._fetch_action = QAction("가져오기 (Fetch)", self)
         self._fetch_action.setToolTip(
             "원격의 변경을 가져옵니다 (워킹 트리는 건드리지 않습니다)"
@@ -493,6 +507,11 @@ class MainWindow(QMainWindow):
 
         self._branch_action = QAction("새 브랜치...", self)
         self._branch_action.triggered.connect(self._prompt_new_branch)
+        self._reflog_action = QAction("reflog 탐색...", self)
+        self._reflog_action.setToolTip(
+            "HEAD가 지나온 자리들 — reset·건너뛰기로 잃은 커밋을 되찾습니다"
+        )
+        self._reflog_action.triggered.connect(self._on_show_reflog)
         self._stash_action = QAction("Stash 보관", self)
         self._stash_action.triggered.connect(self._on_stash_save)
         self._stash_pop_action = QAction("Stash 꺼내기", self)
@@ -510,6 +529,7 @@ class MainWindow(QMainWindow):
         repo_menu.addAction(self._abort_operation_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._branch_action)
+        repo_menu.addAction(self._reflog_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._stash_action)
         repo_menu.addAction(self._stash_pop_action)
@@ -1592,6 +1612,32 @@ class MainWindow(QMainWindow):
             reload_graph=True,
         )
 
+    def _on_show_reflog(self) -> None:
+        """HEAD reflog를 보여준다 — 파괴적 안내문들의 약속을 지키는 화면.
+
+        읽기는 상한(200건)이 있는 호출이라 UI 스레드에서 해도 예산 안이고,
+        브랜치 생성(쓰기)은 WriteQueue로 제출한다 (§3.3 규칙 3).
+        """
+        if self._engine is None:
+            return
+        from gitclient.ui.reflog_dialog import ReflogDialog
+
+        try:
+            entries = self._engine.head_reflog()
+        except GitClientError as error:
+            self._report(error)
+            return
+        dialog = ReflogDialog(entries, self)
+        dialog.branch_requested.connect(self._on_reflog_branch)
+        dialog.exec()
+
+    def _on_reflog_branch(self, sha: str, name: str) -> None:
+        self._submit_write(
+            f"브랜치 생성: {name} ({sha[:7]})",
+            lambda engine: engine.create_branch(name, sha=sha),
+            reload_graph=True,
+        )
+
     def _on_stash_save(self) -> None:
         self._submit_write(
             "Stash 보관",
@@ -1671,7 +1717,15 @@ class MainWindow(QMainWindow):
         "물어보면 해결되는" 유일한 실패라, 실패 시 되풀이할 방법을 여기서
         기억해 둔다. None이면 다시 시도하지 않는다.
         """
+        # **같은 원격을 향한 fetch 계열이면 prefetch를 죽이지 않고 승격한다**
+        # (ADR-83). 취소하면 이미 회선에 실린 바이트를 버리고 같은 데이터를
+        # 0부터 다시 받는다 — ADR-49(벽시계 타임아웃)가 막은 것과 같은
+        # 낭비다. 어차피 같은 전송이므로 완료를 화면에 보이며 기다렸다가,
+        # 끝나면 실제 작업을 이어 돌린다(그 fetch는 대개 전송 0이다).
+        if self._promote_prefetch(worker, message, retry):
+            return
         # 사용자의 작업이 먼저다 — 배경 prefetch가 회선을 물고 있으면 놓는다.
+        # (다른 원격이거나 push·clone처럼 이어받을 수 없는 작업이다.)
         self._cancel_prefetch()
 
         self._remote_retry = retry
@@ -1690,6 +1744,60 @@ class MainWindow(QMainWindow):
         self._update_remote_actions()
         self.statusBar().showMessage(message)
         self._pool.start(worker)
+
+    def _promote_prefetch(self, worker, message: str, retry) -> bool:  # noqa: ANN001
+        """진행 중인 prefetch를 사용자 작업으로 이어받을 수 있으면 이어받는다.
+
+        조건: 같은 원격 + fetch 계열(가져오기·가져와 합치기). push·clone은
+        prefetch의 객체로 득 볼 것이 없어 기존대로 양보시킨다.
+        """
+        prefetch = self._prefetch_worker
+        if prefetch is None or prefetch.is_cancelled:
+            return False
+        if not isinstance(worker, (FetchWorker, PullWorker)):
+            return False
+        if prefetch.remote != worker.remote:
+            return False
+
+        self._pending_remote = (worker, message, retry)
+        self._remote_retry = None
+        # 취소 버튼·진행 가드·액션 잠금이 전부 `_fetch_worker`를 보므로
+        # 승격된 prefetch를 그 자리에 세운다. prefetch 슬롯은 그대로 둔다 —
+        # 은퇴 부기(_on_prefetch_retired)가 그쪽으로 온다.
+        self._fetch_worker = prefetch
+        # prefetch는 조용하도록 progressed를 연결하지 않았었다 — 사용자
+        # 작업이 된 순간부터는 보여야 한다.
+        prefetch.signals.progressed.connect(
+            lambda snapshot, w=prefetch: self._on_remote_progress(w, snapshot)
+        )
+        prefetch.signals.retired.connect(
+            lambda w=prefetch: self._on_promoted_retired(w)
+        )
+        self._reset_progress()
+        self._cancel_button.show()
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, 0)  # 총계를 아직 모른다
+        self._update_remote_actions()
+        self.statusBar().showMessage(f"{message}  (미리 받던 전송을 이어받는 중)")
+        return True
+
+    def _on_promoted_retired(self, prefetch) -> None:  # noqa: ANN001
+        """승격된 prefetch가 은퇴했다 — 미뤄둔 사용자 작업을 시작한다.
+
+        취소됐거나 저장소가 바뀌었으면(`_fetch_worker`가 더 이상 그 워커가
+        아니면) 미뤄둔 작업도 함께 버린다 — 사용자가 멈춘 일을 우리가
+        이어가면 안 된다.
+        """
+        pending = self._pending_remote
+        self._pending_remote = None
+        if self._fetch_worker is not prefetch:
+            return
+        self._fetch_worker = None
+        if pending is None:
+            return
+        worker, message, retry = pending
+        # prefetch 슬롯은 은퇴 부기가 이미 비웠으므로 일반 경로로 간다.
+        self._start_remote(worker, message, retry=retry)
 
     def _on_remote_progress(self, worker, snapshot) -> None:  # noqa: ANN001
         """진행 상황을 상태바에 그린다.
@@ -1852,6 +1960,9 @@ class MainWindow(QMainWindow):
         투기적으로 받던 팩을 버리게 되지만, 애초에 없어도 되는 것이었다.
         """
         worker = self._prefetch_worker
+        # 승격을 기다리던 작업도 함께 버린다 — 저장소 전환·설정 끔은
+        # "이 저장소의 원격 활동을 멈춰라"는 뜻이다.
+        self._pending_remote = None
         if worker is None:
             return
         self._prefetch_worker = None

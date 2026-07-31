@@ -32,6 +32,7 @@ from gitclient.domain.errors import (
     EngineError,
     GitClientError,
 )
+from gitclient.domain.command_log import COMMAND_LOG
 from gitclient.infrastructure.askpass import (
     Credentials,
     credential_environment,
@@ -66,6 +67,14 @@ BASE_CONFIG: tuple[str, ...] = (
     # 하한선이어야 한다.
     "core.compression=6",
     "pack.compression=6",
+    # 공통 조상 협상의 왕복을 줄인다 (ADR-80). 실측(동일 픽스처, 로컬
+    # 300 + 서버 300 커밋 갈라짐): 기본 알고리즘 5왕복(haves 16→32→64→
+    # 128→160) → skipping 1왕복, 전송 객체 수는 동일(1,197개). 왕복이 곧
+    # 대기다 — RTT 300ms 회선에서 fetch당 ~1.2초 차이. skipping은 공통
+    # 조상을 지수적으로 건너뛰어 잡으므로 위상에 따라 전송이 소폭 늘 수
+    # 있지만, 그 대가는 바이트고 아끼는 것은 왕복이다 (§1.4: 느린 회선은
+    # RTT 비중이 크다).
+    "fetch.negotiationAlgorithm=skipping",
     # 받은 팩을 풀지 않고 보관한다. 두 가지 이득이 겹친다:
     #   1. `Receiving objects: ..., N KiB` 가 항상 나와 전송량을 측정할 수 있다
     #   2. 저장소가 팩된 상태를 유지한다 — 순회가 40배 빠르다 (§4.1.1.3)
@@ -95,6 +104,33 @@ BASE_CONFIG: tuple[str, ...] = (
 # 주면 0.6초에 "terminal prompts disabled"로 실패한다.
 # 저장된 자격증명을 반환하는 경로는 그대로 살아 있고 UI만 차단된다.
 NONINTERACTIVE_CONFIG: tuple[str, ...] = ("credential.interactive=false",)
+
+
+def _ssh_command(windows: bool) -> str:
+    """원격 명령에 줄 기본 GIT_SSH_COMMAND.
+
+    POSIX에서는 연결 멀티플렉싱을 켠다 (ADR-81 🔶) — ssh 핸드셰이크는
+    연결마다 왕복 수 회를 쓰고, 느린 회선일수록 그 비중이 크다. 첫 연결이
+    마스터가 되어 60초간 유지되고(ControlPersist) 그 사이의 fetch·push는
+    핸드셰이크 없이 올라탄다. 실패해도 ssh가 일반 연결로 스스로 물러나므로
+    손해 경로가 없다 — 다만 이 환경에 ssh 원격이 없어 이득의 크기는
+    실측하지 못했다(잠정의 이유).
+
+    Windows OpenSSH는 ControlMaster를 지원하지 않는다 — 옵션을 주면
+    연결마다 경고가 나거나 실패하므로 BatchMode만 남긴다.
+
+    ControlPath는 /tmp 직접 지정이다: 유닉스 소켓 경로는 104바이트 상한이
+    있는데 macOS의 사용자 임시 디렉터리(/var/folders/...)는 그것만으로
+    절반을 쓴다. `%C`(호스트·포트·사용자 해시 40자)와 uid로 사용자 간
+    충돌을 막는다.
+    """
+    if windows:
+        return "ssh -o BatchMode=yes"
+    return (
+        "ssh -o BatchMode=yes -o ControlMaster=auto "
+        f"-o ControlPath=/tmp/gitclient-ssh-{os.getuid()}-%C "
+        "-o ControlPersist=60"
+    )
 
 # 부모 환경에서 걷어낼 변수. 이들은 `-C <repo>`의 저장소 탐색을 이기거나
 # 객체/참조의 위치를 바꾼다. 앱을 GIT_DIR이 export된 셸이나 git 훅
@@ -968,7 +1004,8 @@ class RemoteEngine:
         # StrictHostKeyChecking은 건드리지 않는다 — accept-new로 낮추면 알 수
         # 없는 호스트 키를 조용히 받아들이게 되고, 그건 계측을 위해 살 값이
         # 아니다. 모르는 호스트에서는 매달리지 말고 실패하는 편이 낫다.
-        env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        # 사용자가 GIT_SSH_COMMAND를 이미 정했으면 존중한다 (setdefault).
+        env.setdefault("GIT_SSH_COMMAND", _ssh_command(os.name == "nt"))
 
         # helper가 읽을 값은 환경으로만 흐른다 (ADR-29). 명령줄과 디스크에는
         # 변수 이름만 있다.
@@ -978,6 +1015,7 @@ class RemoteEngine:
         if extra_env:
             env.update(extra_env)
 
+        started_at = time.perf_counter()
         try:
             proc = subprocess.Popen(
                 command,
@@ -1020,6 +1058,14 @@ class RemoteEngine:
         finally:
             with self._lock:
                 self._proc = None
+            # 실행된 명령을 투명성 로그에 남긴다 (FR-11). URL 속 자격증명은
+            # 기록 시점에 가려진다. finally라 stall로 죽인 명령도 남는다 —
+            # poll()이 아직 못 거둔 프로세스면 returncode는 None(비정상)이다.
+            COMMAND_LOG.record(
+                command,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                returncode=proc.poll(),
+            )
 
         if self._aborted:
             # 취소로 죽은 프로세스의 0 아닌 종료코드를 사용자 오류로 번역하지

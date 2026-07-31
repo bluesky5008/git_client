@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -41,6 +42,7 @@ from gitclient.domain.errors import (
     RepositoryNotFoundError,
     RepositoryOpenError,
 )
+from gitclient.domain.command_log import COMMAND_LOG
 from gitclient.infrastructure.remote_engine import INHERITED_ENV_BLOCKLIST
 from gitclient.domain.patch import (
     FilePatch,
@@ -67,6 +69,7 @@ from gitclient.domain.models import (
     MergeOutcome,
     MergePreview,
     Ref,
+    ReflogEntry,
     OperationState,
     RefKind,
     RepoOperation,
@@ -1118,10 +1121,16 @@ class LocalGitEngine:
     # 브랜치 연산 (Phase 2)
     # ------------------------------------------------------------------
 
-    def create_branch(self, name: str, *, checkout: bool = False) -> None:
-        """HEAD 커밋에서 브랜치를 만든다."""
+    def create_branch(
+        self, name: str, *, checkout: bool = False, sha: str | None = None
+    ) -> None:
+        """브랜치를 만든다 — 기본은 HEAD, `sha`를 주면 그 커밋에서.
+
+        `sha` 갈래는 reflog 복구(FR-10)의 실행부다: reset·건너뛰기로
+        목록에서 사라진 커밋에 브랜치를 달아 다시 닿게 만든다.
+        """
         with _translate("브랜치 생성"):
-            if self._repo.head_is_unborn:
+            if sha is None and self._repo.head_is_unborn:
                 raise EngineError(
                     "커밋이 없어 브랜치를 만들 수 없습니다.",
                     action="첫 커밋을 만든 뒤 브랜치를 생성해 주세요.",
@@ -1131,10 +1140,40 @@ class LocalGitEngine:
                     f"브랜치가 이미 있습니다: {name}",
                     action="다른 이름을 사용해 주세요.",
                 )
-            head_commit = self._repo[self._repo.head.target]
-            branch = self._repo.branches.local.create(name, head_commit)
+            if sha is None:
+                target = self._repo[self._repo.head.target]
+            else:
+                target = self._lookup_commit(sha)
+            branch = self._repo.branches.local.create(name, target)
             if checkout:
                 self._repo.checkout(branch)
+
+    def head_reflog(self, limit: int = 200) -> tuple[ReflogEntry, ...]:
+        """HEAD가 지나온 자리들 — 최신이 먼저다 (FR-09).
+
+        상한이 있는 읽기 전용 호출이라 UI 스레드에서 불러도 된다
+        (200건 파싱은 ms 단위 — §3.3의 "상한이 실제로 정해진 호출").
+        """
+        with _translate("reflog 조회"):
+            if self._repo.head_is_unborn:
+                return ()
+            entries: list[ReflogEntry] = []
+            for entry in self._repo.references["HEAD"].log():
+                if len(entries) >= limit:
+                    break
+                committer = entry.committer
+                when = datetime.fromtimestamp(
+                    committer.time,
+                    tz=timezone(timedelta(minutes=committer.offset)),
+                )
+                entries.append(
+                    ReflogEntry(
+                        sha=str(entry.oid_new),
+                        message=entry.message or "",
+                        when=when,
+                    )
+                )
+            return tuple(entries)
 
     def _require_no_sequencer(self) -> None:
         """시퀀서가 도는 중에 HEAD를 옮기지 못하게 한다.
@@ -2237,9 +2276,11 @@ class LocalGitEngine:
         # (이 줄은 변이 검증으로 지킬 수 없다 — 개발 환경의 git에 번역 카탈로그가
         # 없어 지워도 테스트가 붉어지지 않는다. 근거는 실측이 아니라 원격
         # 경로에서 같은 이유로 이미 확인된 것이다.)
+        command = [self._git, "-C", workdir, *args]
+        started_at = time.perf_counter()
         try:
             result = subprocess.run(
-                [self._git, "-C", workdir, *args],
+                command,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -2247,7 +2288,18 @@ class LocalGitEngine:
                 env=env,
                 timeout=_HISTORY_TIMEOUT_S,
             )
+            # 투명성 로그 (FR-11) — 원격 경로와 같은 창구에 남긴다.
+            COMMAND_LOG.record(
+                command,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                returncode=result.returncode,
+            )
         except subprocess.TimeoutExpired as exc:
+            COMMAND_LOG.record(
+                command,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                returncode=None,
+            )
             # git은 상태 파일을 원자적으로 쓰므로 죽여도 저장소는 일관적이다.
             # 다만 연산이 진행 중으로 남을 수 있어 빠져나갈 길을 알려준다.
             raise EngineError(

@@ -145,15 +145,77 @@ class TestPrefetchYieldsToTheUser:
         w.fixture = fixture
         return w
 
-    def test_user_fetch_cancels_a_running_prefetch(self, window) -> None:  # noqa: ANN001
-        """**배경 작업 때문에 사용자가 기다리는 일은 없어야 한다.**"""
+    def test_user_fetch_promotes_the_same_remote_prefetch(
+        self, window, qtbot  # noqa: ANN001
+    ) -> None:
+        """같은 원격의 fetch는 prefetch를 죽이지 않고 **이어받는다** (ADR-83).
+
+        취소하면 이미 회선에 실린 바이트를 버리고 같은 데이터를 0부터
+        다시 받는다 — 어차피 같은 전송이면 완료를 보이며 기다리는 쪽이
+        느린 회선에서 항상 이르다. 실행 전 워커를 슬롯에 직접 앉힌다 —
+        로컬 픽스처의 진짜 prefetch는 ms 안에 끝나 경주가 된다.
+        """
+        from gitclient.application.remote_workers import PrefetchWorker
+
         window.fixture.add_and_publish(2)
-        window._maybe_prefetch()
-        assert window._prefetch_worker is not None, "전제가 깨졌다"
+        prefetch = PrefetchWorker(str(window.fixture.work), "origin")
+        window._prefetch_worker = prefetch
 
         window._on_fetch()
 
-        assert window._prefetch_worker is None, "사용자 작업이 배경에 밀렸다"
+        assert not prefetch.is_cancelled, "이어받을 전송을 죽였다"
+        assert window._fetch_worker is prefetch, "취소 버튼이 승격된 작업을 봐야 한다"
+        assert window._pending_remote is not None, "이어갈 사용자 작업이 없다"
+
+        # prefetch가 은퇴하면 미뤄둔 fetch가 실제로 이어진다.
+        window._on_prefetch_retired(prefetch)
+        prefetch.signals.retired.emit()
+        qtbot.waitUntil(
+            lambda: window._pending_remote is None
+            and window._fetch_worker is None,
+            timeout=TIMEOUT,
+        )
+        head = git("rev-parse", "main", cwd=window.fixture.origin).stdout.strip()
+        tracked = git(
+            "rev-parse", "refs/remotes/origin/main", cwd=window.fixture.work
+        ).stdout.strip()
+        assert tracked == head, "이어받은 fetch가 참조를 갱신하지 않았다"
+
+    def test_cancel_also_stops_a_promoted_prefetch(
+        self, window, qtbot  # noqa: ANN001
+    ) -> None:
+        """승격됐어도 취소 버튼은 즉시 듣는다 — 미뤄둔 작업까지 버린다."""
+        from gitclient.application.remote_workers import PrefetchWorker
+
+        prefetch = PrefetchWorker(str(window.fixture.work), "origin")
+        window._prefetch_worker = prefetch
+        window._on_fetch()
+        assert window._pending_remote is not None
+
+        window._on_cancel_remote()
+
+        assert prefetch.is_cancelled
+        window._on_prefetch_retired(prefetch)
+        prefetch.signals.retired.emit()
+        assert window._pending_remote is None, "취소했는데 작업이 이어졌다"
+        assert window._fetch_worker is None
+
+    def test_user_push_still_cancels_the_prefetch(self, window, qtbot) -> None:  # noqa: ANN001
+        """**배경 작업 때문에 사용자가 기다리는 일은 없어야 한다.**
+
+        push는 prefetch의 객체로 득 볼 것이 없다 — 이어받지 않고 양보시킨다.
+        """
+        from gitclient.application.remote_workers import PrefetchWorker, PushWorker
+
+        prefetch = PrefetchWorker(str(window.fixture.work), "origin")
+        window._prefetch_worker = prefetch
+
+        worker = PushWorker(str(window.fixture.work), "origin", branch="main")
+        window._start_remote(worker, "올리는 중...")
+
+        assert prefetch.is_cancelled, "이어받을 수 없는 작업이 배경에 밀렸다"
+        assert window._prefetch_worker is None
+        qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
 
     def test_prefetch_skips_while_a_user_operation_runs(self, window) -> None:  # noqa: ANN001
         """회선과 저장소를 두고 다투지 않는다 — 다음 주기에 다시 온다."""

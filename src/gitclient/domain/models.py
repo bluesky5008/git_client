@@ -24,6 +24,21 @@ class Signature:
 
 
 @dataclass(frozen=True, slots=True)
+class ReflogEntry:
+    """HEAD가 지나온 자리 하나 (FR-09).
+
+    reset·건너뛰기가 목록에서 지운 커밋을 되찾는 창구다 — 앱의 파괴적
+    동작 안내문이 전부 "reflog에 남는다"를 약속하므로, 그 약속을 앱 안에서
+    지키는 화면의 데이터가 된다 (FR-10).
+    """
+
+    sha: str
+    message: str
+    """git이 적은 동작 설명. 예: "reset: moving to HEAD~3"."""
+    when: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class Commit:
     """단일 커밋.
 
