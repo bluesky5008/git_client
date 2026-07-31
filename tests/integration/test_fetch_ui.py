@@ -149,14 +149,17 @@ class TestRefOnlyChanges:
 
         window._on_fetch()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
         assert "이미 최신" not in window._transfer_label.text()
-        labels = [
-            window._ref_list.item(row).text()
-            for row in range(window._ref_list.count())
-        ]
-        assert any("side" in label for label in labels), labels
+        # 참조 목록은 RefsLoader가 비동기로 채운다 — 로딩 플래그가 내려간
+        # 직후를 단언하면 느린 CI 러너에서 경주가 된다 (첫 CI 실측).
+        qtbot.waitUntil(
+            lambda: any(
+                "side" in window._ref_list.item(row).text()
+                for row in range(window._ref_list.count())
+            ),
+            timeout=TIMEOUT,
+        )
 
     def test_zero_bytes_is_not_reported_as_measurement_failure(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001
@@ -401,13 +404,15 @@ class TestPullRefreshesTheView:
 
         window._on_pull()
         qtbot.waitUntil(lambda: window._fetch_worker is None, timeout=TIMEOUT)
-        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
 
-        labels = [
-            window._ref_list.item(row).text()
-            for row in range(window._ref_list.count())
-        ]
-        assert any("newcomer" in label for label in labels), labels
+        # 참조 목록은 RefsLoader가 비동기로 채운다 (위와 같은 이유).
+        qtbot.waitUntil(
+            lambda: any(
+                "newcomer" in window._ref_list.item(row).text()
+                for row in range(window._ref_list.count())
+            ),
+            timeout=TIMEOUT,
+        )
 
     def test_diverged_pull_still_shows_new_remote_branches(
         self, window, qtbot, remote: RemoteFixture  # noqa: ANN001

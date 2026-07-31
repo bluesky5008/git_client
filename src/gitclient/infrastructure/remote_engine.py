@@ -126,9 +126,13 @@ def _ssh_command(windows: bool) -> str:
     """
     if windows:
         return "ssh -o BatchMode=yes"
+    # getuid는 Windows 인터프리터에 없다 — 제품에서는 이 가지가 POSIX에서만
+    # 돌지만, Windows CI가 POSIX 가지의 **내용**을 검증할 수 있어야 한다
+    # (첫 CI 실측에서 확인된 함정).
+    uid = os.getuid() if hasattr(os, "getuid") else 0
     return (
         "ssh -o BatchMode=yes -o ControlMaster=auto "
-        f"-o ControlPath=/tmp/gitclient-ssh-{os.getuid()}-%C "
+        f"-o ControlPath=/tmp/gitclient-ssh-{uid}-%C "
         "-o ControlPersist=60"
     )
 

@@ -26,16 +26,32 @@ def pack_files(repo: Path) -> list[Path]:
 
 @pytest.fixture
 def multipack(tmp_path: Path) -> Path:
-    """팩이 여러 개 쌓인 저장소 — unpackLimit=1 환경의 일상."""
+    """팩이 여러 개 쌓인 저장소 — unpackLimit=1 환경의 일상.
+
+    `git repack -q` 반복은 Windows git에서 팩을 쌓지 않았다(첫 CI 실측 —
+    한 개로 계속 합쳐졌다). 커밋 범위마다 `pack-objects`로 팩을 **직접**
+    만들면 플랫폼·버전과 무관하게 결정적이다.
+    """
+    import subprocess
+
     root = tmp_path / "work"
     root.mkdir()
     git("init", "--quiet", "-b", "main", str(root))
+    previous: str | None = None
     for index in range(3):
         (root / "f.txt").write_text(("x" * 64 + "\n") * 200 + f"{index}\n")
         git("add", "-A", cwd=root)
         git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=root)
-        # 커밋마다 팩 하나 — 느슨한 오브젝트를 즉시 팩으로 만든다.
-        git("repack", "-q", cwd=root)
+        head = git("rev-parse", "HEAD", cwd=root).stdout.strip()
+        rev_range = head if previous is None else f"{previous}..{head}"
+        result = subprocess.run(
+            ["git", "pack-objects", "--revs", "-q",
+             str(root / ".git" / "objects" / "pack" / "pack")],
+            input=rev_range, text=True, capture_output=True, cwd=root,
+        )
+        assert result.returncode == 0, result.stderr
+        previous = head
+    git("prune-packed", cwd=root)
     assert len(pack_files(root)) >= 3, "전제가 깨졌다 — 팩이 쌓여 있어야 한다"
     return root
 
