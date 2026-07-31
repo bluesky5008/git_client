@@ -3,9 +3,6 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-# 배포 준비대 — 바이너리는 git 히스토리가 아니라 GitHub Releases로
-# (doc/release.md §2.2)
-release/
 
 .venv/
 venv/

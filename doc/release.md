@@ -88,24 +88,25 @@ release/
   확인할 유일한 수단이다. 검증: `shasum -a 256 -c SHA256SUMS.txt`
   (Windows는 `certutil -hashfile <파일> SHA256`으로 값 비교).
 
-### 2.2 git이 추적하지 않는다
+### 2.2 git이 추적한다 (2026-07-31 사용자 결정으로 변경)
 
-`release/`는 `.gitignore`에 있다. 이유는 두 가지다:
+처음에는 `.gitignore`로 제외했다 — 바이너리는 히스토리에 넣는 순간
+영구히 저장소를 무겁게 하고(80MB 배포본 몇 번이면 clone이 느려진다),
+공개 채널로는 GitHub Releases가 맞다는 판단이었다.
 
-1. **바이너리는 git 히스토리에 넣는 순간 영구히 저장소를 무겁게 한다.**
-   80MB짜리 배포본 몇 번이면 clone이 느려진다 — 느린 회선을 위한
-   앱의 저장소가 느린 회선에서 못 받는 저장소가 되는 모순이다.
-2. 공개 채널은 **GitHub Releases**가 맞다. 태그에 묶이고, 다운로드
-   수가 보이고, clone 크기에 영향이 없다. `release/<버전>/`은 그
-   업로드 직전의 준비대(staging)다:
-   `gh release create v<버전> release/<버전>/*`
+**사용자 결정으로 뒤집혔다**: `release/<버전>/`을 저장소가 직접
+추적한다. 저장소 하나로 코드와 배포본이 함께 보관되는 단순함을
+택한 것이다. 그 대가는 위 문단 그대로 남는다 — 버전이 쌓일수록
+clone이 무거워지고, GitHub는 파일당 100MB에서 push를 거부한다
+(현재 dmg 45MB·인스톨러 35MB로 한도 안). 무게가 문제가 되는 시점에
+Git LFS나 GitHub Releases로 옮기는 선택지는 열려 있다.
 
 ### 2.3 dist/와 release/의 구분
 
 | 폴더 | 성격 | 파일명 | git |
 |------|------|--------|-----|
 | `dist/` | 빌드 작업대 — PyInstaller·hdiutil이 쓰고 지우는 곳 | 무명 (`gitclient.dmg`) | 무시 |
-| `release/<버전>/` | 배포 준비대 — 검증 끝난 산출물만 옮겨 담는 곳 | 정식 (`gitclient-0.1.0-macos-arm64.dmg`) | 무시 (§2.2) |
+| `release/<버전>/` | 배포 준비대 — 검증 끝난 산출물만 옮겨 담는 곳 | 정식 (`gitclient-0.1.0-macos-arm64.dmg`) | **추적** (§2.2) |
 
 `dist/`에서 `release/`로 옮기는 조건: 해당 커밋의 CI가 전부 녹색이고,
 산출물이 `--version`에 제 버전을 답하고, 체크섬을 기록했다.
