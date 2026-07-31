@@ -206,3 +206,36 @@ class TestRepositorySwitch:
 
         assert window._commit_model.commit_at(0).summary == "단독 커밋"
         assert "other-repo" in window.windowTitle()
+
+
+class TestLateWorkerResultsAfterClose:
+    """창이 닫힌 뒤 도착한 읽기 결과가 파괴된 위젯을 만지면 안 된다.
+
+    `cancel()`은 앞으로의 방출만 막는다 — 이미 이벤트 루프에 실린 결과는
+    배달되고, 그때 위젯이 없으면 "Internal C++ object already deleted"로
+    터진다 (Windows CI 실측). fetch 워커는 같은 이유로 이미 시그널을
+    끊고 있었는데 읽기 워커에는 그 처리가 빠져 있었다.
+    """
+
+    def test_close_detaches_reader_signals(self, qtbot, tmp_path) -> None:  # noqa: ANN001
+        from tests.integration.remote_harness import AUTHOR_ENV, git
+
+        root = tmp_path / "work"
+        root.mkdir()
+        git("init", "--quiet", "-b", "main", str(root))
+        (root / "f.txt").write_text("x\n", encoding="utf-8")
+        git("add", "-A", cwd=root)
+        git(*AUTHOR_ENV, "commit", "--quiet", "-m", "c", cwd=root)
+
+        window = MainWindow()
+        qtbot.addWidget(window)
+        window._report = lambda _e: None
+        window.open_repository(str(root))
+        qtbot.waitUntil(lambda: not window._loading, timeout=10_000)
+        refs_loader = window._refs_loader
+        assert refs_loader is not None, "전제가 깨졌다 — 참조 로더가 있어야 한다"
+
+        window.close()
+
+        # 닫힌 뒤 늦게 도착한 결과 — 예외 없이 무시돼야 한다.
+        refs_loader.signals.ready.emit([])

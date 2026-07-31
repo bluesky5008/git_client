@@ -1144,9 +1144,36 @@ class MainWindow(QMainWindow):
         # 모달로 흐름을 끊는 대신 상태바로 알린다. (doc/design.md §7)
         self.statusBar().showMessage(f"참조 목록을 읽지 못했습니다: {error.message}")
 
+    def _detach_loaders(self) -> None:
+        """읽기 워커의 시그널을 끊는다 — **취소만으로는 부족하다.**
+
+        `cancel()`은 앞으로의 방출을 막을 뿐, 이미 이벤트 루프에 실린
+        결과는 그대로 배달된다. 창이 닫히는 중이면 그 결과가 파괴된
+        위젯을 만져 `Internal C++ object already deleted`로 터진다
+        (Windows CI 실측 — 느린 러너에서 타이밍이 맞았다). fetch 워커가
+        같은 이유로 이미 끊고 있었는데(§4.6.4), 읽기 워커에는 그 처리가
+        빠져 있었다.
+        """
+        loaders = [self._loader, self._refs_loader, self._status_loader]
+        loaders += list(self._diff_loaders.values())
+        loaders += list(self._conflict_loaders.values())
+        for loader in loaders:
+            signals = getattr(loader, "signals", None)
+            if signals is None:
+                continue
+            for name in dir(type(signals)):
+                candidate = getattr(signals, name, None)
+                if candidate is None or not hasattr(candidate, "disconnect"):
+                    continue
+                try:
+                    candidate.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # 연결이 없었다 — 정리 경로는 조용해야 한다
+
     def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt 시그니처
         """창을 닫을 때 워커가 살아 있으면 정리한다."""
         self._cancel_loading()
+        self._detach_loaders()
         self._prefetch_timer.stop()
         self._cancel_prefetch()
         # fetch는 네트워크에 매달려 있어 스스로 끝나기를 기다릴 수 없다.
