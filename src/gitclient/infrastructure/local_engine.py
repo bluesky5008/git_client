@@ -1697,6 +1697,55 @@ class LocalGitEngine:
                     index.add(pygit2.IndexEntry(path, entry.id, chosen.mode))
             index.write()
 
+    def resolve_conflict_lines(self, path: str, choices: list[str]) -> None:
+        """충돌 구획마다 내 것/상대 것/양쪽을 골라 합친다 (F3).
+
+        워킹 트리의 마커 파일을 파싱해 조립한다 — git이 이미 합쳐둔 공통
+        부분은 그대로 두고, 사람에게 넘어온 구획만 선택으로 채운다.
+        마커가 훼손돼 있으면(사용자가 편집기로 손댐) 거부한다 — 반쯤 합친
+        파일을 쓰는 것보다 낫고, 그 경우엔 편집기 경로로 마저 가면 된다.
+
+        인코딩은 utf-8 + surrogateescape로 왕복한다 — 마커 판정에 필요한
+        것은 ASCII 마커 줄뿐이고, 나머지 바이트는 그대로 보존된다.
+        """
+        from gitclient.domain.conflict_text import compose, parse_conflicted
+
+        with _translate("충돌 해결"):
+            index = self._fresh_index()
+            _ancestor, ours, theirs = self._conflict_entry(index, path)
+            keeper = ours or theirs
+            if keeper is not None:
+                self._require_plain_file(path, keeper)
+            target = Path(self._repo.workdir or "") / path
+            try:
+                raw = target.read_bytes()
+            except OSError as exc:
+                raise EngineError(
+                    f"'{path}'을(를) 읽지 못했습니다.", detail=str(exc)
+                ) from exc
+            try:
+                segments = parse_conflicted(
+                    raw.decode("utf-8", "surrogateescape")
+                )
+                composed = compose(segments, choices)
+            except ValueError as exc:
+                raise EngineError(
+                    f"'{path}'의 충돌 마커를 읽을 수 없습니다.",
+                    detail=str(exc),
+                    action="파일을 이미 편집하셨다면 편집기에서 마커를 정리한 뒤 "
+                    "스테이징해 주세요.",
+                ) from exc
+            target.write_bytes(composed.encode("utf-8", "surrogateescape"))
+            del index.conflicts[path]
+            index.add(path)
+            # 모드 되살리기 — resolve_conflict와 같은 이유 (ADR-66).
+            if keeper is not None:
+                entry = index[path]
+                if entry.mode != keeper.mode:
+                    index.remove(path)
+                    index.add(pygit2.IndexEntry(path, entry.id, keeper.mode))
+            index.write()
+
     @staticmethod
     def _require_plain_file(path: str, entry) -> None:  # noqa: ANN001
         """평범한 파일만 이 방식으로 해결할 수 있다.

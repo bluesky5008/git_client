@@ -383,6 +383,7 @@ class MainWindow(QMainWindow):
         self._conflict_panel = ConflictPanel()
         self._conflict_panel.resolve_requested.connect(self._on_resolve_conflict)
         self._conflict_panel.detail_requested.connect(self._on_conflict_selected)
+        self._conflict_panel.line_pick_requested.connect(self._on_line_pick)
         self._conflict_box = self._wrap("충돌 해결", self._conflict_panel)
         self._conflict_box.hide()
 
@@ -2639,6 +2640,49 @@ class MainWindow(QMainWindow):
             f"충돌 해결({label}): {path}",
             resolve_conflict_job(path, choice),
         )
+
+    def _on_line_pick(self, path: str) -> None:
+        """구획별 선택 화면을 연다 (F3).
+
+        워킹 파일을 한 번 읽어 파싱한다 — 클릭 한 번에 묶인 1회 읽기로,
+        해결 버튼 경로의 잔여(backlog §3.3)와 같은 부류다. 마커가 훼손돼
+        있으면 편집기 경로를 안내한다 — 반쯤 합친 파일을 만들지 않는다.
+        """
+        if self._repo_path is None:
+            return
+        from gitclient.domain.conflict_text import hunks_of, parse_conflicted
+        from gitclient.ui.conflict_lines_dialog import ConflictLinesDialog
+
+        try:
+            raw = (Path(self._repo_path) / path).read_bytes()
+            segments = parse_conflicted(raw.decode("utf-8", "surrogateescape"))
+        except (OSError, ValueError) as exc:
+            self._notify(
+                "줄 단위 선택 불가",
+                f"'{path}'의 충돌 마커를 읽을 수 없습니다.",
+                detail=str(exc),
+                action="파일을 이미 편집하셨다면 편집기에서 마커를 정리한 뒤 "
+                "스테이징해 주세요.",
+            )
+            self._sync_operation_state()  # 잠가둔 버튼을 되살린다
+            return
+        hunks = hunks_of(segments)
+        if not hunks:
+            self._notify(
+                "고를 구획이 없습니다",
+                f"'{path}'에는 충돌 마커가 남아 있지 않습니다.",
+                action="이미 정리된 파일이면 스테이징만 하면 됩니다.",
+            )
+            self._sync_operation_state()
+            return
+        dialog = ConflictLinesDialog(path, hunks, self._operation.labels, self)
+        dialog.apply_requested.connect(
+            lambda choices: self._submit_write(
+                f"충돌 해결(줄 단위): {path}",
+                lambda engine: engine.resolve_conflict_lines(path, choices),
+            )
+        )
+        dialog.exec()
 
     def _working_copy_edited(self, path: str) -> bool:
         """워킹 트리 파일이 충돌 직후 상태에서 벗어났는가.

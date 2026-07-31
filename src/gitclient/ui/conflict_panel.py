@@ -44,6 +44,9 @@ class ConflictPanel(QWidget):
     detail_requested = Signal(str)
     """(경로) — 선택한 파일의 양쪽 내용을 채워 달라는 요청."""
 
+    line_pick_requested = Signal(str)
+    """(경로) — 구획별로 골라 합치는 화면을 열어 달라는 요청 (F3)."""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._current_path: str | None = None
@@ -71,6 +74,11 @@ class ConflictPanel(QWidget):
         self._take_theirs.clicked.connect(
             lambda: self._request(ConflictChoice.THEIRS)
         )
+        # 줄 단위 선택 (F3) — 마커가 있는 텍스트 충돌에서만 열린다.
+        # 바이너리·삭제 계열엔 고를 구획 자체가 없다 (FR-06).
+        self._pick_lines = QPushButton("줄 단위로 고르기...")
+        self._pick_lines.setEnabled(False)
+        self._pick_lines.clicked.connect(self._request_line_pick)
 
         self._hint = QLabel("")
         self._hint.setWordWrap(True)
@@ -88,6 +96,7 @@ class ConflictPanel(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(self._take_ours)
         buttons.addWidget(self._take_theirs)
+        buttons.addWidget(self._pick_lines)
         buttons.addStretch(1)
 
         layout = QVBoxLayout(self)
@@ -179,6 +188,10 @@ class ConflictPanel(QWidget):
             return  # 그 사이 사용자가 다른 파일을 골랐다
         self._take_ours.setEnabled(True)
         self._take_theirs.setEnabled(True)
+        # 줄 단위 선택은 양쪽이 다 있는 텍스트 충돌 = 마커가 있는 경우만.
+        self._pick_lines.setEnabled(
+            detail.can_show_text and detail.ours.exists and detail.theirs.exists
+        )
 
         if not detail.can_show_text:
             # **여기가 이 화면의 존재 이유다.** 내용을 비교할 수는 없어도
@@ -241,6 +254,7 @@ class ConflictPanel(QWidget):
         self._theirs.setPlainText("")
         self._take_ours.setEnabled(False)
         self._take_theirs.setEnabled(False)
+        self._pick_lines.setEnabled(False)
 
     def _on_selection_changed(self, current, _previous) -> None:  # noqa: ANN001
         if current is None:
@@ -254,6 +268,7 @@ class ConflictPanel(QWidget):
         # 경로가 재사용하는 원본(`_working_copy_edited`)도 아직 없다.
         self._take_ours.setEnabled(False)
         self._take_theirs.setEnabled(False)
+        self._pick_lines.setEnabled(False)
         self._hint.setText(f"'{self._current_path}'의 내용을 읽는 중...")
         self.detail_requested.emit(self._current_path)
 
@@ -264,4 +279,9 @@ class ConflictPanel(QWidget):
         # 목록이 갱신되며 다시 열린다.
         self._take_ours.setEnabled(False)
         self._take_theirs.setEnabled(False)
+        self._pick_lines.setEnabled(False)
         self.resolve_requested.emit(self._current_path, choice)
+
+    def _request_line_pick(self) -> None:
+        if self._current_path is not None:
+            self.line_pick_requested.emit(self._current_path)
