@@ -13,7 +13,7 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | ✅ 완료 |
 | 5 | 다듬기 — 테마, 단축키, 다국어 | 🚧 설치본 마감만 남음 |
 
-테스트 **849개** — macOS·git 2.50 실측 **845 통과, 4 skip, 실패 0**
+테스트 **858개** — macOS·git 2.50 실측 **854 통과, 4 skip, 실패 0**
 (Windows·Linux는 CI가 매 push마다 검증 — .github/workflows/ci.yml).
 커밋 10만 개 저장소에서 첫 행 표시까지 **493ms**
 (macOS 재실측 599ms, 목표 1,500ms).
