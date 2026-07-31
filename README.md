@@ -11,9 +11,9 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | 2 | 로컬 쓰기 — stage/commit/branch/stash, 라인 단위 스테이징 | ✅ 완료 |
 | 3 | 원격 통신 — clone/fetch/push + 계측·최적화 | ✅ 완료 (원격 관리 포함) |
 | 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | ✅ 완료 |
-| 5 | 다듬기 — 테마, 단축키, 다국어 | 🚧 설치본 마감만 남음 |
+| 5 | 다듬기 — 테마, 단축키, 다국어 | ✅ 완료 (서명만 인증서 대기) |
 
-테스트 **858개** — macOS·git 2.50 실측 **854 통과, 4 skip, 실패 0**
+테스트 **861개** — macOS·git 2.50 실측 **857 통과, 4 skip, 실패 0**
 (Windows·Linux는 CI가 매 push마다 검증 — .github/workflows/ci.yml).
 커밋 10만 개 저장소에서 첫 행 표시까지 **493ms**
 (macOS 재실측 599ms, 목표 1,500ms).
@@ -126,8 +126,9 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 
 **아직 없는 것** (전체 목록: [doc/backlog.md](doc/backlog.md))
 
-- 값이 끼어드는 문구의 번역(정적 문구 205개는 완료)
-- 설치본 마감: dmg 서명·인스톨러 (onedir 빌드·CI 아티팩트는 있음)
+- 코드서명·공증 (dmg·Windows 인스톨러는 CI가 매 push마다 만든다 —
+  서명만 인증서를 가진 사람의 몫이다)
+- Linux 패키징(AppImage·deb) — 수요 확인 후
 
 ---
 

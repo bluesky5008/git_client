@@ -64,8 +64,24 @@ jobs:
         shell: bash
         run: |
           ./dist/gitclient/gitclient --version
+      # 설치본까지 만든다 — 빌드는 되는데 배포본에서 깨지는 경우를
+      # 릴리스 직전이 아니라 여기서 만난다. **서명은 하지 않는다**:
+      # Developer ID·코드서명 인증서는 이 저장소의 자원이 아니라
+      # 키를 가진 사람이 이어서 돌린다 (packaging/*의 주석 참조).
+      - name: dmg (macOS)
+        if: runner.os == 'macOS'
+        run: sh packaging/make_dmg.sh
+      - name: 인스톨러 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" packaging\gitclient.iss
       - uses: actions/upload-artifact@v4
         with:
           name: gitclient-${{ runner.os }}
-          path: dist/gitclient
+          path: |
+            dist/gitclient
+            dist/*.dmg
+            dist/*setup*.exe
           retention-days: 14

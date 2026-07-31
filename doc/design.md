@@ -2272,13 +2272,25 @@ Phase 5(다듬기)에서 다룬다 — reflog만 Phase 4다 ([backlog.md](backlo
 - 라이선스: 앱은 [MIT](../LICENSE), 제3자 고지는
   [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
 
-**남은 것** (Phase 5 잔여로 §10에 귀속):
+- `packaging/make_dmg.sh` — macOS dmg(드래그 설치, LICENSE·제3자 고지
+  동봉). 로컬 실측 44MB. **서명·공증은 하지 않는다** — Developer ID는
+  이 저장소가 가질 수 없는 자원이라 키를 가진 사람이 이어서 돌린다
+  (스크립트 주석에 명령 두 줄). 서명 없는 dmg도 동작한다: 사용자가 첫
+  실행에서 Gatekeeper 경고를 한 번 넘길 뿐이다.
+- `packaging/gitclient.iss` — Windows 인스톨러(Inno Setup). onedir을 그대로
+  담아 LGPL 조건을 지키고, 관리자 권한을 요구하지 않으며, git이 없으면
+  설치 끝에 안내한다(GPLv2 바이너리를 재배포하지 않으면서 사용자가 막히지
+  않는 선). 코드서명 역시 인증서를 가진 사람의 몫이다.
+- CI가 두 산출물을 매 push마다 만들어 아티팩트로 올린다 — 빌드는 되는데
+  설치본에서 깨지는 경우를 릴리스 직전이 아니라 그때 만난다.
 
-| 플랫폼 | 산출물 | 도구 |
-|--------|--------|------|
-| Windows | `.exe` 인스톨러 | Inno Setup |
-| macOS | `.dmg` (서명 + 공증) | codesign/notarytool — 서명 키 필요 |
-| Linux | AppImage, `.deb` | appimagetool |
+**남은 것** (외부 자원이 필요하다):
+
+| 플랫폼 | 남은 일 | 왜 여기서 멈추는가 |
+|--------|--------|------------------|
+| macOS | codesign + notarytool | Apple Developer ID 인증서 |
+| Windows | signtool | 코드서명 인증서 |
+| Linux | AppImage, `.deb` | 수요 확인 후 — CI에 Linux 패키징 잡이 아직 없다 |
 
 - **git 의존성**: 시스템 git을 사용한다. 없으면 첫 실행 시 안내한다.
   (번들링은 라이선스·용량·업데이트 측면에서 불리하다.)
