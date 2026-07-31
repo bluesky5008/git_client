@@ -266,6 +266,21 @@ class MainWindow(QMainWindow):
         # 승격(ADR-83)으로 prefetch 완료를 기다리는 사용자 작업.
         # (워커, 상태바 문구, 재시도 함수) — prefetch가 은퇴하면 시작된다.
         self._pending_remote: tuple | None = None
+        # 파일시스템 감시 (F2, ADR-85). 워킹 트리 전체가 아니라 `.git`의
+        # 핵심 신호만 본다 — 앱 밖 CLI 조작(커밋·전환·fetch)은 전부 거길
+        # 지나간다. 워킹 트리 편집의 반영은 창 활성화가 담당한다.
+        from PySide6.QtCore import QFileSystemWatcher
+
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.fileChanged.connect(self._on_fs_event)
+        self._fs_watcher.directoryChanged.connect(self._on_fs_event)
+        self._fs_debounce = QTimer(self)
+        self._fs_debounce.setSingleShot(True)
+        self._fs_debounce.setInterval(800)  # CLI 작업 하나가 이벤트 여럿을 만든다
+        self._fs_debounce.timeout.connect(self._on_fs_settled)
+        # 앱 자신의 쓰기가 만든 이벤트로 이중 재로딩하지 않기 위한 도장.
+        self._suppress_fs_until = 0.0
+
         # 유휴 repack (FR-08). 사용자 활동이 잦아들면 저장소당 한 번 팩을
         # 정돈한다 — 사용자 작업이 오면 이벤트로 즉시 물러난다 (NFR-03).
         self._last_user_activity = time.monotonic()
@@ -809,6 +824,7 @@ class MainWindow(QMainWindow):
         self._repo_path = str(path)
         self._settings.setValue("last_repository", str(path))
         self._remember_repository(str(path))
+        self._watch_repository(info.path)
 
         self._commit_model.reset([])
         self._ref_list.clear()
@@ -885,6 +901,76 @@ class MainWindow(QMainWindow):
         if self._engine is None:
             return
         self.open_repository(self._settings.value("last_repository"))
+
+    # ------------------------------------------------------------------
+    # 파일시스템 감시 (F2, ADR-85)
+    # ------------------------------------------------------------------
+
+    def _watch_repository(self, git_dir: str) -> None:
+        """`.git`의 핵심 신호를 감시한다 — 워킹 트리는 감시하지 않는다.
+
+        HEAD·MERGE_HEAD·FETCH_HEAD는 gitdir의 직계 자식이라 디렉터리
+        감시 하나로 잡히고(원자적 rename도 directoryChanged로 온다),
+        브랜치 이동은 refs/heads, `pack-refs` 뒤에는 packed-refs가 잡는다.
+        """
+        stale = self._fs_watcher.files() + self._fs_watcher.directories()
+        if stale:
+            self._fs_watcher.removePaths(stale)
+        base = Path(git_dir)
+        candidates = [base, base / "refs" / "heads", base / "packed-refs"]
+        self._fs_watcher.addPaths(
+            [str(p) for p in candidates if p.exists()]
+        )
+
+    def _on_fs_event(self, path: str) -> None:
+        # QFileSystemWatcher는 rename된 파일을 목록에서 떨군다 — git은
+        # 원자적 rename으로 쓰므로 매 이벤트마다 되살린다.
+        watched = set(self._fs_watcher.files() + self._fs_watcher.directories())
+        if path not in watched and Path(path).exists():
+            self._fs_watcher.addPath(path)
+        self._fs_debounce.start()
+
+    def _on_fs_settled(self) -> None:
+        """이벤트가 잦아들었다 — 밖에서 바뀐 것이면 새로 고친다 (FR-03).
+
+        앱 자신의 쓰기·원격 작업이 만든 이벤트는 걸러낸다 (FR-04): 그
+        경로들은 끝나면 스스로 재로딩하므로 여기서 또 하면 이중이다.
+        진행 중이면 통째로 버린다 — prefetch가 만든 이벤트로 화면을
+        흔들지 않는 것도 이 가드다 (prefetch는 보이지 않아야 한다).
+        """
+        if self._engine is None or self._repo_path is None or self._loading:
+            return
+        if time.monotonic() < self._suppress_fs_until:
+            return
+        if self._write_queue is not None and self._write_queue.is_busy:
+            return
+        if self._fetch_worker is not None or self._prefetch_worker is not None:
+            return
+        self.statusBar().showMessage("저장소가 밖에서 바뀌어 새로 고칩니다...")
+        self.open_repository(self._repo_path)
+
+    def _stamp_self_write(self) -> None:
+        """앱이 방금 저장소를 만졌다 — 그 여파의 감시 이벤트를 무시한다."""
+        self._suppress_fs_until = time.monotonic() + 2.0
+
+    def changeEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt 시그니처
+        """창이 다시 활성화되면 작업 디렉터리 상태를 되읽는다 (F2).
+
+        워킹 트리 수만 파일을 감시하는 대신, 사용자가 편집기·터미널에서
+        **돌아오는 순간**을 쓴다 — 그때가 최신 상태를 기대하는 순간이다.
+        상태 읽기는 StatusLoader 워커라 활성화가 걸리적거리지 않는다.
+        """
+        super().changeEvent(event)
+        from PySide6.QtCore import QEvent
+
+        if (
+            event.type() == QEvent.Type.ActivationChange
+            and self.isActiveWindow()
+            and self._engine is not None
+            and not self._loading
+            and (self._write_queue is None or not self._write_queue.is_busy)
+        ):
+            self._refresh_status()
 
     # ------------------------------------------------------------------
     # 백그라운드 로딩
@@ -1417,6 +1503,7 @@ class MainWindow(QMainWindow):
         """
         if queue is not self._write_queue:
             return  # 교체된 저장소의 늦은 결과
+        self._stamp_self_write()  # 이 쓰기의 감시 이벤트로 이중 재로딩하지 않는다
         if isinstance(result, (MergeOutcome, HistoryOutcome)) and result.is_conflicted:
             self._enter_conflict_mode(result)
             return
@@ -2370,6 +2457,7 @@ class MainWindow(QMainWindow):
     def _on_remote_finished(self, worker, stats) -> None:  # noqa: ANN001
         if worker is not self._fetch_worker:
             return  # 이전 저장소의 늦은 결과
+        self._stamp_self_write()  # fetch가 만든 감시 이벤트를 걸러낸다 (F2)
         self._fetch_worker = None
         self._reset_progress()
         self._update_remote_actions()
