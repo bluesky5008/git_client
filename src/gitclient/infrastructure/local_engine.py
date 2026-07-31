@@ -1372,9 +1372,14 @@ class LocalGitEngine:
 
         **로컬 질의라 여기(pygit2)에 있다.** 처음에는 `git rev-list --count`로
         RemoteEngine에 두었는데, 네트워크를 한 바이트도 쓰지 않으면서
-        프로세스 생성 비용만 냈다 — 실측 19ms 대 pygit2 0.002ms. §2.3의
-        엔진 경계(로컬은 pygit2, 네트워크는 CLI)에 어긋났고, UI 스레드에서
-        불리므로 G4 예산 50ms의 40%를 이유 없이 태우고 있었다.
+        프로세스 생성 비용(실측 19ms)만 냈다. §2.3의 엔진 경계(로컬은
+        pygit2, 네트워크는 CLI)에 어긋났고, UI 스레드에서 불리므로 G4
+        예산 50ms의 40%를 이유 없이 태우고 있었다.
+
+        **pygit2 쪽 비용도 공짜가 아니다 — 갈라진 만큼 선형이다** (감사
+        실측: 100+100 중앙값 0.41ms, 1만+1만 최악 84.8ms). 한때 "0.002ms"
+        라고 적었던 것은 한쪽 1커밋 픽스처의 값이었다. 극단 모노레포
+        대응은 backlog §3.4.
 
         ADR-2가 CLI를 정당화한 근거는 **전송 바이트를 줄이는 수단**
         (protocol v2, 필터, 협상 튜닝)인데 이 질의는 그중 어느 것도 쓰지 않는다.
@@ -1500,16 +1505,9 @@ class LocalGitEngine:
         index.read(False)  # 디스크가 바뀌었을 때만 다시 읽는다
         return index
 
-    def is_merging(self) -> bool:
-        """저장소가 병합 진행 중인가. **충돌 유무와 무관하다.**
-
-        충돌을 전부 해결해 스테이징하면 `index.conflicts`는 비지만, 커밋하기
-        전까지 MERGE_HEAD는 그대로 남아 병합은 계속 진행 중이다. 충돌 개수로
-        판단하면 마지막 파일을 스테이징하는 순간 중단 메뉴가 꺼져 사용자가
-        빠져나갈 길 없는 화면에 갇힌다.
-        """
-        with _translate("병합 상태 조회"):
-            return self._repo.state() == pygit2.enums.RepositoryState.MERGE
+    # `is_merging()`이 한때 여기 있었다. 판정은 전부 `current_operation()`
+    # (MERGE 포함 연산 일반)으로 옮겨가 프로덕션 호출자가 0이 됐다 —
+    # 테스트만 지지하던 죽은 코드라 함께 지웠다 (backlog §3.8).
 
     def index_conflicts(self) -> tuple[ConflictedFile, ...]:
         """저장소 상태와 **무관하게** 인덱스에 남은 충돌 전부.

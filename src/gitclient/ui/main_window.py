@@ -2958,8 +2958,11 @@ class MainWindow(QMainWindow):
     def _ahead_behind(self) -> tuple[int, int] | None:
         """(앞선 커밋 수, 뒤처진 커밋 수). upstream이 없으면 None.
 
-        UI 스레드에서 부른다. pygit2 네이티브라 실측 0.002ms로 G4 예산
-        (50ms)에 견줘 무시할 수 있다 — CLI subprocess로 하던 때는 19ms였다.
+        UI 스레드에서 부른다 — 다만 비용은 상수가 아니라 **갈라진 만큼
+        선형**이다 (감사 실측: 100+100 중앙값 0.41ms, 1만+1만 최악
+        84.8ms — G4 초과). 한때 "실측 0.002ms"라고 적혀 있었는데 그것은
+        한쪽 1커밋짜리 픽스처의 값이었다(ADR-11 부류의 흠). 극단 모노레포
+        대응(워커 이동)은 backlog §3.4에 남아 있다.
         """
         resolved, branch = self._upstream(), self._current_branch()
         if resolved is None or branch is None or self._engine is None:

@@ -19,6 +19,17 @@ from gitclient.ui.main_window import MainWindow
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv if argv is None else argv
 
+    # 패키징 스모크 테스트의 발판이다 — 창 없이 "실행 파일이 살아 있는가"에
+    # 답할 유일한 경로. CI가 빌드 산출물에 이것을 묻는다 (§9).
+    if "--version" in args[1:]:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            print(f"gitclient {version('gitclient')}")
+        except PackageNotFoundError:
+            print("gitclient (개발 트리)")
+        return 0
+
     # 엔진이 남기는 진단(제외된 태그 등)이 보이도록 한다. (doc/design.md §7)
     logging.basicConfig(
         level=logging.INFO,

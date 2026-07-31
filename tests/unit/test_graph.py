@@ -161,8 +161,13 @@ class TestOrphanBranch:
         assert edges_of(rows[2], EdgeKind.INCOMING) == []
 
 
-class TestCrossMerge:
-    """서로 다른 시점에 갈라지고 합쳐지는, 레인이 여러 개 살아있는 형태.
+class TestNestedMerges:
+    """중첩 머지 — 레인이 여러 개 살아있는 형태.
+
+    한때 `TestCrossMerge`라는 이름이었지만 이 픽스처는 교차 머지가
+    아니다 (감사 확정, backlog 구 §3.9) — 진짜 criss-cross는 아래
+    `TestCrissCross`가 본다. 이름이 검증 범위를 부풀리면 다음 사람이
+    "확인됐구나"로 읽는다.
 
         M2      부모: M1, T
         |\\
@@ -207,6 +212,75 @@ class TestCrossMerge:
         # 같은 행 안에서 두 선이 같은 위치에서 시작해 다른 곳으로 가면 안 된다.
         for row in rows:
             passing = [e for e in row.edges if e.kind is EdgeKind.PASS]
+            starts = [e.from_lane for e in passing]
+            assert len(starts) == len(set(starts))
+
+
+class TestCrissCross:
+    """진짜 교차 머지 — 두 브랜치가 **서로를** 병합해 선이 교차한다.
+
+        MA      부모: A1, B1
+        | MB    부모: B1, A1   ← 서로의 머리를 반대 순서로 병합
+        A1|
+        | B1
+        |/
+        R
+    """
+
+    @pytest.fixture
+    def rows(self) -> list[GraphRow]:
+        return layout(
+            [
+                ("MA", ("A1", "B1")),
+                ("MB", ("B1", "A1")),
+                ("A1", ("R",)),
+                ("B1", ("R",)),
+                ("R", ()),
+            ]
+        )
+
+    def test_both_merges_fan_out_to_two_parents(
+        self, rows: list[GraphRow]
+    ) -> None:
+        ma, mb = rows[0], rows[1]
+        assert len(edges_of(ma, EdgeKind.OUTGOING)) == 2
+        assert len(edges_of(mb, EdgeKind.OUTGOING)) == 2
+
+    def test_a_line_crosses_over_a_live_lane(self, rows: list[GraphRow]) -> None:
+        """교차의 흔적 — 어떤 선이 **살아 있는(PASS) 레인 위를 가로지른다.**
+
+        중첩 머지에는 이 형태가 없다: 합류·분기는 있어도 남의 레인을
+        넘어가는 대각선은 서로를 병합할 때만 생긴다. (실측: MB의 나가는
+        선 2→0이 PASS 중인 레인 1을 지난다.)
+        """
+        for row in rows:
+            passing = {e.from_lane for e in edges_of(row, EdgeKind.PASS)}
+            for edge in row.edges:
+                if edge.kind is EdgeKind.PASS:
+                    continue
+                low, high = sorted((edge.from_lane, edge.to_lane))
+                if any(low < lane < high for lane in passing):
+                    return  # 교차를 찾았다
+        pytest.fail("어느 행에서도 선이 살아 있는 레인을 가로지르지 않았다")
+
+    def test_merged_lines_share_the_lane_without_duplication(
+        self, rows: list[GraphRow]
+    ) -> None:
+        """같은 레인으로 합류한 두 선은 **한 번만** 그려진다 (실측 모델).
+
+        A1에는 MA(0→0)와 MB(2→0)의 선이 오지만 레인 0에서 합쳐져 세로선
+        하나로 들어온다 — 레인별 중복 없이. B1은 레인이 달라(1과 2→1)
+        둘로 들어온다.
+        """
+        a1, b1 = rows[2], rows[3]
+        a1_in = edges_of(a1, EdgeKind.INCOMING)
+        assert [(-1 if e.from_lane == e.to_lane else e.from_lane, e.to_lane)
+                for e in a1_in].count((-1, a1.lane)) == 1
+        assert len(edges_of(b1, EdgeKind.INCOMING)) == 2
+
+    def test_lanes_never_collide(self, rows: list[GraphRow]) -> None:
+        for row in rows:
+            passing = edges_of(row, EdgeKind.PASS)
             starts = [e.from_lane for e in passing]
             assert len(starts) == len(set(starts))
 

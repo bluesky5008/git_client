@@ -327,10 +327,10 @@ class TestPrefetchStatsDoNotEvictUserStats:
         for _ in range(10):
             store.record("repo", stats(OperationKind.PREFETCH))
 
-        summary = store.summarize("repo")
+        remaining = len(store.recent("repo", limit=100))
 
-        assert summary.operations >= 6, (
-            f"배경 기록이 사용자 기록을 밀어냈다 (남은 행 {summary.operations}개)"
+        assert remaining >= 6, (
+            f"배경 기록이 사용자 기록을 밀어냈다 (남은 행 {remaining}개)"
         )
 
 

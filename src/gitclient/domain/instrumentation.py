@@ -191,22 +191,9 @@ class TransferStats:
 
     succeeded: bool = True
 
-    @property
-    def billed_bytes(self) -> int | None:
-        """이 작업이 회선에 실은 총 바이트 — 목적함수의 단위.
-
-        받은 것과 보낸 것을 합친다. 회선을 지나간 양은 방향을 가리지
-        않으므로,
-        누적 집계는 이 값으로 해야 한다. 한쪽이라도 측정하지 못했으면
-        합계도 "측정하지 못함"이다 — 0으로 때우면 과소 집계가 된다.
-        """
-        if self.received_bytes is None and self.sent_bytes is None:
-            return None
-        if self.received_bytes is None or self.sent_bytes is None:
-            # 한 방향만 측정된 경우. fetch는 sent를, push는 received를
-            # 애초에 만들지 않으므로, 없는 쪽은 0으로 본다.
-            return self.received_bytes if self.sent_bytes is None else self.sent_bytes
-        return self.received_bytes + self.sent_bytes
+    # `billed_bytes`(받은+보낸 합계)가 한때 여기 있었다. 소비자였던 누적
+    # 집계가 ADR-57로 폐기되며 함께 지웠다 — 아무도 읽지 않는, 권위 있어
+    # 보이는 죽은 코드는 없는 것보다 나쁘다 (backlog §3.8).
 
     @property
     def transferred_anything(self) -> bool:

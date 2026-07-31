@@ -2182,7 +2182,7 @@ Phase 5(다듬기)에서 다룬다 — reflog만 Phase 4다 ([backlog.md](backlo
 |------|------|-----------|
 | SSH ControlMaster 멀티플렉싱 🔶 | 연결 핸드셰이크 제거 | SSH 원격 — **미구현** |
 | HTTP keep-alive / 커넥션 재사용 | TLS 핸드셰이크 제거 | HTTPS 원격 |
-| 다중 원격 병렬 fetch | 벽시계 시간 단축 | 원격 2개 이상 (동시 4개 상한) |
+| 다중 원격 병렬 fetch | 벽시계 시간 단축 | 🔶 미구현 — 원격 2개 이상인 사용 사례가 확인되면 (동시 4개 상한으로) |
 
 **C. 로컬 처리 가속 — 적극 적용 (컴퓨팅이 여유롭다)**
 
@@ -2256,11 +2256,29 @@ Phase 5(다듬기)에서 다룬다 — reflog만 Phase 4다 ([backlog.md](backlo
 
 ## 9. 패키징 및 배포
 
+**구현된 것** (2026-07-31 — 그 전까지 이 절은 전부 계획이었고 backlog
+§3.7이 "로드맵상 누구의 일도 아니다"라고 지적했다):
+
+- `packaging/gitclient.spec` — PyInstaller **onedir** 빌드. onedir이
+  요구사항이다: PySide6/Qt(LGPLv3)의 공유 라이브러리가 교체 가능한 별도
+  파일로 남아야 한다 ([THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)).
+  로컬 실측: 106MB, `--version` 스모크 통과. pygit2의 `_cffi_backend`는
+  정적 분석이 놓쳐 hiddenimport로 명시한다(실측).
+- `.github/workflows/ci.yml` — 3개 OS 테스트 매트릭스(§11의 리스크
+  대응이 실제로 도는 자리 — Windows 잡이 ADR-78 등 크로스플랫폼 가정을
+  상시 검증한다) + macOS/Windows 패키징 잡(빌드 → `--version` 스모크 →
+  아티팩트 업로드, 14일 보관).
+- `gitclient --version` — 창 없이 실행 파일 생존을 확인하는 유일한 경로.
+- 라이선스: 앱은 [MIT](../LICENSE), 제3자 고지는
+  [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md).
+
+**남은 것** (Phase 5 잔여로 §10에 귀속):
+
 | 플랫폼 | 산출물 | 도구 |
 |--------|--------|------|
-| Windows | `.exe` 인스톨러 | PyInstaller + Inno Setup |
-| macOS | `.dmg` (서명 + 공증) | PyInstaller + codesign/notarytool |
-| Linux | AppImage, `.deb` | PyInstaller + appimagetool |
+| Windows | `.exe` 인스톨러 | Inno Setup |
+| macOS | `.dmg` (서명 + 공증) | codesign/notarytool — 서명 키 필요 |
+| Linux | AppImage, `.deb` | appimagetool |
 
 - **git 의존성**: 시스템 git을 사용한다. 없으면 첫 실행 시 안내한다.
   (번들링은 라이선스·용량·업데이트 측면에서 불리하다.)
@@ -2346,8 +2364,8 @@ Phase 5(다듬기)에서 다룬다 — reflog만 Phase 4다 ([backlog.md](backlo
 |--------|------|------|
 | 커밋 그래프 알고리즘의 복잡도 | 일정 지연 | Phase 1에서 프로토타입으로 조기 검증. 초기엔 단순 알고리즘으로 시작해 개선. |
 | Python 성능이 목표에 미달 | G2 실패 | 프로파일링으로 병목 특정 → 해당 모듈만 Rust(pyo3)로 교체. Domain 층이 순수 파이썬이라 교체 범위가 격리된다. |
-| partial clone 미지원 서버 | G3 부분 실패 | 서버 capability를 먼저 조회해 지원 여부를 감지하고 자동 폴백. |
-| 플랫폼별 경로/개행/권한 차이 | 버그 산발 | CI에서 3개 OS 전부 테스트 🔶 (**CI 미구축** — 현재는 Windows 로컬 실행만). 경로는 `pathlib`로 통일. |
+| partial clone 미지원 서버 | G3 부분 실패 | 🔶 capability 사전 조회·자동 폴백은 **미구현** — partial clone이 선택지일 뿐 기본값이 아니라(ADR-6) 실패 시 오류로 드러나고, 사용자는 전체 복제로 다시 시도하면 된다. 자동화는 수요 확인 후. |
+| 플랫폼별 경로/개행/권한 차이 | 버그 산발 | ✅ CI가 3개 OS에서 전체 스위트를 돈다 (`.github/workflows/ci.yml`, 2026-07-31). 경로는 `pathlib`로 통일. |
 | PySide6 LGPL 준수 | 배포 이슈 | 동적 링크 유지, 라이선스 고지 포함. |
 
 ---

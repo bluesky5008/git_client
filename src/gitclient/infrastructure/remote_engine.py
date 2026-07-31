@@ -753,26 +753,10 @@ class RemoteEngine:
             return False
         return True
 
-    def ahead_behind(self, branch: str, upstream: str) -> tuple[int, int] | None:
-        """(앞선 커밋 수, 뒤처진 커밋 수). 비교할 수 없으면 None.
-
-        push/pull 버튼의 활성 여부와 안내 문구가 이 값에서 나온다.
-        네트워크를 타지 않는 로컬 질의라 계측 대상이 아니다.
-        """
-        try:
-            result = self._run(
-                ["rev-list", "--left-right", "--count", f"{branch}...{upstream}"],
-                measure=False,
-            )
-        except GitClientError:
-            return None  # upstream이 없거나 아직 fetch하지 않았다
-        parts = result.stdout.split()
-        if len(parts) != 2:
-            return None
-        try:
-            return int(parts[0]), int(parts[1])
-        except ValueError:
-            return None
+    # `ahead_behind`(rev-list CLI 질의)가 한때 여기 있었다. §4.7.6이 판정을
+    # pygit2(LocalGitEngine)로 옮긴 뒤에도 남아, docstring이 "push/pull
+    # 버튼이 이 값에서 나온다"고 거짓 주장했다 — 아무도 읽지 않는, 권위
+    # 있어 보이는 죽은 코드는 없는 것보다 나쁘다 (backlog §3.8).
 
     # ------------------------------------------------------------------
     # 실행

@@ -55,18 +55,34 @@ class TestEngineBoundary:
         engine = LocalGitEngine.open(str(remote.work))
         assert engine.ahead_behind("main", "refs/remotes/origin/nope") is None
 
-    def test_ui_does_not_shell_out_for_divergence(self) -> None:
-        """UI의 ahead/behind 경로가 RemoteEngine을 쓰면 안 된다.
+    def test_ui_does_not_shell_out_for_divergence(
+        self, qtbot, remote: RemoteFixture, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """UI의 ahead/behind 경로가 프로세스를 띄우면 안 된다.
 
-        기능만 보면 어느 쪽이든 같은 숫자가 나오므로, 원칙 위반은 이렇게
-        구조를 직접 확인해야 잡힌다.
+        예전 판은 소스 문자열에 "RemoteEngine"이 없는지만 봤다 —
+        `subprocess.run(["git","rev-list",...])`을 인라인으로 넣으면
+        통과하는, 정확히 금지하려던 그것을 놓치는 검사였다 (감사 확정,
+        backlog 구 §3.9). 지금은 **실행 중 subprocess 자체를 봉인**하고
+        값이 그래도 나오는지를 본다 — 어떤 우회로든 여기서 걸린다.
         """
+        import subprocess as subprocess_module
+
         from gitclient.ui.main_window import MainWindow
 
-        source = inspect.getsource(MainWindow._ahead_behind)
+        window = MainWindow()
+        qtbot.addWidget(window)
+        window._report = lambda _e: None
+        window.open_repository(str(remote.work))
+        qtbot.waitUntil(lambda: not window._loading, timeout=30_000)
 
-        assert "RemoteEngine" not in source, "로컬 질의에 CLI 엔진을 썼다"
-        assert "_engine" in source
+        def forbidden(*_args, **_kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("ahead/behind가 프로세스를 띄웠다")
+
+        monkeypatch.setattr(subprocess_module, "run", forbidden)
+        monkeypatch.setattr(subprocess_module, "Popen", forbidden)
+
+        assert window._ahead_behind() == (0, 0)
 
 
 class TestCredentialDelegationForClone:
@@ -122,16 +138,27 @@ class TestInstrumentationAttribution:
     def test_record_skips_when_there_is_no_repository(
         self, tmp_path: Path, monkeypatch
     ) -> None:  # noqa: ANN001
-        """귀속시킬 저장소가 없으면 조용히 건너뛴다 — 죽지 않는다."""
-        recorded: list = []
+        """귀속시킬 저장소가 없으면 조용히 건너뛴다 — 죽지 않고, 쓰지도 않는다.
+
+        예전 판은 만들어 놓고 아무 데도 넘기지 않은 목록에 대고
+        `assert recorded == []`를 했다 — 무조건 참이라 아무것도 지키지
+        않았다 (감사 확정, backlog 구 §3.9). 지금은 저장 경로 자체를 세어
+        **StatsStore가 정말 불리지 않는가**를 본다.
+        """
+        from gitclient.infrastructure.stats_store import StatsStore
+
+        stored: list = []
+        monkeypatch.setattr(remote_workers, "_repo_key", lambda path: None)
         monkeypatch.setattr(
-            remote_workers, "_repo_key", lambda path: None
+            StatsStore,
+            "record",
+            lambda self, key, stats: stored.append((key, stats)),
         )
         worker = CloneWorker("https://x/y.git", tmp_path / "dst")
 
         worker._record(object())  # 예외 없이 지나가야 한다
 
-        assert recorded == []
+        assert stored == [], "귀속할 저장소가 없는데 계측이 기록됐다"
 
 
 class TestSubmoduleRecursionIsOffEverywhere:

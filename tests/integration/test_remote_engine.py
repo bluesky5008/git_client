@@ -307,7 +307,6 @@ class TestPush:
         assert stats.kind is OperationKind.PUSH
         assert stats.sent_bytes is not None and stats.sent_bytes > 0
         assert stats.sent_objects
-        assert stats.billed_bytes == stats.sent_bytes
 
     def test_push_does_not_claim_received_bytes(
         self, remote: RemoteFixture, engine: RemoteEngine
@@ -379,22 +378,9 @@ class TestPush:
         assert excinfo.value.detail  # git 원문 보존
 
 
-class TestAheadBehind:
-    def test_reports_divergence(
-        self, remote: RemoteFixture, engine: RemoteEngine
-    ) -> None:
-        remote.diverge()
-        engine.fetch()
-
-        assert engine.ahead_behind("main", "origin/main") == (1, 1)
-
-    def test_in_sync_is_zero_zero(
-        self, remote: RemoteFixture, engine: RemoteEngine
-    ) -> None:
-        assert engine.ahead_behind("main", "origin/main") == (0, 0)
-
-    def test_unknown_upstream_is_none(self, engine: RemoteEngine) -> None:
-        assert engine.ahead_behind("main", "origin/nonexistent") is None
+# TestAheadBehind가 한때 여기 있었다 — RemoteEngine의 죽은 구현(§4.7.6이
+# pygit2로 옮김)을 테스트가 지지하고 있어 함께 지웠다 (backlog §3.8).
+# 살아 있는 쪽의 검증은 test_design_consistency.py에 있다.
 
 
 class TestArgumentInjection:

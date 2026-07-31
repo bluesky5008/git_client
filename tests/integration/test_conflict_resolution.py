@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from gitclient.domain.errors import EngineError
-from gitclient.domain.models import ConflictChoice, ConflictSide
+from gitclient.domain.models import ConflictChoice, ConflictSide, RepoOperation
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from tests.integration.remote_harness import AUTHOR_ENV, git
 
@@ -341,7 +341,7 @@ class TestConflictsFromOtherSources:
         engine = LocalGitEngine.open(str(self._stash_conflict(tmp_path)))
 
         assert [c.path for c in engine.index_conflicts()] == ["f.txt"]
-        assert not engine.is_merging(), "병합이 아닌데 병합이라고 한다"
+        assert engine.current_operation() is not RepoOperation.MERGE, "병합이 아닌데 병합이라고 한다"
 
     def test_stash_conflicts_are_resolvable(self, tmp_path: Path) -> None:
         """해결 경로도 출처를 가리지 않아야 한다."""
@@ -432,7 +432,7 @@ class TestRebaseConflictsAreShownWithHonestLabels:
         engine = LocalGitEngine.open(str(self._rebase_conflict(tmp_path)))
 
         assert engine.merge_conflicts() == ()
-        assert not engine.is_merging()
+        assert engine.current_operation() is not RepoOperation.MERGE
 
 
 class TestSpecialFileTypesAreRefused:

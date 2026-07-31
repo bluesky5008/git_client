@@ -61,23 +61,9 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
-class TransferSummary:
-    """기간별 집계.
-
-    `measured_operations`가 `operations`보다 작으면 일부 작업의 전송량을
-    측정하지 못했다는 뜻이다 — 합계를 "전부"라고 읽으면 안 된다.
-    """
-
-    operations: int = 0
-    measured_operations: int = 0
-    total_bytes: int = 0
-    total_objects: int = 0
-    total_duration_ms: int = 0
-
-    @property
-    def fully_measured(self) -> bool:
-        return self.operations == self.measured_operations
+# `TransferSummary`/`summarize()`(기간 집계)가 한때 여기 있었다. 소비자였던
+# 누적 대시보드가 ADR-57로 폐기되며 함께 지웠다 (backlog §3.8) — 개별 행
+# 조회는 `recent()`가 남아 상태바와 테스트가 쓴다.
 
 
 class StatsStore:
@@ -211,45 +197,6 @@ class StatsStore:
                 """,
                 (repo_key, kind, repo_key, kind, self._keep),
             )
-
-    def summarize(self, repo_key: str, *, since: datetime | None = None) -> TransferSummary:
-        """기간 집계. `since`를 주면 그 시각 이후만 센다."""
-        # 목적함수는 방향을 가리지 않는다 — 받은 것과 보낸 것을 함께 센다.
-        # "측정됨"의 판정도 둘 중 **해당 방향**이 채워졌는지로 봐야 한다.
-        # received만 보면 push 행이 전부 미측정으로 잡혀 신호가 무의미해진다.
-        query = [
-            "SELECT COUNT(*) AS ops,",
-            "       SUM(received_bytes IS NOT NULL",
-            "           OR sent_bytes IS NOT NULL) AS measured,",
-            "       COALESCE(SUM(COALESCE(received_bytes, 0)",
-            "                    + COALESCE(sent_bytes, 0)), 0) AS bytes,",
-            "       COALESCE(SUM(COALESCE(received_objects, 0)",
-            "                    + COALESCE(sent_objects, 0)), 0) AS objects,",
-            "       COALESCE(SUM(duration_ms), 0) AS duration",
-            "  FROM remote_stats WHERE repo_key = ?",
-        ]
-        params: list[object] = [repo_key]
-        if since is not None:
-            query.append("AND recorded_at >= ?")
-            params.append(since.isoformat())
-
-        try:
-            with closing(self._connect()) as connection:
-                row = connection.execute(" ".join(query), params).fetchone()
-        except sqlite3.Error as exc:
-            logger.warning("계측을 읽지 못했습니다: %s", exc)
-            return TransferSummary()
-
-        if row is None or not row["ops"]:
-            return TransferSummary()
-
-        return TransferSummary(
-            operations=int(row["ops"]),
-            measured_operations=int(row["measured"] or 0),
-            total_bytes=int(row["bytes"]),
-            total_objects=int(row["objects"]),
-            total_duration_ms=int(row["duration"]),
-        )
 
     def recent(self, repo_key: str, limit: int = 20) -> list[sqlite3.Row]:
         try:

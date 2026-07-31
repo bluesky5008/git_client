@@ -13,8 +13,8 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 | 4 | 고급 작업 — merge/rebase/cherry-pick, 충돌 해결 | 🚧 인터랙티브 rebase만 남음 |
 | 5 | 다듬기 — 테마, 단축키, 다국어 | 🚧 다국어·패키징만 남음 |
 
-테스트 **824개** — macOS·git 2.50 실측 **820 통과, 4 skip, 실패 0**
-(Windows 재검증은 대기 — [doc/backlog.md](doc/backlog.md)).
+테스트 **826개** — macOS·git 2.50 실측 **822 통과, 4 skip, 실패 0**
+(Windows·Linux는 CI가 매 push마다 검증 — .github/workflows/ci.yml).
 커밋 10만 개 저장소에서 첫 행 표시까지 **493ms**
 (macOS 재실측 599ms, 목표 1,500ms).
 
@@ -252,4 +252,7 @@ Infrastructure (pygit2 LocalGitEngine · git CLI RemoteEngine · StatsStore)
 
 ## 라이선스
 
-미정. PySide6가 LGPL이므로 동적 링크 조건을 유지한다.
+[MIT](LICENSE). 제3자 구성요소(PySide6 LGPLv3 등)는
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) — 동적 링크 조건을
+유지하기 위해 배포는 PyInstaller **onedir**로만 한다
+(`packaging/gitclient.spec`).

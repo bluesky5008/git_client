@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from gitclient.domain.errors import EngineError, GitClientError
-from gitclient.domain.models import ConflictSide, WorkAreaStatus
+from gitclient.domain.models import ConflictSide, RepoOperation, WorkAreaStatus
 from gitclient.infrastructure.local_engine import LocalGitEngine
 from tests.integration.remote_harness import AUTHOR_ENV, git
 
@@ -133,7 +133,7 @@ class TestAbortRefusesOtherOperations:
         engine = LocalGitEngine.open(str(repo))
 
         assert engine.merge_conflicts() == ()
-        assert engine.is_merging() is False
+        assert engine.current_operation() is not RepoOperation.MERGE
 
 
 class TestUserIsNeverStuck:
@@ -151,13 +151,13 @@ class TestUserIsNeverStuck:
         engine.stage_file("shared.txt")
 
         assert engine.merge_conflicts() == (), "전제가 깨졌다"
-        assert engine.is_merging() is True, "병합이 끝나지 않았는데 아니라고 한다"
+        assert engine.current_operation() is RepoOperation.MERGE, "병합이 끝나지 않았는데 아니라고 한다"
 
         engine.abort_merge()
         assert not (repo / ".git" / "MERGE_HEAD").exists()
 
     def test_clean_repository_is_not_merging(self, repo: Path) -> None:
-        assert LocalGitEngine.open(str(repo)).is_merging() is False
+        assert LocalGitEngine.open(str(repo)).current_operation() is not RepoOperation.MERGE
 
 
 class TestGuidanceLeadsSomewhere:
