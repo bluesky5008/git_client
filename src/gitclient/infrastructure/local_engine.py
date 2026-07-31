@@ -1178,6 +1178,55 @@ class LocalGitEngine:
                 )
             return tuple(entries)
 
+    # -- 원격 관리 (F1, Phase 3 증분 5) --------------------------------
+    #
+    # 네트워크는 CLI, 로컬 쓰기는 pygit2라는 ADR-2의 경계에서 원격
+    # 관리는 **로컬 쓰기다** — 설정과 원격 추적 참조를 만질 뿐 회선에
+    # 나가지 않는다. 그래서 RemoteEngine이 아니라 여기 산다.
+
+    def list_remotes_with_urls(self) -> tuple[tuple[str, str], ...]:
+        with _translate("원격 목록 조회"):
+            return tuple(
+                (remote.name, remote.url) for remote in self._repo.remotes
+            )
+
+    def add_remote(self, name: str, url: str) -> None:
+        name, url = name.strip(), url.strip()
+        with _translate("원격 추가"):
+            if not name or not url:
+                raise EngineError(
+                    "원격 이름과 주소를 모두 입력해 주세요.",
+                )
+            if any(r.name == name for r in self._repo.remotes):
+                raise EngineError(
+                    f"원격이 이미 있습니다: {name}",
+                    action="다른 이름을 쓰거나 기존 원격의 주소를 바꿔 주세요.",
+                )
+            self._repo.remotes.create(name, url)
+
+    def remove_remote(self, name: str) -> None:
+        """원격을 지운다. **원격 추적 참조도 함께 사라진다** — 호출 전에
+        §5.2의 확인 절차를 거칠 것. 원격 저장소 자체는 건드리지 않는다."""
+        with _translate("원격 삭제"):
+            if not any(r.name == name for r in self._repo.remotes):
+                raise EngineError(
+                    f"원격이 없습니다: {name}",
+                    action="목록을 새로 고친 뒤 다시 시도해 주세요.",
+                )
+            self._repo.remotes.delete(name)
+
+    def set_remote_url(self, name: str, url: str) -> None:
+        url = url.strip()
+        with _translate("원격 주소 변경"):
+            if not url:
+                raise EngineError("원격 주소를 입력해 주세요.")
+            if not any(r.name == name for r in self._repo.remotes):
+                raise EngineError(
+                    f"원격이 없습니다: {name}",
+                    action="목록을 새로 고친 뒤 다시 시도해 주세요.",
+                )
+            self._repo.remotes.set_url(name, url)
+
     def idle_repack(self, *, should_abort=None) -> bool:  # noqa: ANN001
         """유휴 시간에 팩을 하나로 정돈한다 (FR-08). 중단·실패는 False.
 

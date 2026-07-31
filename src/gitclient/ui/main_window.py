@@ -696,6 +696,9 @@ class MainWindow(QMainWindow):
 
         self._branch_action = QAction("새 브랜치...", self)
         self._branch_action.triggered.connect(self._prompt_new_branch)
+        self._remotes_action = QAction("원격 관리...", self)
+        self._remotes_action.setToolTip("원격 추가 · 삭제 · 주소 변경")
+        self._remotes_action.triggered.connect(self._on_show_remotes)
         self._reflog_action = QAction("reflog 탐색...", self)
         self._reflog_action.setToolTip(
             "HEAD가 지나온 자리들 — reset·건너뛰기로 잃은 커밋을 되찾습니다"
@@ -714,6 +717,7 @@ class MainWindow(QMainWindow):
         repo_menu.addAction(self._push_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._prefetch_action)
+        repo_menu.addAction(self._remotes_action)
         repo_menu.addSeparator()
         repo_menu.addAction(self._abort_operation_action)
         repo_menu.addSeparator()
@@ -1817,6 +1821,54 @@ class MainWindow(QMainWindow):
             lambda engine: engine.create_branch(name, checkout=True),
             reload_graph=True,
         )
+
+    def _on_show_remotes(self) -> None:
+        """원격 관리 (F1). 다이얼로그는 요청만 내고 쓰기는 여기서 제출한다."""
+        if self._engine is None:
+            return
+        from gitclient.ui.remotes_dialog import RemotesDialog
+
+        try:
+            remotes = self._engine.list_remotes_with_urls()
+        except GitClientError as error:
+            self._report(error)
+            return
+        dialog = RemotesDialog(remotes, self)
+
+        def refresh_dialog(_result=None) -> None:  # noqa: ANN001
+            # 쓰기가 끝난 뒤 목록을 되읽는다 — 다이얼로그가 열려 있는 동안
+            # 낡은 목록을 보여주면 같은 이름을 두 번 지우게 된다.
+            if dialog.isVisible() and self._engine is not None:
+                try:
+                    dialog.set_remotes(self._engine.list_remotes_with_urls())
+                except GitClientError:
+                    dialog.reject()
+
+        dialog.add_requested.connect(
+            lambda name, url: self._submit_write(
+                f"원격 추가: {name}",
+                lambda engine: engine.add_remote(name, url),
+                reload_graph=True,
+                on_success=refresh_dialog,
+            )
+        )
+        dialog.remove_requested.connect(
+            lambda name: self._submit_write(
+                f"원격 삭제: {name}",
+                lambda engine: engine.remove_remote(name),
+                reload_graph=True,
+                on_success=refresh_dialog,
+            )
+        )
+        dialog.url_change_requested.connect(
+            lambda name, url: self._submit_write(
+                f"원격 주소 변경: {name}",
+                lambda engine: engine.set_remote_url(name, url),
+                reload_graph=True,
+                on_success=refresh_dialog,
+            )
+        )
+        dialog.exec()
 
     def _on_show_reflog(self) -> None:
         """HEAD reflog를 보여준다 — 파괴적 안내문들의 약속을 지키는 화면.
