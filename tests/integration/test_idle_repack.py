@@ -28,34 +28,31 @@ def pack_files(repo: Path) -> list[Path]:
 def multipack(tmp_path: Path) -> Path:
     """팩이 여러 개 쌓인 저장소 — unpackLimit=1 환경의 일상.
 
-    `git repack -q` 반복은 Windows git에서 팩을 쌓지 않았다(첫 CI 실측 —
-    한 개로 계속 합쳐졌다). 커밋 범위마다 `pack-objects`로 팩을 **직접**
-    만들면 플랫폼·버전과 무관하게 결정적이다.
+    팩을 손으로 만드는 두 시도(`repack -q` 반복, `pack-objects` 직접 호출)는
+    git 버전마다 다르게 끝났다 (1~3차 CI 실측: Windows는 한 개로 합쳐지고,
+    2.54+는 세 번 중 두 개만 남았다). **제품이 실제로 팩을 쌓는 메커니즘
+    그대로 만든다**: `transfer.unpackLimit=1` fetch는 받은 팩을 풀지 않고
+    보관한다 — BASE_CONFIG(ADR-16)가 보증하는, 버전과 무관하게 우리가
+    이미 기대고 있는 동작이다.
     """
-    import subprocess
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "--quiet", "-b", "main", str(origin))
+    (origin / "f.txt").write_text("base\n", encoding="utf-8")
+    git("add", "-A", cwd=origin)
+    git(*AUTHOR_ENV, "commit", "--quiet", "-m", "base", cwd=origin)
 
     root = tmp_path / "work"
-    root.mkdir()
-    git("init", "--quiet", "-b", "main", str(root))
-    previous: str | None = None
+    git("clone", "--quiet", "--no-local", str(origin), str(root))
     for index in range(3):
-        (root / "f.txt").write_text(("x" * 64 + "\n") * 200 + f"{index}\n")
-        git("add", "-A", cwd=root)
-        git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=root)
-        head = git("rev-parse", "HEAD", cwd=root).stdout.strip()
-        rev_range = head if previous is None else f"{previous}..{head}"
-        # `--revs`에 범위를 먹이는 방식은 CI의 git에서 빈 팩으로 끝났다
-        # (2차 CI 실측 — 버전에 따라 stdin rev 파싱이 다르다). 객체 목록을
-        # rev-list로 **명시적으로** 뽑아 먹이면 해석의 여지가 없다.
-        objects = git("rev-list", "--objects", rev_range, cwd=root).stdout
-        result = subprocess.run(
-            ["git", "pack-objects", "-q",
-             str(root / ".git" / "objects" / "pack" / "pack")],
-            input=objects, text=True, capture_output=True, cwd=root,
+        (origin / "f.txt").write_text(
+            ("x" * 64 + "\n") * 200 + f"{index}\n", encoding="utf-8"
         )
-        assert result.returncode == 0, result.stderr
-        previous = head
-    git("prune-packed", cwd=root)
+        git("add", "-A", cwd=origin)
+        git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=origin)
+        git("-c", "transfer.unpackLimit=1", "fetch", "--quiet", cwd=root)
+    git("merge", "--ff-only", "--quiet", "origin/main", cwd=root)
+
     packs = pack_files(root)
     version = git("--version", cwd=root).stdout.strip()
     assert len(packs) >= 3, (
