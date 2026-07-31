@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -71,6 +72,8 @@ from gitclient.domain.models import (
     MergeKind,
     MergeOutcome,
     MergePreview,
+    RebaseAction,
+    RebaseStep,
     Ref,
     ReflogEntry,
     OperationState,
@@ -2123,6 +2126,87 @@ class LocalGitEngine:
             expected=RepoOperation.REBASE,
         )
 
+    def rebase_todo(self, upstream_ref: str) -> tuple[RebaseStep, ...]:
+        """`upstream_ref` 위로 옮길 커밋들 — **오래된 것부터** (FR-16).
+
+        git의 todo 순서와 같다: 위에서 아래로 적용된다. 화면이 그 순서를
+        그대로 보여줘야 사용자가 짠 계획과 git이 실행할 계획이 일치한다.
+        """
+        with _translate("리베이스 계획 조회"):
+            head = self._repo.head.target
+            upstream = self._repo.revparse_single(upstream_ref).peel(
+                pygit2.Commit
+            )
+            walker = self._repo.walk(head, pygit2.enums.SortMode.TOPOLOGICAL)
+            walker.hide(upstream.id)
+            steps = [
+                RebaseStep(
+                    sha=str(commit.id),
+                    action=RebaseAction.PICK,
+                    summary=commit.message.splitlines()[0]
+                    if commit.message
+                    else "",
+                )
+                for commit in walker
+            ]
+            steps.reverse()  # git todo와 같은 순서(오래된 것부터)
+            return tuple(steps)
+
+    def rebase_interactive(
+        self,
+        upstream_ref: str,
+        steps: list[RebaseStep],
+        *,
+        expected_branch: str | None = None,
+    ) -> HistoryOutcome:
+        """사용자가 짠 계획대로 리베이스한다 (ADR-86).
+
+        **계획은 `GIT_SEQUENCE_EDITOR`로 주입한다** — git이 todo 파일을
+        열려고 부르는 자리에 "우리 파일을 그 자리에 복사하라"를 넣는다.
+        todo를 손으로 `.git/rebase-merge/`에 쓰는 방법도 있지만, 그건 git
+        내부 구조를 우리가 흉내 내는 것이라 버전마다 깨진다(픽스처에서
+        이미 배운 교훈). 편집기 자리는 git이 공개적으로 약속한 접점이다.
+
+        커밋 메시지 편집기(`GIT_EDITOR`)는 계속 막아둔다 — squash의 합쳐진
+        메시지는 git이 양쪽을 이어 붙여 자동으로 만든다(실측). GUI에서
+        메시지를 다시 쓰고 싶으면 그건 amend의 일이다.
+        """
+        self._require_quiet_repository()
+        self._require_expected_branch(self._head_branch(), expected_branch)
+        kept = [step for step in steps if step.action is not RebaseAction.DROP]
+        if not kept:
+            raise EngineError(
+                "모든 커밋을 버리는 계획입니다.",
+                action="적어도 하나는 남겨 주세요. 브랜치를 통째로 되돌리려면 "
+                "'되돌리기(reset)'를 쓰는 편이 분명합니다.",
+            )
+        if kept[0].action in (RebaseAction.SQUASH, RebaseAction.FIXUP):
+            # git이 "cannot squash without a previous commit"으로 거부하는
+            # 계획이다. 우리가 먼저 막으면 사용자는 무엇이 잘못됐는지
+            # 화면에서 바로 안다.
+            raise EngineError(
+                "첫 커밋은 앞 커밋에 합칠 수 없습니다.",
+                action="맨 위 커밋은 '그대로 두기'여야 합니다.",
+            )
+
+        todo = "".join(
+            f"{step.action.value} {step.sha}\n"
+            for step in steps
+            if step.action is not RebaseAction.DROP
+        )
+        with tempfile.TemporaryDirectory(prefix="gitclient-todo-") as tmp:
+            todo_path = Path(tmp) / "todo"
+            todo_path.write_text(todo, encoding="utf-8")
+            # 경로에 공백이 있어도 셸이 한 인자로 읽도록 따옴표로 싼다.
+            # git은 이 문자열 뒤에 todo 파일 경로를 붙여 셸로 실행한다.
+            posix = str(todo_path).replace("\\", "/")
+            return self._sequencer(
+                ["rebase", "-i", "--empty=stop", "--", upstream_ref],
+                context="리베이스",
+                expected=RepoOperation.REBASE,
+                extra_env={"GIT_SEQUENCE_EDITOR": f'cp "{posix}"'},
+            )
+
     def cherry_pick(
         self, sha: str, *, expected_branch: str | None = None
     ) -> HistoryOutcome:
@@ -2341,6 +2425,7 @@ class LocalGitEngine:
         *,
         context: str,
         expected: RepoOperation,
+        extra_env: dict[str, str] | None = None,
     ) -> HistoryOutcome:
         """시퀀서 명령 하나를 돌리고 **저장소 상태로** 결과를 판정한다.
 
@@ -2349,7 +2434,9 @@ class LocalGitEngine:
         후자는 오류다. 둘을 가르는 것은 `state()`다: 멈췄다면 연산이
         진행 중으로 남고, 거부됐다면 NONE 그대로다.
         """
-        result = self._run_git(args, context=context, check=False)
+        result = self._run_git(
+            args, context=context, check=False, extra_env=extra_env
+        )
         state = self.current_operation()
 
         if state.is_active:
@@ -2405,7 +2492,12 @@ class LocalGitEngine:
         return ""
 
     def _run_git(
-        self, args: list[str], *, context: str, check: bool = True
+        self,
+        args: list[str],
+        *,
+        context: str,
+        check: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """저장소 안에서 git 명령 하나를 돌린다. 워커 스레드 전용.
 
@@ -2442,6 +2534,12 @@ class LocalGitEngine:
         # (이 줄은 변이 검증으로 지킬 수 없다 — 개발 환경의 git에 번역 카탈로그가
         # 없어 지워도 테스트가 붉어지지 않는다. 근거는 실측이 아니라 원격
         # 경로에서 같은 이유로 이미 확인된 것이다.)
+        if extra_env:
+            # 인터랙티브 rebase만 이 문을 쓴다 — 사용자가 화면에서 짠 계획을
+            # GIT_SEQUENCE_EDITOR로 주입한다 (ADR-86). 위의 편집기 차단을
+            # **덮어쓰는 유일한 경로**이며, 값은 우리가 만든 파일 복사
+            # 명령뿐이다.
+            env.update(extra_env)
         command = [self._git, "-C", workdir, *args]
         started_at = time.perf_counter()
         try:

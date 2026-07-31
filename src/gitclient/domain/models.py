@@ -23,6 +23,35 @@ class Signature:
         return f"{self.name} <{self.email}>"
 
 
+class RebaseAction(Enum):
+    """인터랙티브 리베이스에서 커밋 하나에 내리는 지시 (FR-16).
+
+    git의 todo 동사 중 **되돌릴 수 없거나 화면이 없는 것은 빼고** 넷만
+    쓴다: `edit`은 중간에 멈춰 셸을 요구하고, `exec`은 임의 명령 실행이라
+    GUI가 감당할 계약이 아니다. 남긴 넷은 전부 결과가 커밋 목록에 바로
+    드러난다.
+    """
+
+    PICK = "pick"
+    """그대로 옮긴다."""
+    SQUASH = "squash"
+    """앞 커밋에 합친다. 메시지는 둘을 이어 붙인다."""
+    FIXUP = "fixup"
+    """앞 커밋에 합치되 이 커밋의 메시지는 버린다."""
+    DROP = "drop"
+    """버린다. **커밋이 결과에서 사라진다** — reflog로만 되찾을 수 있다."""
+
+
+@dataclass(frozen=True, slots=True)
+class RebaseStep:
+    """계획의 한 줄. `sha`는 짧은 형태여도 된다 (git이 해석한다)."""
+
+    sha: str
+    action: RebaseAction
+    summary: str = ""
+    """화면 표시용 요약 — git에 넘기지 않는다."""
+
+
 @dataclass(frozen=True, slots=True)
 class ReflogEntry:
     """HEAD가 지나온 자리 하나 (FR-09).

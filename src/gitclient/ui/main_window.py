@@ -3047,6 +3047,10 @@ class MainWindow(QMainWindow):
             f"'{shorthand}' 위로 현재 브랜치 리베이스...",
             lambda: self._start_rebase(shorthand, is_local),
         ))
+        entries.append((
+            f"'{shorthand}' 위로 계획 짜서 리베이스...",
+            lambda: self._start_interactive_rebase(shorthand, is_local),
+        ))
         if is_local:
             entries.append((
                 f"'{shorthand}' 삭제...",
@@ -3212,6 +3216,45 @@ class MainWindow(QMainWindow):
             rebase_job(f"{prefix}{upstream}", branch),
             reload_graph=True,
         )
+
+    def _start_interactive_rebase(self, upstream: str, is_local: bool = True) -> None:
+        """계획을 짜서 리베이스한다 (FR-16) — 재배열·합치기·버리기.
+
+        일반 리베이스와 달리 확인 다이얼로그를 따로 띄우지 않는다:
+        계획 화면 자체가 무엇이 벌어지는지 줄 단위로 보여주고, 시작
+        버튼이 그 확인이다 (§5.2 원칙 2 — 확인은 정보와 함께여야 한다).
+        """
+        branch = self._current_branch()
+        if self._write_queue is None or branch is None or self._engine is None:
+            return
+        prefix = "refs/heads/" if is_local else "refs/remotes/"
+        upstream_ref = f"{prefix}{upstream}"
+        try:
+            steps = self._engine.rebase_todo(upstream_ref)
+        except GitClientError as error:
+            self._report(error)
+            return
+        if not steps:
+            self._notify(
+                "옮길 커밋이 없습니다",
+                f"'{branch}'에 '{upstream}'보다 새로운 커밋이 없습니다.",
+                action="이미 그 위에 있거나 뒤처져 있습니다 — 가져오기(Pull)를 "
+                "생각해 보세요.",
+            )
+            return
+        from gitclient.ui.rebase_todo_dialog import RebaseTodoDialog
+
+        dialog = RebaseTodoDialog(upstream, steps, self)
+        dialog.plan_ready.connect(
+            lambda plan: self._submit_write(
+                f"리베이스(계획): {upstream}",
+                lambda engine: engine.rebase_interactive(
+                    upstream_ref, plan, expected_branch=branch
+                ),
+                reload_graph=True,
+            )
+        )
+        dialog.exec()
 
     def _on_cherry_pick(self, sha: str) -> None:
         if self._write_queue is None:
