@@ -659,10 +659,18 @@ def test_broken_upstream_config_does_not_kill_the_app(window, repo: Path) -> Non
 
     window._engine.upstream_of_head = boom
 
-    assert window._ahead_behind() is None
+    # 벌어진 정도 계산은 워커로 옮겨갔지만(backlog §3.4) upstream 조회는
+    # 여전히 UI 경로 여럿이 부른다 — 던지면 Qt 슬롯까지 올라가 앱이 죽는다.
+    assert window._upstream() is None
     window._describe_divergence()   # 던지면 여기서 실패한다
     window._update_remote_actions()
     window._refresh_status()
+
+    # 워커 쪽도 같은 실패에서 조용히 None을 낸다 — 상태바에 표시할 것이
+    # 없을 뿐, 참조 목록 로딩 전체가 무너지면 안 된다.
+    from gitclient.application.refs_loader import RefsLoader
+
+    assert RefsLoader._divergence(window._engine) is None
 
 
 def test_commit_is_locked_during_a_sequencer(window, repo: Path) -> None:

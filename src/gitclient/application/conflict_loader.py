@@ -25,8 +25,14 @@ from gitclient.domain.errors import GitClientError
 
 
 class ConflictLoaderSignals(QObject):
-    ready = Signal(int, str, object)
-    """(token, 경로, ConflictDetail)."""
+    ready = Signal(int, str, object, object)
+    """(token, 경로, ConflictDetail, 워킹 파일 지문).
+
+    지문은 `(편집됐는가, size, mtime_ns)`다 — 편집 여부 판정을 **여기서
+    끝내고** UI는 클릭 시점에 `stat()` 하나로 그 판정이 아직 유효한지만
+    본다 (backlog §3.3). 판정 자체는 파일 전체를 읽어야 하는데, 그것을
+    클릭 경로에 두면 파일 크기가 UI 스레드 비용이 된다.
+    """
 
     failed = Signal(int, str, object)
     """(token, 경로, GitClientError) — 그 사이 해결됐거나 저장소가 바뀌었다."""
@@ -56,15 +62,38 @@ class ConflictLoader(QRunnable):
     def cancel(self) -> None:
         self._cancelled = True
 
+    def _working_fingerprint(self, detail) -> tuple | None:  # noqa: ANN001
+        """(편집됐는가, size, mtime_ns). 파일이 없으면 None.
+
+        **마커 유무만으로는 판단할 수 없다** — 바이너리 충돌에는 애초에
+        마커가 없으므로, 그것만 보면 이 기능이 존재하는 이유인 경우마다
+        확인창이 뜬다. 마커가 남아 있으면 손대지 않은 것이고, 없더라도
+        내용이 양쪽 원본 중 하나와 같으면 git이 써둔 그대로다.
+        """
+        target = Path(self._repo_path) / self._path
+        try:
+            stat = target.stat()
+            data = target.read_bytes()
+        except OSError:
+            return None
+        if b"<<<<<<<" in data and b">>>>>>>" in data:
+            edited = False
+        else:
+            edited = data not in (detail.ours.data, detail.theirs.data)
+        return (edited, stat.st_size, stat.st_mtime_ns)
+
     def run(self) -> None:
         try:
             from gitclient.infrastructure.local_engine import LocalGitEngine
 
             engine = LocalGitEngine.open(self._repo_path)
             detail = engine.conflict_detail(self._path)
+            fingerprint = self._working_fingerprint(detail)
             if self._cancelled:
                 return
-            self.signals.ready.emit(self._token, self._path, detail)
+            self.signals.ready.emit(
+                self._token, self._path, detail, fingerprint
+            )
         except GitClientError as error:
             if self._cancelled:
                 return

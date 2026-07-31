@@ -267,6 +267,9 @@ class MainWindow(QMainWindow):
         # 승격(ADR-83)으로 prefetch 완료를 기다리는 사용자 작업.
         # (워커, 상태바 문구, 재시도 함수) — prefetch가 은퇴하면 시작된다.
         self._pending_remote: tuple | None = None
+        # 원격과 벌어진 정도 — RefsLoader가 계산해 온 값을 담아둔다
+        # (backlog §3.4). 저장소를 열기 전에는 보여줄 것이 없다.
+        self._divergence: tuple[int, int] | None = None
         # 파일시스템 감시 (F2, ADR-85). 워킹 트리 전체가 아니라 `.git`의
         # 핵심 신호만 본다 — 앱 밖 CLI 조작(커밋·전환·fetch)은 전부 거길
         # 지나간다. 워킹 트리 편집의 반영은 창 활성화가 담당한다.
@@ -317,6 +320,9 @@ class MainWindow(QMainWindow):
         self._conflict_generation = 0
         self._conflict_loaders: dict[int, ConflictLoader] = {}
         self._loaded_conflict_detail = None
+        # 워커가 계산해 온 (편집됐는가, size, mtime_ns) — 클릭 시점에는
+        # stat() 하나로 이 판정이 아직 유효한지만 본다 (backlog §3.3).
+        self._conflict_fingerprint: tuple | None = None
 
         self._commit_model = CommitGraphModel(self)
         self._diff_model = DiffModel(self)
@@ -1035,7 +1041,9 @@ class MainWindow(QMainWindow):
 
         refs_loader = RefsLoader(path)
         refs_loader.signals.ready.connect(
-            lambda refs, l=refs_loader: self._on_refs_ready(l, refs)
+            lambda refs, divergence, l=refs_loader: self._on_refs_ready(
+                l, refs, divergence
+            )
         )
         refs_loader.signals.failed.connect(
             lambda error, l=refs_loader: self._on_refs_failed(l, error)
@@ -1131,11 +1139,15 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._report(error)
 
-    def _on_refs_ready(self, loader: RefsLoader, refs: list) -> None:
+    def _on_refs_ready(self, loader: RefsLoader, refs: list, divergence) -> None:  # noqa: ANN001
         if loader is not self._refs_loader:
             return  # 이전 저장소의 늦은 결과
+        # 벌어진 정도는 워커가 계산해 온 값을 쓴다 (backlog §3.4) — UI
+        # 스레드에서 세면 갈라진 만큼 선형이라 모노레포에서 G4를 넘는다.
+        self._divergence = divergence
         self._populate_refs(refs)
         self._commit_model.set_refs(refs)
+        self._update_status(self._info)
 
     def _on_refs_failed(self, loader: RefsLoader, error: GitClientError) -> None:
         if loader is not self._refs_loader:
@@ -1250,7 +1262,7 @@ class MainWindow(QMainWindow):
         이 값이 없으면 사용자는 pull과 push 중 무엇이 필요한지 눌러보기
         전까지 알 수 없다. 트래픽이 비싼 환경에서 "눌러서 확인"은 비용이다.
         """
-        counts = self._ahead_behind()
+        counts = self._divergence
         if counts is None:
             return None
         ahead, behind = counts
@@ -2604,6 +2616,7 @@ class MainWindow(QMainWindow):
         if self._engine is None or self._repo_path is None:
             return
         self._loaded_conflict_detail = None
+        self._conflict_fingerprint = None
         for stale in self._conflict_loaders.values():
             stale.cancel()
         self._conflict_loaders.clear()
@@ -2616,11 +2629,14 @@ class MainWindow(QMainWindow):
         self._conflict_loaders[token] = loader
         self._pool.start(loader)
 
-    def _on_conflict_detail_ready(self, token: int, path: str, detail) -> None:  # noqa: ANN001
+    def _on_conflict_detail_ready(  # noqa: ANN001
+        self, token: int, path: str, detail, fingerprint
+    ) -> None:
         self._conflict_loaders.pop(token, None)
         if token != self._conflict_generation:
             return  # 늦게 도착한 이전 세대의 결과
         self._loaded_conflict_detail = detail
+        self._conflict_fingerprint = fingerprint
         self._conflict_panel.show_detail(detail)
 
     def _on_conflict_detail_failed(self, token: int, path: str, _error) -> None:  # noqa: ANN001
@@ -2713,35 +2729,31 @@ class MainWindow(QMainWindow):
     def _working_copy_edited(self, path: str) -> bool:
         """워킹 트리 파일이 충돌 직후 상태에서 벗어났는가.
 
-        **마커 유무만으로는 판단할 수 없다.** 바이너리 충돌에는 애초에
-        마커가 들어가지 않으므로, 그것만 보면 이 기능이 존재하는 이유인
-        경우마다 확인창이 뜬다.
+        **판정은 워커가 이미 끝냈다** (backlog §3.3 해소). 여기서는
+        `stat()` 하나로 그 판정이 아직 유효한지만 본다 — 파일 크기와
+        무관한 상수 비용이다. 예전에는 클릭할 때마다 워킹 파일을 통째로
+        읽었고(그 전에는 blob까지 합쳐 크기의 3배), 그 비용이 UI 스레드에
+        그대로 실렸다.
 
-        그래서 두 가지를 함께 본다: 마커가 남아 있으면 손대지 않은 것이고,
-        마커가 없더라도 내용이 양쪽 원본 중 하나와 같으면 git이 써둔 그대로다.
-        둘 다 아닐 때만 사용자가 손을 댄 것으로 본다.
-
-        양쪽 원본은 워커가 이미 읽어둔 것을 재사용한다 (ADR-77) — 해결
-        버튼은 상세가 도착해야 켜지므로 그 시점에는 항상 있다. blob을
-        여기서 다시 읽으면 클릭 한 번이 파일 크기의 3배를 UI 스레드에서
-        쓴다 (backlog §3.3). 워킹 파일 1회 읽기는 남는다 — 편집은 상세
-        도착 이후에도 일어날 수 있어 클릭 시점의 내용이어야 한다.
+        **어긋나면 편집된 것으로 본다.** 상세를 읽은 뒤 파일이 바뀌었다는
+        뜻이고, 그때 조용히 덮어쓰는 것보다 한 번 묻는 편이 안전하다 —
+        이 확인창이 존재하는 이유가 정확히 그것이다.
         """
-        if self._repo_path is None or self._engine is None:
+        if self._repo_path is None or self._conflict_fingerprint is None:
             return False
+        if (
+            self._loaded_conflict_detail is None
+            or self._loaded_conflict_detail.path != path
+        ):
+            return False
+        edited, size, mtime_ns = self._conflict_fingerprint
         try:
-            target = Path(self._repo_path) / path
-            if not target.exists():
-                return False
-            data = target.read_bytes()
+            stat = (Path(self._repo_path) / path).stat()
         except OSError:
-            return False
-        if b"<<<<<<<" in data and b">>>>>>>" in data:
-            return False  # 아직 마커가 그대로다
-        detail = self._loaded_conflict_detail
-        if detail is None or detail.path != path:
-            return False  # 상세가 없으면 비교할 원본도 없다 — 확인창을 띄울 근거 부족
-        return data not in (detail.ours.data, detail.theirs.data)
+            return False  # 파일이 사라졌다 — 덮어쓸 편집도 없다
+        if (stat.st_size, stat.st_mtime_ns) != (size, mtime_ns):
+            return True  # 읽은 뒤 바뀌었다
+        return edited
 
     def _sync_operation_state(self) -> None:
         """저장소에 진행 중인 연산이 있는지 확인해 UI 전체에 반영한다.
@@ -2981,22 +2993,10 @@ class MainWindow(QMainWindow):
         )
         self._graph_reload_pending = True
 
-    def _ahead_behind(self) -> tuple[int, int] | None:
-        """(앞선 커밋 수, 뒤처진 커밋 수). upstream이 없으면 None.
-
-        UI 스레드에서 부른다 — 다만 비용은 상수가 아니라 **갈라진 만큼
-        선형**이다 (감사 실측: 100+100 중앙값 0.41ms, 1만+1만 최악
-        84.8ms — G4 초과). 한때 "실측 0.002ms"라고 적혀 있었는데 그것은
-        한쪽 1커밋짜리 픽스처의 값이었다(ADR-11 부류의 흠). 극단 모노레포
-        대응(워커 이동)은 backlog §3.4에 남아 있다.
-        """
-        resolved, branch = self._upstream(), self._current_branch()
-        if resolved is None or branch is None or self._engine is None:
-            return None
-        try:
-            return self._engine.ahead_behind(branch, resolved[1])
-        except GitClientError:
-            return None
+    # `_ahead_behind()`가 여기 있었다. UI 스레드에서 세던 값을 RefsLoader가
+    # 계산해 오도록 옮겼다 (backlog §3.4) — pygit2 질의라 CLI보다 훨씬
+    # 싸지만 갈라진 만큼 선형이라 1만+1만에서 최악 84.8ms였다. 참조를 읽는
+    # 워커는 이미 저장소를 열어 두었으므로 거기가 가장 싼 자리다.
 
     def _describe_transfer(self, stats) -> str:  # noqa: ANN001
         """계측 결과를 사람이 읽을 문장으로.

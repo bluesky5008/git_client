@@ -55,16 +55,16 @@ class TestEngineBoundary:
         engine = LocalGitEngine.open(str(remote.work))
         assert engine.ahead_behind("main", "refs/remotes/origin/nope") is None
 
-    def test_ui_does_not_shell_out_for_divergence(
+    def test_ui_does_not_compute_divergence_itself(
         self, qtbot, remote: RemoteFixture, monkeypatch
     ) -> None:  # noqa: ANN001
-        """UI의 ahead/behind 경로가 프로세스를 띄우면 안 된다.
+        """벌어진 정도를 **UI 스레드가 세면 안 된다** (backlog §3.4).
 
-        예전 판은 소스 문자열에 "RemoteEngine"이 없는지만 봤다 —
-        `subprocess.run(["git","rev-list",...])`을 인라인으로 넣으면
-        통과하는, 정확히 금지하려던 그것을 놓치는 검사였다 (감사 확정,
-        backlog 구 §3.9). 지금은 **실행 중 subprocess 자체를 봉인**하고
-        값이 그래도 나오는지를 본다 — 어떤 우회로든 여기서 걸린다.
+        이 검사는 두 번 강해졌다. 처음엔 소스 문자열에 "RemoteEngine"이
+        없는지만 봐서 `subprocess.run(["git","rev-list",...])` 인라인을
+        놓쳤고, 그다음엔 subprocess를 봉인해 프로세스 기동을 막았다.
+        이제는 계산 자체가 워커로 갔으므로 **엔진 질의까지 봉인**한다 —
+        그래도 값이 나온다면 워커가 계산해 온 것을 쓰고 있다는 뜻이다.
         """
         import subprocess as subprocess_module
 
@@ -74,15 +74,20 @@ class TestEngineBoundary:
         qtbot.addWidget(window)
         window._report = lambda _e: None
         window.open_repository(str(remote.work))
-        qtbot.waitUntil(lambda: not window._loading, timeout=30_000)
+        qtbot.waitUntil(
+            lambda: not window._loading and window._divergence is not None,
+            timeout=30_000,
+        )
 
         def forbidden(*_args, **_kwargs):  # noqa: ANN002, ANN003
-            raise AssertionError("ahead/behind가 프로세스를 띄웠다")
+            raise AssertionError("UI 스레드가 벌어진 정도를 직접 셌다")
 
         monkeypatch.setattr(subprocess_module, "run", forbidden)
         monkeypatch.setattr(subprocess_module, "Popen", forbidden)
+        monkeypatch.setattr(LocalGitEngine, "ahead_behind", forbidden)
 
-        assert window._ahead_behind() == (0, 0)
+        assert window._divergence == (0, 0)
+        assert window._describe_divergence() == "원격과 동기화됨"
 
 
 class TestCredentialDelegationForClone:

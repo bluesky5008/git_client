@@ -238,4 +238,4 @@ class TestLateWorkerResultsAfterClose:
         window.close()
 
         # 닫힌 뒤 늦게 도착한 결과 — 예외 없이 무시돼야 한다.
-        refs_loader.signals.ready.emit([])
+        refs_loader.signals.ready.emit([], None)

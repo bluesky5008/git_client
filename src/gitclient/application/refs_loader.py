@@ -19,8 +19,14 @@ from gitclient.domain.errors import GitClientError
 
 
 class RefsLoaderSignals(QObject):
-    ready = Signal(list)
-    """list[Ref] — 로컬/원격 브랜치와 태그 전체."""
+    ready = Signal(list, object)
+    """(list[Ref], (앞선 수, 뒤처진 수) | None).
+
+    벌어진 정도를 **여기서 함께 계산해 보낸다** (backlog §3.4). pygit2
+    질의라 CLI보다 훨씬 싸지만 공짜는 아니다 — 갈라진 만큼 선형이라
+    1만+1만에서 최악 84.8ms로 G4(50ms)를 넘는다(감사 실측). 참조를
+    읽는 이 워커가 이미 저장소를 열어 두었으므로 여기가 가장 싼 자리다.
+    """
 
     failed = Signal(object)
     """GitClientError."""
@@ -39,16 +45,37 @@ class RefsLoader(QRunnable):
     def cancel(self) -> None:
         self._cancelled = True
 
+    @staticmethod
+    def _divergence(engine) -> tuple[int, int] | None:  # noqa: ANN001
+        """현재 브랜치가 upstream과 얼마나 벌어졌는가. 없으면 None.
+
+        upstream이 없거나 아직 fetch하지 않은 것은 오류가 아니다 —
+        화면 입장에서 "표시할 것이 없음"과 같으므로 None으로 접는다.
+        """
+        from gitclient.domain.errors import GitClientError as _Error
+
+        try:
+            resolved = engine.upstream_of_head()
+            if resolved is None:
+                return None
+            branch = engine.info(include_refs=False).head_shorthand
+            if branch is None:
+                return None
+            return engine.ahead_behind(branch, resolved[1])
+        except _Error:
+            return None
+
     def run(self) -> None:
         try:
             from gitclient.infrastructure.local_engine import LocalGitEngine
 
             engine = LocalGitEngine.open(self._repo_path)
             refs = engine.refs()
+            divergence = self._divergence(engine)
 
             if self._cancelled:
                 return
-            self.signals.ready.emit(refs)
+            self.signals.ready.emit(refs, divergence)
 
         except GitClientError as exc:
             if not self._cancelled:
