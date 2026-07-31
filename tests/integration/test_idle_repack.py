@@ -44,15 +44,24 @@ def multipack(tmp_path: Path) -> Path:
         git(*AUTHOR_ENV, "commit", "--quiet", "-m", f"c{index}", cwd=root)
         head = git("rev-parse", "HEAD", cwd=root).stdout.strip()
         rev_range = head if previous is None else f"{previous}..{head}"
+        # `--revs`에 범위를 먹이는 방식은 CI의 git에서 빈 팩으로 끝났다
+        # (2차 CI 실측 — 버전에 따라 stdin rev 파싱이 다르다). 객체 목록을
+        # rev-list로 **명시적으로** 뽑아 먹이면 해석의 여지가 없다.
+        objects = git("rev-list", "--objects", rev_range, cwd=root).stdout
         result = subprocess.run(
-            ["git", "pack-objects", "--revs", "-q",
+            ["git", "pack-objects", "-q",
              str(root / ".git" / "objects" / "pack" / "pack")],
-            input=rev_range, text=True, capture_output=True, cwd=root,
+            input=objects, text=True, capture_output=True, cwd=root,
         )
         assert result.returncode == 0, result.stderr
         previous = head
     git("prune-packed", cwd=root)
-    assert len(pack_files(root)) >= 3, "전제가 깨졌다 — 팩이 쌓여 있어야 한다"
+    packs = pack_files(root)
+    version = git("--version", cwd=root).stdout.strip()
+    assert len(packs) >= 3, (
+        f"전제가 깨졌다 — 팩이 쌓여 있어야 한다: "
+        f"{[p.name for p in packs]} ({version})"
+    )
     return root
 
 
