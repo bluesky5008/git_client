@@ -76,7 +76,7 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup --no-progress -y
-          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" packaging\gitclient.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\gitclient.iss
       - uses: actions/upload-artifact@v4
         with:
           name: gitclient-${{ runner.os }}

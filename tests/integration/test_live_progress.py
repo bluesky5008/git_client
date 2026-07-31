@@ -108,7 +108,12 @@ class TestEngineReportsWhileRunning:
             ):
                 sys.stderr.write(line + "\\r")
                 sys.stderr.flush()
-                time.sleep(0.3)
+                # 진행률은 0.2초 폴링으로 tail의 마지막 줄만 보는 표본
+                # 설계다 — 줄 간격이 폴 간격에 가까우면 바쁜 CI 러너에서
+                # 폴 하나가 밀리는 순간 중간 단계가 표본에서 빠진다
+                # (macOS CI 실측: RECEIVING이 사라짐). 줄마다 폴 기회를
+                # 다섯 번 주어 스케줄링 지터를 흡수한다.
+                time.sleep(1.0)
             """
         )
         seen: list[ProgressSnapshot] = []
