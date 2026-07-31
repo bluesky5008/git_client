@@ -93,18 +93,53 @@ logger = logging.getLogger(__name__)
 _NO_LINE = -1
 
 
+# 저장소에 없는 오브젝트를 만났을 때 pygit2/libgit2가 내는 흔적.
+# KeyError는 인자가 OID 문자열이고, GitError는 문구에 그것이 실린다.
+_MISSING_OBJECT = re.compile(r"\b([0-9a-f]{7,40})\b")
+
+
+def _missing_oid(exc: Exception) -> str | None:
+    """"없는 오브젝트" 오류라면 그 OID. 아니면 None."""
+    if isinstance(exc, KeyError) and exc.args:
+        candidate = str(exc.args[0])
+        return candidate if _MISSING_OBJECT.fullmatch(candidate) else None
+    text = str(exc).lower()
+    if "not found" not in text and "does not exist" not in text:
+        return None
+    match = _MISSING_OBJECT.search(text)
+    return match.group(1) if match else None
+
+
 @contextmanager
-def _translate(context: str):
+def _translate(context: str, *, partial_hint: bool = False):
     """pygit2 예외를 도메인 예외로 변환하는 경계.
 
     이미 도메인 예외인 것은 그대로 통과시킨다. KeyError를 포함하는 이유는
     pygit2가 존재하지 않는 오브젝트 조회를 KeyError로 던지기 때문이다.
+
+    **없는 오브젝트는 따로 말한다** (ADR-88). 부분 복제(ADR-6의 선택지)는
+    blob을 나중에 받으므로, 오프라인이거나 원격이 사라졌으면 파일을 여는
+    순간 이 오류가 난다. OID를 버리고 "Git 엔진 오류"로 뭉개면 사용자는
+    **무엇이 없는지도, 어떻게 받는지도** 알 수 없다.
     """
     try:
         yield
     except GitClientError:
         raise
     except (pygit2.GitError, pygit2.InvalidSpecError, KeyError, ValueError) as exc:
+        oid = _missing_oid(exc)
+        if oid is not None:
+            raise EngineError(
+                "저장소에 없는 객체를 참조했습니다.",
+                detail=f"{oid} ({type(exc).__name__}: {exc})",
+                action=(
+                    "부분 복제(blob 지연 수신) 저장소입니다. 네트워크에 연결한 "
+                    "뒤 가져오기(Fetch)를 실행하면 필요한 객체를 받아옵니다."
+                    if partial_hint
+                    else "저장소가 손상되었거나 참조가 가리키는 객체가 "
+                    "없습니다. 가져오기(Fetch)로 받아올 수 있는지 확인해 주세요."
+                ),
+            ) from exc
         raise EngineError(
             f"{context} 중 Git 엔진 오류가 발생했습니다.",
             detail=f"{type(exc).__name__}: {exc}",
@@ -345,6 +380,10 @@ class LocalGitEngine:
         # 히스토리 재작성 구획에서만 쓴다 (ADR-67). 이름을 주입받는 이유는
         # 테스트가 가짜 git으로 실패 경로를 만들 수 있게 하기 위해서다.
         self._git = git_binary
+        # 없는 객체를 만났을 때의 안내를 가른다 (ADR-88). 설정 조회라
+        # 열 때 한 번만 한다 — blob을 읽는 경로마다 다시 물으면 그 자체가
+        # 비용이다.
+        self._partial = self._is_partial(repo)
 
     @classmethod
     def open(cls, path: str | Path) -> LocalGitEngine:
@@ -585,7 +624,7 @@ class LocalGitEngine:
 
     def commit_detail(self, sha: str) -> CommitDetail:
         """커밋 하나와 그 커밋이 바꾼 파일 목록."""
-        with _translate("커밋 상세 조회"):
+        with _translate("커밋 상세 조회", partial_hint=self._partial):
             return self._commit_detail(sha)
 
     def _commit_detail(self, sha: str) -> CommitDetail:
@@ -618,7 +657,7 @@ class LocalGitEngine:
 
         `path`를 주면 해당 파일만, 주지 않으면 커밋 전체의 diff를 반환한다.
         """
-        with _translate("diff 계산"):
+        with _translate("diff 계산", partial_hint=self._partial):
             return self._diff_lines(sha, path)
 
     def _diff_lines(self, sha: str, path: str | None) -> list[DiffLine]:
@@ -1639,7 +1678,7 @@ class LocalGitEngine:
         마커가 섞인 결과물이 있거나(텍스트), 우리 것만 있거나(바이너리),
         아무것도 없을(삭제) 수 있어서 원본 두 개를 복원할 수 없다.
         """
-        with _translate("충돌 내용 조회"):
+        with _translate("충돌 내용 조회", partial_hint=self._partial):
             ancestor, ours, theirs = self._conflict_entry(
                 self._fresh_index(), path
             )

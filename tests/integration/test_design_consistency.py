@@ -135,15 +135,15 @@ class TestInstrumentationAttribution:
         assert key is not None
         assert key.endswith(".git")
 
-    def test_record_skips_when_there_is_no_repository(
+    def test_record_falls_back_to_the_url_for_clones(
         self, tmp_path: Path, monkeypatch
     ) -> None:  # noqa: ANN001
-        """귀속시킬 저장소가 없으면 조용히 건너뛴다 — 죽지 않고, 쓰지도 않는다.
+        """저장소가 없어도 **주소가 있다** — 복제는 거기 귀속시킨다 (ADR-88).
 
         예전 판은 만들어 놓고 아무 데도 넘기지 않은 목록에 대고
         `assert recorded == []`를 했다 — 무조건 참이라 아무것도 지키지
-        않았다 (감사 확정, backlog 구 §3.9). 지금은 저장 경로 자체를 세어
-        **StatsStore가 정말 불리지 않는가**를 본다.
+        않았다 (감사 확정). 그 뒤 실검증으로 바꿨고, 이제는 결론이
+        바뀌었다: 버리면 ADR-26이 막으려던 무기록이 된다.
         """
         from gitclient.infrastructure.stats_store import StatsStore
 
@@ -158,7 +158,7 @@ class TestInstrumentationAttribution:
 
         worker._record(object())  # 예외 없이 지나가야 한다
 
-        assert stored == [], "귀속할 저장소가 없는데 계측이 기록됐다"
+        assert [key for key, _stats in stored] == ["url:https://x/y.git"]
 
 
 class TestSubmoduleRecursionIsOffEverywhere:

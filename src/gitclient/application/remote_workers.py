@@ -250,20 +250,20 @@ class RemoteWorker(QRunnable):
         return engine.remote_url(self._remote)
 
     def _record(self, stats: TransferStats) -> None:
-        """계측 저장은 실패해도 본 작업의 성공을 뒤집지 않는다.
-
-        clone은 성공한 뒤에야 저장소가 생기므로, 키를 구하지 못하면 조용히
-        건너뛴다 — 실패한 clone에는 귀속시킬 저장소가 없다.
-        """
+        """계측 저장은 실패해도 본 작업의 성공을 뒤집지 않는다."""
         try:
             from gitclient.infrastructure.stats_store import StatsStore
 
-            key = _repo_key(self._repo_path)
+            key = _repo_key(self._repo_path) or self._fallback_key()
             if key is None:
-                return  # 귀속시킬 저장소가 없다 (실패한 복제 등)
+                return
             StatsStore(StatsStore.default_path()).record(key, stats)
         except Exception:  # noqa: BLE001 - 계측은 부가 기능이다
             pass
+
+    def _fallback_key(self) -> str | None:
+        """저장소가 없을 때의 귀속 대상. 기본은 없다 — 하위 클래스가 정한다."""
+        return None
 
 
 class FetchWorker(RemoteWorker):
@@ -374,6 +374,22 @@ class CloneWorker(RemoteWorker):
         # 실제 프로세스를 끊으려면 **실행 중인 그 엔진**을 붙잡아야 한다.
         self._clone_engine: RemoteEngine | None = None
         self._cleanup_allowed = self._decide_cleanup_policy()
+
+    def _fallback_key(self) -> str | None:
+        """실패한 복제의 계측을 **원격 주소**에 귀속시킨다 (ADR-88).
+
+        ADR-26("실패해도 쓴 트래픽은 기록한다")과 §4.9("귀속시킬 대상이
+        없다")가 서로 다른 말을 하고 있었다. 저장소가 없는 것은 사실이지만
+        **주소는 있다** — 그리고 실패한 복제에서 알고 싶은 것이 정확히
+        "이 주소에서 얼마나 받다 말았는가"다. 로컬 경로를 키로 쓰면 재시도
+        때마다 다른 저장소로 갈리고, 버리면 ADR-26이 막으려던 무기록이 된다.
+
+        키에는 자격증명이 들어가지 않는다(`_without_userinfo`) — 계측
+        데이터베이스는 비밀을 담는 곳이 아니다.
+        """
+        from gitclient.infrastructure.remote_engine import _without_userinfo
+
+        return f"url:{_without_userinfo(self._url)}" if self._url else None
 
     def _decide_cleanup_policy(self) -> bool:
         """대상을 정리해도 되는가 — **시작 전에** 한 번만 판단한다.

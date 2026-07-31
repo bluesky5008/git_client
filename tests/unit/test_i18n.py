@@ -61,9 +61,13 @@ def _literals(paths, names) -> set[str]:  # noqa: ANN001
                 if keyword.arg in {"action", "detail"}
             ]
             for argument in arguments:
-                items = (
-                    argument.elts if isinstance(argument, ast.List) else [argument]
-                )
+                if isinstance(argument, ast.List):
+                    items = list(argument.elts)
+                elif isinstance(argument, ast.IfExp):
+                    # `action=A if 조건 else B` — 양쪽 다 화면에 나간다.
+                    items = [argument.body, argument.orelse]
+                else:
+                    items = [argument]
                 for item in items:
                     if (
                         isinstance(item, ast.Constant)

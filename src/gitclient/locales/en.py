@@ -170,6 +170,21 @@ CATALOG: dict[str, str] = {
         "Forcing light or dark applies immediately. Switching back to "
         "\"Follow system\" needs a restart to restore the platform style."
     ),
+    "줄을 선택하면 그 줄만 적용합니다": (
+        "Select lines to apply only those lines"
+    ),
+    "원격 저장소가 로그인을 요구합니다.": (
+        "The remote repository requires a login."
+    ),
+    "자격증명이 거부되었습니다.": "The credentials were rejected.",
+    "사용자 이름과 비밀번호(또는 액세스 토큰)를 입력해 주세요.": (
+        "Enter your username and password (or access token)."
+    ),
+    "입력한 자격증명이 맞는지 확인해 주세요. GitHub 등에서는 비밀번호 대신 "
+    "액세스 토큰이 필요합니다.": (
+        "Check the credentials you entered. GitHub and others need an access "
+        "token instead of a password."
+    ),
     "이 원격 저장소는 로그인이 필요합니다.": (
         "This remote repository requires a login."
     ),
@@ -399,6 +414,19 @@ CATALOG: dict[str, str] = {
     ),
     "작업이 진행 중으로 남아 있다면 '중단'으로 되돌릴 수 있습니다.": (
         "If the operation is left in progress, \"Abort\" rolls it back."
+    ),
+    "저장소에 없는 객체를 참조했습니다.": (
+        "A referenced object is missing from this repository."
+    ),
+    "부분 복제(blob 지연 수신) 저장소입니다. 네트워크에 연결한 뒤 "
+    "가져오기(Fetch)를 실행하면 필요한 객체를 받아옵니다.": (
+        "This is a partial clone (blobs arrive on demand). Connect to the "
+        "network and run a fetch to bring the missing objects in."
+    ),
+    "저장소가 손상되었거나 참조가 가리키는 객체가 없습니다. "
+    "가져오기(Fetch)로 받아올 수 있는지 확인해 주세요.": (
+        "The repository may be damaged, or the reference points at an object "
+        "that is not here. Check whether a fetch can bring it in."
     ),
     "워킹 트리가 없는 저장소에서는 할 수 없는 작업입니다.": (
         "This is not possible in a repository without a working tree."
