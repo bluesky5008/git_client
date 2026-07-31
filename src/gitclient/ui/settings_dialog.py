@@ -35,6 +35,12 @@ SHORTCUT_SPECS: tuple[tuple[str, str, str], ...] = (
     ("reflog", "reflog 탐색", "Ctrl+Shift+R"),
 )
 
+_LANGUAGE_CHOICES = (
+    ("system", "시스템 설정 따르기"),
+    ("ko", "한국어"),
+    ("en", "English"),
+)
+
 _THEME_CHOICES = (
     ("system", "시스템 설정 따르기"),
     ("light", "라이트 고정"),
@@ -85,8 +91,26 @@ class SettingsDialog(QDialog):
             settings.value("idle_repack_minutes", 10, type=int)
         )
 
+        self._language = QComboBox()
+        for value, label in _LANGUAGE_CHOICES:
+            self._language.addItem(label, value)
+        current_language = str(settings.value("language", "system"))
+        self._language.setCurrentIndex(
+            next(
+                (i for i, (v, _l) in enumerate(_LANGUAGE_CHOICES)
+                 if v == current_language),
+                0,
+            )
+        )
+        # 언어는 창을 만들 때 문구가 정해지므로 이미 떠 있는 화면에는
+        # 반쯤만 적용된다 — 조용히 반만 바꾸느니 미리 말한다.
+        self._language.setToolTip(
+            "언어는 앱을 다시 시작해야 모든 화면에 적용됩니다."
+        )
+
         general = QGroupBox("일반")
         form = QFormLayout(general)
+        form.addRow("언어", self._language)
         form.addRow("테마", self._theme)
         form.addRow(self._prefetch)
         form.addRow("유휴 정리(repack)까지", self._repack_minutes)
@@ -113,6 +137,7 @@ class SettingsDialog(QDialog):
 
     def accept(self) -> None:
         settings = self._settings
+        settings.setValue("language", self._language.currentData())
         settings.setValue("theme", self._theme.currentData())
         settings.setValue("prefetch_enabled", self._prefetch.isChecked())
         settings.setValue("idle_repack_minutes", self._repack_minutes.value())

@@ -43,9 +43,15 @@ def main(argv: list[str] | None = None) -> int:
     # 플랫폼 스타일이 OS 다크 모드를 스스로 따라가므로 손대지 않는다.
     from PySide6.QtCore import QSettings
 
+    from gitclient.i18n import install as install_i18n, set_language
     from gitclient.ui.theme import apply_theme
 
-    apply_theme(app, str(QSettings("gitclient", "gitclient").value("theme", "system")))
+    settings = QSettings("gitclient", "gitclient")
+    apply_theme(app, str(settings.value("theme", "system")))
+    # 언어는 창을 만들기 전에 정하고, 표시 이벤트 필터가 이후 모든 화면을
+    # 자동으로 번역한다 (FR-15).
+    set_language(str(settings.value("language", "system")))
+    install_i18n(app)
 
     window = MainWindow()
     if len(args) > 1:

@@ -84,6 +84,7 @@ from gitclient.application.refs_loader import RefsLoader
 from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
+from gitclient.i18n import tr
 from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
     HistoryOutcome,
@@ -3153,12 +3154,16 @@ class MainWindow(QMainWindow):
         메시지 본문 아래에 권장 조치(action)를 바로 보이게 놓고,
         엔진 원문(detail)은 접히는 상세 영역에 보존한다.
         """
+        # **여기가 번역의 출구다** (FR-15). 도메인·인프라 층은 한국어
+        # 원문을 그대로 들고 다니고(§3.1 의존 방향), 화면에 닿는 순간에만
+        # 카탈로그를 거친다. detail은 git의 원문이라 번역하지 않는다 —
+        # 검색 가능한 1차 자료여야 한다 (§5.2 원칙 4).
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("오류")
-        box.setText(error.message)
+        box.setWindowTitle(tr("오류"))
+        box.setText(tr(error.message))
         if error.action:
-            box.setInformativeText(error.action)
+            box.setInformativeText(tr(error.action))
         if error.detail:
             box.setDetailedText(error.detail)
         box.exec()
@@ -3175,10 +3180,10 @@ class MainWindow(QMainWindow):
         """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle(title)
-        box.setText(message)
+        box.setWindowTitle(tr(title))
+        box.setText(tr(message))
         if action:
-            box.setInformativeText(action)
+            box.setInformativeText(tr(action))
         if detail:
             box.setDetailedText(detail)
         box.exec()
