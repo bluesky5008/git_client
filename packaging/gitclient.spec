@@ -11,10 +11,15 @@
 # 검증:  dist/gitclient/gitclient --version
 
 from PySide6 import __file__ as pyside_file  # noqa: F401 - 존재 확인
+from PyInstaller.utils.hooks import copy_metadata
 
 a = Analysis(
     ["../src/gitclient/__main__.py"],
     pathex=["../src"],
+    # dist-info 메타데이터 — --version이 importlib.metadata로 버전을 읽는데,
+    # 이것이 없으면 배포본이 자기 버전 대신 "(개발 트리)"를 말한다
+    # (배포 패키지 준비 중 실측). 버전의 출처는 pyproject.toml 한 곳이다.
+    datas=copy_metadata("gitclient"),
     hiddenimports=[
         # pygit2는 cffi 기반이다 — 백엔드 모듈을 정적 분석이 놓친다
         # (로컬 빌드 실측: 빠뜨리면 기동 즉시 ModuleNotFoundError).
