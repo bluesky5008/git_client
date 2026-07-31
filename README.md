@@ -121,7 +121,7 @@ GitKraken을 목표 모델로 하는 데스크톱 Git 클라이언트.
 **아직 없는 것** (전체 목록: [doc/backlog.md](doc/backlog.md))
 
 - 인터랙티브 rebase(커밋 재배열·squash)
-- 다국어(전용 카탈로그 회차 필요), 배포 패키징·LICENSE — Phase 5 잔여
+- 다국어(전용 카탈로그 회차 필요), 설치본 패키징(dmg·인스톨러 — onedir 빌드·CI는 있음) — Phase 5 잔여
 
 ---
 
