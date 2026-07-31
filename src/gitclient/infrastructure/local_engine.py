@@ -43,7 +43,10 @@ from gitclient.domain.errors import (
     RepositoryOpenError,
 )
 from gitclient.domain.command_log import COMMAND_LOG
-from gitclient.infrastructure.remote_engine import INHERITED_ENV_BLOCKLIST
+from gitclient.infrastructure.remote_engine import (
+    INHERITED_ENV_BLOCKLIST,
+    _kill_process_tree,
+)
 from gitclient.domain.patch import (
     FilePatch,
     PatchError,
@@ -1174,6 +1177,73 @@ class LocalGitEngine:
                     )
                 )
             return tuple(entries)
+
+    def idle_repack(self, *, should_abort=None) -> bool:  # noqa: ANN001
+        """유휴 시간에 팩을 하나로 정돈한다 (FR-08). 중단·실패는 False.
+
+        `unpackLimit=1` + `maintenance.auto=false`(§4.6.2)가 매 fetch마다
+        팩을 하나씩 쌓는다 — 원격 작업 뒤의 `maintenance run --auto`가
+        대부분 치우지만, 여기서는 **델타 설정까지 얹어** 전부 다시 싼다.
+        ADR-35가 push에서 기각한 `pack.window/depth=250`을 쓰는 유일한
+        자리다: push 중의 CPU는 사용자가 기다리는 시간이지만, 유휴의 CPU는
+        진짜 공짜다 (§1.4 원칙 1의 예외).
+
+        **조용한 배경 작업이다** — 실패해도 예외를 올리지 않는다(다음
+        유휴에 다시 온다). `should_abort`가 참을 돌려주면 0.2초 안에
+        프로세스 트리를 끊고 물러난다: 사용자 작업이 큐 뒤에서 기다리게
+        하면 안 된다 (NFR-03). git repack은 임시 팩에 쓰고 원자적으로
+        교체하므로 중간에 죽여도 저장소는 일관적이다.
+        """
+        workdir = self._repo.workdir
+        if not workdir:
+            return False
+        if should_abort is not None and should_abort():
+            # 큐에서 기다리는 사이 사용자 작업이 이미 왔다 — 프로세스를
+            # 띄우지도 않는다. (소형 저장소는 repack이 첫 폴링(0.2초)보다
+            # 빨리 끝나므로, 시작 후 판정만으로는 이 신호를 지나친다.)
+            return False
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _HISTORY_ENV_BLOCKLIST
+        }
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        command = [
+            self._git, "-C", workdir,
+            "-c", "pack.window=250",
+            "-c", "pack.depth=250",
+            "repack", "-a", "-d", "-q",
+        ]
+        started_at = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                env=env,
+                start_new_session=(os.name != "nt"),
+            )
+        except OSError:
+            logger.debug("유휴 repack 시작 실패", exc_info=True)
+            return False
+        aborted = False
+        while True:
+            try:
+                proc.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if should_abort is not None and should_abort():
+                    aborted = True
+                    _kill_process_tree(proc)
+                    proc.wait()
+                    break
+        COMMAND_LOG.record(
+            command,
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            returncode=proc.poll(),
+        )
+        return not aborted and proc.returncode == 0
 
     def _require_no_sequencer(self) -> None:
         """시퀀서가 도는 중에 HEAD를 옮기지 못하게 한다.

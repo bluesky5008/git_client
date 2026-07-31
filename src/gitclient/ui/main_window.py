@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -191,6 +193,15 @@ class MainWindow(QMainWindow):
         # 승격(ADR-83)으로 prefetch 완료를 기다리는 사용자 작업.
         # (워커, 상태바 문구, 재시도 함수) — prefetch가 은퇴하면 시작된다.
         self._pending_remote: tuple | None = None
+        # 유휴 repack (FR-08). 사용자 활동이 잦아들면 저장소당 한 번 팩을
+        # 정돈한다 — 사용자 작업이 오면 이벤트로 즉시 물러난다 (NFR-03).
+        self._last_user_activity = time.monotonic()
+        self._idle_repack_done = False
+        self._repack_abort: threading.Event | None = None
+        self._idle_repack_timer = QTimer(self)
+        self._idle_repack_timer.setInterval(60 * 1000)
+        self._idle_repack_timer.timeout.connect(self._maybe_idle_repack)
+        self._idle_repack_timer.start()
         self._prefetch_timer = QTimer(self)
         self._prefetch_timer.timeout.connect(self._maybe_prefetch)
         self._merge_conflicts: tuple = ()
@@ -565,6 +576,9 @@ class MainWindow(QMainWindow):
             self.open_repository(directory)
 
     def open_repository(self, path: str | Path) -> None:
+        # 저장소를 여는 것도 사용자 활동이다 — 유휴 시계를 되감고, 이전
+        # 저장소에서 돌던 배경 repack을 물린다.
+        self._touch_user_activity()
         try:
             engine = LocalGitEngine.open(path)
             # include_refs=False: ref 열거는 ref 수에 비례해 느리다(실측 ref당
@@ -1153,6 +1167,7 @@ class MainWindow(QMainWindow):
         if queue is None:
             return
 
+        self._touch_user_activity()
         self.statusBar().showMessage(f"{name}...")
         job_id = queue.submit(name, work)
         # submit 직후 connect해도 안전하다 — 완료 시그널은 UI 스레드 이벤트 루프로
@@ -1722,6 +1737,7 @@ class MainWindow(QMainWindow):
         # 0부터 다시 받는다 — ADR-49(벽시계 타임아웃)가 막은 것과 같은
         # 낭비다. 어차피 같은 전송이므로 완료를 화면에 보이며 기다렸다가,
         # 끝나면 실제 작업을 이어 돌린다(그 fetch는 대개 전송 0이다).
+        self._touch_user_activity()
         if self._promote_prefetch(worker, message, retry):
             return
         # 사용자의 작업이 먼저다 — 배경 prefetch가 회선을 물고 있으면 놓는다.
@@ -1893,6 +1909,52 @@ class MainWindow(QMainWindow):
         else:
             self._prefetch_timer.stop()
             self._cancel_prefetch()
+
+    def _touch_user_activity(self) -> None:
+        """사용자 작업이 왔다 — 유휴 시계를 되감고 배경 repack을 물린다.
+
+        repack이 WriteQueue 안에서 돌고 있으면 사용자 작업은 그 뒤에
+        줄을 선다 — 이벤트 하나로 0.2초 안에 자리를 비키게 한다 (NFR-03).
+        """
+        self._last_user_activity = time.monotonic()
+        self._idle_repack_done = False
+        if self._repack_abort is not None:
+            self._repack_abort.set()
+
+    def _maybe_idle_repack(self) -> None:
+        """조건이 맞으면 배경으로 팩을 정돈한다 (FR-08).
+
+        prefetch와 같은 원칙으로 움직인다: 사용자가 하는 일이 있으면
+        건너뛰고, 시작한 뒤라도 사용자 작업이 오면 즉시 물러난다.
+        저장소당·유휴당 한 번이다 — repack은 멱등이라 더 돌 이유가 없다.
+        """
+        if self._engine is None or self._write_queue is None:
+            return
+        if self._idle_repack_done or self._loading:
+            return
+        idle_minutes = self._settings.value("idle_repack_minutes", 10, type=int)
+        if time.monotonic() - self._last_user_activity < idle_minutes * 60:
+            return
+        if self._write_queue.is_busy or self._fetch_worker is not None:
+            return
+        if self._prefetch_worker is not None or self._operation.is_active:
+            return
+
+        abort = threading.Event()
+        self._repack_abort = abort
+        self._idle_repack_done = True
+
+        def job(engine) -> None:  # noqa: ANN001
+            # 조용한 배경 작업 — 실패는 로그로만 남기고 삼킨다. 오류 모달이
+            # 유휴 시간에 튀어나오면 그 자체가 방해다.
+            try:
+                engine.idle_repack(should_abort=abort.is_set)
+            except Exception:  # noqa: BLE001
+                logger.debug("유휴 repack 실패", exc_info=True)
+
+        # `_submit_write`를 쓰지 않는다 — 그쪽은 사용자 작업용이라 유휴
+        # 시계를 되감고(자기 자신을 무한히 미룬다) 실패에 모달을 띄운다.
+        self._write_queue.submit("유휴 정리", job)
 
     def _maybe_prefetch(self) -> None:
         """조건이 맞으면 배경으로 미리 받아온다.
