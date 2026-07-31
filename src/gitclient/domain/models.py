@@ -717,3 +717,19 @@ class HistoryOutcome:
     @property
     def is_would_be_empty(self) -> bool:
         return self.kind is HistoryOutcomeKind.WOULD_BE_EMPTY
+
+
+@dataclass(frozen=True, slots=True)
+class PathHistoryEntry:
+    """한 경로를 바꾼 커밋 하나 — 파일 히스토리 목록의 행이다.
+
+    `Commit` 전체를 쓰지 않는 이유: 이 목록은 CLI(`git log -- <경로>`)의
+    출력에서 오는데(ADR-90), 화면이 쓰는 네 값만 실어 나르면 파싱도
+    화면도 단순해진다. 부모·트리 같은 나머지가 필요해지는 순간이 오면
+    sha로 엔진에 다시 물으면 된다.
+    """
+
+    sha: str
+    summary: str
+    author: str
+    when: datetime

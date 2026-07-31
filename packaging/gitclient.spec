@@ -39,6 +39,7 @@ a = Analysis(
         "gitclient.ui.settings_dialog",
         "gitclient.ui.conflict_lines_dialog",
         "gitclient.ui.command_log_panel",
+        "gitclient.ui.path_history_dialog",
     ],
     excludes=[
         # Qt의 무거운 부속 중 앱이 쓰지 않는 것 — 배포 크기를 줄인다.

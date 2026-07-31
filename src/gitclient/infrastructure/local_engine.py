@@ -58,13 +58,13 @@ from gitclient.domain.patch import (
 )
 from gitclient.domain.models import (
     ChangeStatus,
-    ConflictChoice,
-    ConflictDetail,
-    ConflictSideContent,
     Commit,
     CommitDetail,
-    ConflictedFile,
+    ConflictChoice,
+    ConflictDetail,
     ConflictSide,
+    ConflictSideContent,
+    ConflictedFile,
     DiffLine,
     DiffLineKind,
     FileChange,
@@ -73,12 +73,13 @@ from gitclient.domain.models import (
     MergeKind,
     MergeOutcome,
     MergePreview,
+    OperationState,
+    PathHistoryEntry,
     RebaseAction,
     RebaseStep,
     Ref,
-    ReflogEntry,
-    OperationState,
     RefKind,
+    ReflogEntry,
     RepoOperation,
     RepositoryInfo,
     ResetKind,
@@ -1270,6 +1271,51 @@ class LocalGitEngine:
                 )
             self._repo.remotes.set_url(name, url)
 
+    def path_history(self, path: str, *, limit: int = 1000) -> list[PathHistoryEntry]:
+        """한 경로를 바꾼 커밋들 — 시간 역순 (경로 히스토리, ADR-90).
+
+        **로컬 읽기인데 CLI를 쓴다** — ADR-2의 두 번째 예외다(첫째는
+        시퀀서, ADR-67). 이유 둘: ① git의 히스토리 단순화(TREESAME 가지
+        치기)와 같은 결과를 pygit2로 다시 만드는 것은 그 자체가 결함
+        표면이고, ② commit-graph의 Bloom 필터는 git CLI만 읽는다 —
+        실측(1만 커밋)에서 pygit2 순회 366.7ms, CLI 58.7ms, CLI+Bloom
+        22.9ms였다. 느린 쪽을 골라 단순화 규칙까지 재구현할 이유가 없다.
+
+        이름 변경(rename)은 따라가지 않는다 — 개명 시점에서 목록이
+        끊긴다. `--follow`는 단일 경로 전용에 단순화 규칙도 달라져서,
+        화면이 한계를 밝히는 쪽을 골랐다 (FR-04).
+
+        존재한 적 없는 경로는 오류가 아니라 빈 목록이다 — git log의
+        의미론 그대로이고, 화면은 "기록 없음"을 그리면 된다.
+        """
+        result = self._run_git(
+            [
+                "log",
+                f"--max-count={limit}",
+                # %x1f(단위 구분자)는 요약에 나올 수 없는 문자다 —
+                # 쉼표·탭으로 가르면 요약이 필드를 오염시킨다.
+                "--format=%H%x1f%an%x1f%at%x1f%s",
+                "--",
+                path,
+            ],
+            context="파일 히스토리",
+        )
+        entries: list[PathHistoryEntry] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\x1f", 3)
+            if len(parts) != 4:
+                continue  # 형식 밖의 줄은 버린다 — 잘린 마지막 줄 등
+            sha, author, timestamp, summary = parts
+            entries.append(
+                PathHistoryEntry(
+                    sha=sha,
+                    summary=summary,
+                    author=author,
+                    when=datetime.fromtimestamp(int(timestamp), tz=timezone.utc),
+                )
+            )
+        return entries
+
     def idle_repack(self, *, should_abort=None) -> bool:  # noqa: ANN001
         """유휴 시간에 팩을 하나로 정돈한다 (FR-08). 중단·실패는 False.
 
@@ -1300,12 +1346,34 @@ class LocalGitEngine:
             if key not in _HISTORY_ENV_BLOCKLIST
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
-        command = [
-            self._git, "-C", workdir,
-            "-c", "pack.window=250",
-            "-c", "pack.depth=250",
-            "repack", "-a", "-d", "-q",
-        ]
+        if not self._idle_command(
+            [
+                self._git, "-C", workdir,
+                "-c", "pack.window=250",
+                "-c", "pack.depth=250",
+                "repack", "-a", "-d", "-q",
+            ],
+            env=env,
+            should_abort=should_abort,
+        ):
+            return False
+        # commit-graph를 Bloom 필터(--changed-paths)와 함께 쓴다 — 경로
+        # 히스토리(ADR-90)의 가속 장치다. 실측(1만 커밋): 경로 로그
+        # 58.7ms → 22.9ms, 쓰기 비용 137.7ms는 유휴라 공짜다. repack이
+        # 팩을 갈아엎은 직후가 그래프도 함께 새로 쓸 자리다.
+        return self._idle_command(
+            [
+                self._git, "-C", workdir,
+                "commit-graph", "write", "--reachable", "--changed-paths",
+            ],
+            env=env,
+            should_abort=should_abort,
+        )
+
+    def _idle_command(
+        self, command: list[str], *, env: dict[str, str], should_abort=None  # noqa: ANN001
+    ) -> bool:
+        """유휴 단계 하나 — 조용히 돌고, 0.2초 안에 물러날 수 있어야 한다."""
         started_at = time.perf_counter()
         try:
             proc = subprocess.Popen(
@@ -1317,7 +1385,7 @@ class LocalGitEngine:
                 start_new_session=(os.name != "nt"),
             )
         except OSError:
-            logger.debug("유휴 repack 시작 실패", exc_info=True)
+            logger.debug("유휴 명령 시작 실패", exc_info=True)
             return False
         aborted = False
         while True:

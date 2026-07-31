@@ -14,7 +14,6 @@ Phase 1은 읽기 전용이다. 저장소를 열고, 커밋 그래프를 탐색�
 
 from __future__ import annotations
 
-import functools
 import gc
 import logging
 import threading
@@ -86,6 +85,7 @@ from gitclient.application.status_loader import StatusLoader
 from gitclient.application.write_queue import WriteQueue
 from gitclient.domain.errors import AuthenticationRequired, GitClientError
 from gitclient.i18n import tr, trf
+from gitclient.ui.late_delivery import drops_late_deliveries
 from gitclient.domain.instrumentation import OperationKind, TransferPhase
 from gitclient.domain.models import (
     HistoryOutcome,
@@ -199,28 +199,6 @@ def _format_bytes(count: int) -> str:
 # 워커는 시그널이 끊겨 있어 이 위젯을 건드릴 수 없으므로 길게 잡을 이유가
 # 없다. G4(50ms) 안에 들어가도록 짧게 둔다.
 logger = logging.getLogger(__name__)
-
-
-def _drops_late_deliveries(handler):  # noqa: ANN001, ANN201
-    """C++ 쪽 창이 먼저 파괴된 뒤 도착한 워커 배달을 버린다.
-
-    `_detach_loaders()`의 disconnect로도 부족했다 — 이미 이벤트 루프에
-    **실린** 배달은 disconnect 뒤에도 도착한다. 수신자인 signals 객체는
-    파이썬이 붙들고 있어 살아 있고, 슬롯이 만지는 위젯·모델만 먼저
-    죽는다 (Windows CI 실측: `CommitGraphModel already deleted` — 이전
-    테스트의 창이 지워진 뒤 그 창의 커밋 배치가 배달됐다). 배달의 표적이
-    이미 없다면 버리는 것 말고 옳은 처리가 없다.
-    """
-
-    @functools.wraps(handler)
-    def guarded(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        import shiboken6
-
-        if not shiboken6.isValid(self):
-            return None
-        return handler(self, *args, **kwargs)
-
-    return guarded
 
 
 _CLOSE_DRAIN_MS = 20
@@ -377,6 +355,12 @@ class MainWindow(QMainWindow):
         self._commit_view = self._build_commit_view()
         self._file_list = QListWidget()
         self._file_list.currentRowChanged.connect(self._on_file_selected)
+        self._file_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self._file_list.customContextMenuRequested.connect(
+            self._on_file_context_menu
+        )
         self._diff_view = self._build_diff_view()
 
         self._work_panel = WorkingTreePanel()
@@ -1100,7 +1084,7 @@ class MainWindow(QMainWindow):
         self._status_loader = status_loader
         self._pool.start(status_loader)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_status_ready(
         self, loader: StatusLoader, status, head_message  # noqa: ANN001
     ) -> None:
@@ -1108,7 +1092,7 @@ class MainWindow(QMainWindow):
             return
         self._work_panel.show_status(status, head_message)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_status_failed(self, loader: StatusLoader, error: GitClientError) -> None:
         if loader is not self._status_loader:
             return
@@ -1128,7 +1112,7 @@ class MainWindow(QMainWindow):
             diff_loader.cancel()
         self._loading = False
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_batch_ready(self, loader: CommitLoader, commits: list) -> None:
         if loader is not self._loader:
             return  # 이전 저장소의 늦은 묶음
@@ -1145,7 +1129,7 @@ class MainWindow(QMainWindow):
             f"커밋을 읽는 중... {self._commit_model.rowCount()}개"
         )
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_loading_finished(self, loader: CommitLoader, _total: int) -> None:
         self._restore_gc()
         if loader is not self._loader:
@@ -1160,7 +1144,7 @@ class MainWindow(QMainWindow):
             self._diff_model.clear()
             self._show_placeholder()
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_loading_failed(self, loader: CommitLoader, error: GitClientError) -> None:
         self._restore_gc()
         if loader is not self._loader:
@@ -1168,7 +1152,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._report(error)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_refs_ready(self, loader: RefsLoader, refs: list, divergence) -> None:  # noqa: ANN001
         if loader is not self._refs_loader:
             return  # 이전 저장소의 늦은 결과
@@ -1179,7 +1163,7 @@ class MainWindow(QMainWindow):
         self._commit_model.set_refs(refs)
         self._update_status(self._info)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_refs_failed(self, loader: RefsLoader, error: GitClientError) -> None:
         if loader is not self._refs_loader:
             return
@@ -1395,7 +1379,7 @@ class MainWindow(QMainWindow):
         self._diff_loaders[token] = loader
         self._pool.start(loader)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_diff_ready(self, token: int, detail, lines) -> None:  # noqa: ANN001
         self._diff_loaders.pop(token, None)
         if token != self._diff_generation:
@@ -1414,7 +1398,7 @@ class MainWindow(QMainWindow):
         self._diff_model.set_lines(lines, positions, patch)
         self._update_partial_actions()
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_diff_failed(self, token: int, error: GitClientError) -> None:
         self._diff_loaders.pop(token, None)
         if token != self._diff_generation:
@@ -1471,6 +1455,24 @@ class MainWindow(QMainWindow):
         path = item.data(Qt.ItemDataRole.UserRole)
         # include_detail=False: 파일 목록은 그대로 두고 diff만 갈아끼운다.
         self._request_diff(self._current_sha, path=path, include_detail=False)
+
+    def _on_file_context_menu(self, pos) -> None:  # noqa: ANN001
+        """변경 파일 우클릭 — 그 경로의 히스토리로 들어가는 입구 (ADR-90)."""
+        item = self._file_list.itemAt(pos)
+        if item is None or self._repo_path is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return  # '전체 변경' 행 — 경로가 아니다
+        menu = QMenu(self._file_list)
+        history_action = menu.addAction(tr("이 파일의 히스토리"))
+        chosen = menu.exec(self._file_list.mapToGlobal(pos))
+        if chosen is history_action:
+            from gitclient.ui.path_history_dialog import PathHistoryDialog
+
+            # 모달이 아니다 — 히스토리를 옆에 두고 그래프를 계속 다룰 수
+            # 있어야 한다. 수명은 부모(self)가 쥔다.
+            PathHistoryDialog(self._repo_path, path, parent=self).show()
 
     def _on_ref_activated(self, item: QListWidgetItem) -> None:
         """참조를 더블클릭/Enter 하면 해당 커밋으로 이동한다."""
@@ -2662,7 +2664,7 @@ class MainWindow(QMainWindow):
         self._conflict_loaders[token] = loader
         self._pool.start(loader)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_conflict_detail_ready(  # noqa: ANN001
         self, token: int, path: str, detail, fingerprint
     ) -> None:
@@ -2673,7 +2675,7 @@ class MainWindow(QMainWindow):
         self._conflict_fingerprint = fingerprint
         self._conflict_panel.show_detail(detail)
 
-    @_drops_late_deliveries
+    @drops_late_deliveries
     def _on_conflict_detail_failed(self, token: int, path: str, _error) -> None:  # noqa: ANN001
         self._conflict_loaders.pop(token, None)
         if token != self._conflict_generation:
