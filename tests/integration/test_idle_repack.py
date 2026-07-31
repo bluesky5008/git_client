@@ -130,6 +130,9 @@ class TestWindowSchedulesIt:
         return w
 
     def test_idle_triggers_a_repack_once(self, window, qtbot) -> None:  # noqa: ANN001
+        from gitclient.domain.command_log import COMMAND_LOG
+
+        before = len(COMMAND_LOG.snapshot())
         window._last_user_activity = time.monotonic() - 3600  # 유휴 척
 
         window._maybe_idle_repack()
@@ -138,7 +141,19 @@ class TestWindowSchedulesIt:
         qtbot.waitUntil(
             lambda: not window._write_queue.is_busy, timeout=TIMEOUT
         )
-        assert len(pack_files(window.repo)) == 1
+        # 이 테스트의 관심사는 **스케줄링**이다 — repack이 정확히 한 번,
+        # 성공으로 돌았는가를 명령 로그로 본다. 팩이 하나로 줄어드는 것
+        # 자체는 엔진 테스트가 검증한다. 여기서 팩 수를 세면 안 되는
+        # 이유: 창이 연 pygit2 핸들이 팩을 mmap하고 있으면 Windows에서는
+        # 옛 팩 삭제가 다음 기회로 미뤄진다 (6차 CI 실측 — git이 새 팩을
+        # 쓰고도 옛 것을 지우지 못해 개수가 그대로였다).
+        repacks = [
+            record
+            for record in COMMAND_LOG.snapshot()[before:]
+            if "repack" in record.argv
+        ]
+        assert len(repacks) == 1, "repack이 정확히 한 번 돌아야 한다"
+        assert repacks[0].returncode == 0
 
         # 같은 유휴 구간에서는 다시 돌지 않는다.
         window._maybe_idle_repack()
