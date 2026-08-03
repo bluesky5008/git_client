@@ -1,7 +1,7 @@
 # 남은 작업 (Backlog)
 
-> 문서 버전: 1.2
-> 최종 수정: 2026-07-20
+> 문서 버전: 1.3
+> 최종 수정: 2026-08-03
 > 상위 문서: [design.md](design.md) · [performance.md](performance.md)
 >
 > 구현 시점: Phase 1·2 완료, Phase 3 증분 1~4 완료, Phase 4 증분 1~3 완료.
