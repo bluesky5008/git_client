@@ -207,6 +207,50 @@ class TestRepositorySwitch:
         assert window._commit_model.commit_at(0).summary == "단독 커밋"
         assert "other-repo" in window.windowTitle()
 
+    def test_switching_does_not_query_the_old_head(
+        self, window, qtbot, tmp_path: Path  # noqa: ANN001
+    ) -> None:
+        """이전 저장소의 HEAD로 새 저장소를 조회하던 결함 (실사용 보고).
+
+        파일 목록을 비우는 clear()가 currentRowChanged를 발화시키는
+        시점에 _current_sha가 아직 이전 저장소의 것이면, 가드 셋(row·
+        sha·경로)이 전부 통과해 새 엔진에 옛 sha를 묻는다 — 사용자에게
+        "커밋을 찾을 수 없습니다: <이전 HEAD>"가 떴다. 상태 무효화가
+        위젯 정리보다 먼저여야 한다.
+        """
+        # fixture가 diff까지 로딩했으므로 파일 목록에 current 행이 있고
+        # _current_sha는 이 저장소의 HEAD다 — 결함이 요구하는 사용 흔적.
+        old_head = window._current_sha
+        assert old_head is not None
+
+        # 오류 "보고"를 기다리는 검증은 비결정적이다 — 늦은 실패가 새
+        # 요청 뒤에 도착하면 세대 토큰이 조용히 버린다. 결함의 본질은
+        # **이전 sha로 조회가 나간다는 것**이므로 요청 자체를 잡는다.
+        seen: list[str] = []
+        original = window._request_diff
+
+        def recording(sha: str, **kwargs):  # noqa: ANN003, ANN202
+            seen.append(sha)
+            return original(sha, **kwargs)
+
+        window._request_diff = recording
+
+        other = tmp_path / "second-repo"
+        repo = pygit2.init_repository(str(other), initial_head="main")
+        (other / "solo.txt").write_text("x", encoding="utf-8")
+        repo.index.add("solo.txt")
+        repo.index.write()
+        tree = repo.index.write_tree()
+        repo.create_commit("HEAD", SIGNATURE, SIGNATURE, "단독 커밋", tree, [])
+
+        window.open_repository(str(other))
+        qtbot.waitUntil(lambda: not window._loading, timeout=TIMEOUT)
+
+        assert old_head not in seen, (
+            "이전 저장소의 HEAD로 새 저장소에 diff를 요청했다"
+        )
+        assert [e.message for e in window.reported_errors] == []
+
 
 class TestLateWorkerResultsAfterClose:
     """창이 닫힌 뒤 도착한 읽기 결과가 파괴된 위젯을 만지면 안 된다.

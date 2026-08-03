@@ -842,11 +842,17 @@ class MainWindow(QMainWindow):
         self._remember_repository(str(path))
         self._watch_repository(info.path)
 
+        # **위젯을 비우기 전에 sha부터 무효화한다.** clear()는 항목을
+        # 지우는 동안 currentRowChanged를 발화시키고, 그 핸들러
+        # (_on_file_selected)는 _current_sha로 diff를 요청한다 — 이 줄이
+        # 위젯 정리 뒤에 있던 동안, 이전 저장소의 HEAD로 새 저장소를
+        # 조회해 "커밋을 찾을 수 없습니다"가 떴다 (실사용 보고 재현).
+        # _repo_path는 이미 새 경로라 가드 셋이 전부 통과해 버린다.
+        self._current_sha = None
         self._commit_model.reset([])
         self._ref_list.clear()
         self._diff_model.clear()
         self._show_placeholder()
-        self._current_sha = None
 
         # 쓰기 경로. bare 저장소는 워킹 트리가 없어 쓰기 UI를 껐다.
         #
