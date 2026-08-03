@@ -1,2 +1,2 @@
-7701f51a3a7b24b0d49ab017c3702c36a99024701412a01cb087e2c4f82d7dde  gitclient-0.1.0-macos-arm64.dmg
-771a228a7dde779214fd7fc4a429d82d03f6a8f957659b61f8cf2710dd5a4fe6  gitclient-0.1.0-windows-x64-setup.exe
+54955049bcaa313c60b53ac6fa0ed03fda54abfcf4ecc42b5a69ef7ee34a6569  gitclient-0.1.0-macos-arm64.dmg
+a83cb9a13d5c4653f445e76075fcea266d86e76ab9deff948f41a3eaf9dba7b6  gitclient-0.1.0-windows-x64-setup.exe
