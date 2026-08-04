@@ -9,7 +9,10 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,7 +20,7 @@ import pytest
 from gitclient.application import remote_workers
 from gitclient.application.remote_workers import CloneWorker, _repo_key
 from gitclient.infrastructure.local_engine import LocalGitEngine
-from gitclient.infrastructure.remote_engine import RemoteEngine
+from gitclient.infrastructure.remote_engine import NO_WINDOW, RemoteEngine
 from tests.integration.remote_harness import RemoteFixture, git
 
 TIMEOUT = 60
@@ -198,3 +201,66 @@ class TestSubmoduleRecursionIsOffEverywhere:
         engine.fetch(stall_timeout_s=TIMEOUT)
 
         assert "--no-recurse-submodules" in captured[0]
+
+
+class TestChildProcessesStayInvisible:
+    """자식 프로세스가 콘솔 창을 띄우지 않는다 (실사용 보고, 2026-08-04).
+
+    GUI 앱은 콘솔 없이 뜬다(PyInstaller `console=False`). 그 상태에서
+    콘솔 애플리케이션(git.exe, taskkill.exe)을 실행하면 Windows가 새
+    콘솔을 할당해 **창이 나타났다 사라진다** — 앱이 git을 부르는 빈도만큼
+    깜빡였다. `capture_output`은 파이프만 돌릴 뿐 콘솔 할당을 막지 못한다.
+
+    이 검사가 지키는 것은 개별 호출이 아니라 **규칙**이다: 프로세스를
+    띄우는 새 코드가 플래그를 빠뜨리면 여기서 걸린다. 창이 실제로 뜨는지는
+    Windows GUI 세션에서만 관찰할 수 있어(헤드리스 CI로는 불가) 자동
+    검증이 닿는 가장 먼 지점이 여기다.
+    """
+
+    SPAWN_FUNCTIONS = frozenset({"run", "Popen", "call", "check_output"})
+
+    def _spawn_calls(self) -> list[tuple[Path, ast.Call]]:
+        source_root = Path(__file__).resolve().parents[2] / "src" / "gitclient"
+        found: list[tuple[Path, ast.Call]] = []
+        for path in sorted(source_root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr in self.SPAWN_FUNCTIONS
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"
+                ):
+                    found.append((path, node))
+        return found
+
+    def test_the_extractor_actually_finds_the_call_sites(self) -> None:
+        """추출기가 조용히 0개를 반환하면 아래 검사가 공허하게 통과한다.
+
+        이 저장소는 그 함정을 이미 한 번 겪었다(감사가 확정한 공허한
+        테스트 둘) — 상한이 아니라 하한을 단언한다.
+        """
+        assert len(self._spawn_calls()) >= 5
+
+    def test_every_spawn_hides_its_console(self) -> None:
+        missing = [
+            f"{path.name}:{node.lineno}"
+            for path, node in self._spawn_calls()
+            if not any(keyword.arg == "creationflags" for keyword in node.keywords)
+        ]
+
+        assert not missing, (
+            "프로세스를 띄우면서 창을 숨기지 않는다 "
+            "(creationflags=NO_WINDOW 필요):\n"
+            + "\n".join(f"  {site}" for site in missing)
+        )
+
+    def test_the_flag_means_something_on_windows_and_nothing_elsewhere(self) -> None:
+        """POSIX에는 이 개념이 없다 — 0은 `creationflags`의 기본값이다."""
+        if os.name == "nt":
+            assert NO_WINDOW == subprocess.CREATE_NO_WINDOW
+        else:
+            assert NO_WINDOW == 0

@@ -199,6 +199,22 @@ DRAIN_TIMEOUT_S = 5
 # 진행 여부를 확인하는 주기. 짧을수록 반응이 빠르지만 깨어나는 횟수가 는다.
 _POLL_INTERVAL_S = 0.2
 
+# **자식 프로세스가 콘솔 창을 띄우지 않게 한다** (실사용 보고: 앱을 쓰는
+# 내내 터미널이 깜빡였다).
+#
+# GUI 앱은 콘솔 없이 뜬다(PyInstaller `console=False`). 그 상태에서 콘솔
+# 애플리케이션(git.exe, taskkill.exe)을 실행하면 Windows가 **새 콘솔을
+# 할당해** 창이 나타났다 사라진다. `capture_output`은 파이프만 돌릴 뿐
+# 콘솔 할당을 막지 못한다 — 앱이 git을 부르는 빈도만큼 깜빡인다.
+#
+# **자손까지 조용해진다** — `CREATE_NO_WINDOW`는 콘솔을 없애는 것이 아니라
+# 창 없는 콘솔을 준다. git이 띄우는 credential helper(`sh -c`, ADR-78)와
+# git-remote-https는 그 보이지 않는 콘솔을 상속하므로 따로 손댈 자리가 없다.
+#
+# POSIX에는 이 개념이 없어 상수가 정의되지 않는다. 0은 `creationflags`의
+# 기본값이라 그쪽에서는 아무 일도 하지 않는다.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 _URL_IN_MESSAGE = re.compile(r"'((?:https?|ssh|git)://[^'\s]+)'")
 
@@ -420,6 +436,7 @@ def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
             capture_output=True,
             check=False,
             timeout=DRAIN_TIMEOUT_S,
+            creationflags=NO_WINDOW,
         )
     else:
         try:
@@ -921,6 +938,7 @@ class RemoteEngine:
                 errors="replace",
                 env=env,
                 timeout=DRAIN_TIMEOUT_S * 4,
+                creationflags=NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise EngineError("git 실행에 실패했습니다.", detail=str(exc)) from exc
@@ -1019,6 +1037,8 @@ class RemoteEngine:
                 env=env,
                 # POSIX: 자손을 한 프로세스 그룹으로 묶어 killpg로 함께 죽인다.
                 start_new_session=(os.name != "nt"),
+                # Windows: 콘솔 창을 띄우지 않는다.
+                creationflags=NO_WINDOW,
             )
         except FileNotFoundError as exc:
             raise EngineError(

@@ -47,6 +47,7 @@ from gitclient.domain.errors import (
 from gitclient.domain.command_log import COMMAND_LOG
 from gitclient.infrastructure.remote_engine import (
     INHERITED_ENV_BLOCKLIST,
+    NO_WINDOW,
     _kill_process_tree,
 )
 from gitclient.domain.patch import (
@@ -1383,6 +1384,9 @@ class LocalGitEngine:
                 stdin=subprocess.DEVNULL,
                 env=env,
                 start_new_session=(os.name != "nt"),
+                # Windows: 콘솔 창을 띄우지 않는다. 유휴 작업이 사용자
+                # 몰래 도는 만큼, 창이 뜨면 원인 모를 깜빡임이 된다.
+                creationflags=NO_WINDOW,
             )
         except OSError:
             logger.debug("유휴 명령 시작 실패", exc_info=True)
@@ -2657,6 +2661,7 @@ class LocalGitEngine:
                 errors="replace",
                 env=env,
                 timeout=_HISTORY_TIMEOUT_S,
+                creationflags=NO_WINDOW,
             )
             # 투명성 로그 (FR-11) — 원격 경로와 같은 창구에 남긴다.
             COMMAND_LOG.record(
